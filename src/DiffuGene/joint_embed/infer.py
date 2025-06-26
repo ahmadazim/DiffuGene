@@ -33,7 +33,16 @@ def inference(args):
         latent_channels=args.latent_channels
     ).cuda()
     
-    model.load_state_dict(torch.load(args.model_path, map_location='cuda'))
+    # Handle both old and new model save formats
+    checkpoint = torch.load(args.model_path, map_location='cuda')
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        # New format with metadata
+        model.load_state_dict(checkpoint['model_state_dict'])
+        logger.info("Loaded model from new format with metadata")
+    else:
+        # Old format - direct state dict
+        model.load_state_dict(checkpoint)
+        logger.info("Loaded model from old format")
     model.eval()
     
     # Encode all data

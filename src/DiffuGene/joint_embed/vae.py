@@ -8,163 +8,211 @@ from .distribution import DiagonalGaussianDistribution
 
 class JointBlockEmbedder(nn.Module):
     """
-    1) pos‐embed each block (B,N,3)→(B,N,3)
-    2) pad/truncate N→1024
-    3) project 3→4 channels via an MLP
-    4) reshape (B,4,32,32) and one down‐conv to (B,32,16,16)
+    1) content MLP: (B,N,D) → (B,N,E)
+    2) FiLM pos‐modulation: (B,N,E)
+    3) pad/truncate seq‐len → 4*H*W
+    4) permute → (B, E, 4*H*W)
+    5) Conv1d(stride=2)  → (B, C/2, 2*H*W)
+    6) Conv1d(stride=2)  → (B, C,   H*W)
+    7) reshape → (B, C, H, W)
     """
-    def __init__(self, block_emb_dim=3, pos_emb_dim=16, grid_size=(32,32)):
+    def __init__(self,
+                 block_emb_dim: int = 3,
+                 pos_emb_dim: int   = 16,
+                 grid_size: tuple   = (16,16),
+                 latent_channels: int = 32):
         super().__init__()
         H, W = grid_size
         self.H, self.W = H, W
         self.n_cells = H * W
-        
-        # keep your existing pos-MLP
-        self.pos_mlp = nn.Sequential(
+
+        # embed‐dim is a quarter of your final channels
+        E = latent_channels // 4
+
+        # 1) content MLP: D → E
+        self.content_mlp = nn.Sequential(
+            nn.Linear(block_emb_dim, pos_emb_dim),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(pos_emb_dim, E),
+        )
+        # 2) FiLM MLP: pos(3) → 2*E (γ,β)
+        self.film_mlp = nn.Sequential(
             nn.Linear(3, pos_emb_dim),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(pos_emb_dim, block_emb_dim),
+            nn.Linear(pos_emb_dim, 2 * E),
         )
-        # project block_emb_dim→4 so we can form a 4-channel "image"
-        self.cell_proj = nn.Linear(block_emb_dim, 4)
-        
-        # single conv: (B,4,32,32) → (B,32,16,16)
-        self.down = nn.Sequential(
-            nn.Conv2d(4, 32, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+
+        # 3–6) two strided Conv1d blocks: E→C/2→C
+        C2 = latent_channels // 2
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(E,    C2, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm1d(C2),
             nn.LeakyReLU(0.2, inplace=True),
         )
-    
-    def forward(self, block_embs, spans):
-        B, N, D = block_embs.shape
-        # 1) positional add
-        delta = self.pos_mlp(spans)        # (B,N,3)
-        x = block_embs + delta             # (B,N,3)
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(C2, latent_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm1d(latent_channels),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
 
-        # 2) pad/truncate to 1024
-        cells = self.n_cells
-        if N < cells:
-            pad = x.new_zeros((B, cells-N, D))
+    def forward(self, block_embs: torch.Tensor, spans: torch.Tensor) -> torch.Tensor:
+        """
+        block_embs: (B, N, D)
+        spans:      (B, N, 3)
+        returns:    (B, C, H, W)
+        """
+        B, N, D = block_embs.shape
+        H, W    = self.H, self.W
+
+        # 1) content → (B,N,E)
+        c = self.content_mlp(block_embs)
+
+        # 2) FiLM: compute (γ,β) from spans → apply
+        gam_bias = self.film_mlp(spans)            # (B,N,2E)
+        gamma, beta = gam_bias.chunk(2, dim=-1)   # each (B,N,E)
+        x = gamma * c + beta                      # (B,N,E)
+
+        # 3) pad/truncate sequence-length to exactly 4*H*W
+        seq_len = 4 * H * W
+        if N < seq_len:
+            pad = x.new_zeros((B, seq_len - N, x.size(-1)))
             x = torch.cat([x, pad], dim=1)
         else:
-            x = x[:, :cells]  # TODO: JUST A PLACEHOLDER FOR NOW, BUT WE NEVER WANT TO SLICE LIKE THIS!
+            x = x[:, :seq_len]
 
-        # 3) project 3→4 channels
-        x = self.cell_proj(x)   # (B,1024,4)
+        # 4) → (B, E, seq_len)
+        x = x.permute(0, 2, 1)
 
-        # 4) reshape into 32×32 grid
-        x = x.view(B, cells, 4).permute(0,2,1)        # (B,4,1024)
-        x = x.view(B, 4, self.H, self.W)              # (B,4,H,W)
+        # 5) → (B, C/2, 2*H*W)
+        x = self.conv1(x)
 
-        # 5) one down-conv to 16×16 with 32 channels
-        return self.down(x)    # (B,32,16,16)
-    
+        # 6) → (B, C, H*W)
+        x = self.conv2(x)
+
+        # 7) reshape to 2D grid
+        return x.view(B, -1, H, W)                # (B, C, H, W)
+
+
 
 class JointBlockDecoder(nn.Module):
     """
-    Mirror of the new JointBlockEmbedder:
-      1) z: (B,16,16,16)  → upsample to (B, 4, 32, 32)
-      2) reshape → (B,1024,4)
-      3) linear 4→3 → (B,1024,3)
-      4) unpad → (B, N, 3)
-      5) subtract positional delta
+    Mirror of the embedder, but taking in z of shape (B, C2, H, W), where
+    C2 = latent_channels // 2 == the number of sampled latent channels.
     """
     def __init__(self,
-                 pos_mlp: nn.Module,
-                 grid_size: tuple = (32,32),
-                 block_emb_dim: int = 3):
+                 grid_size: tuple   = (16,16),
+                 block_emb_dim: int = 3,
+                 pos_emb_dim: int   = 16,
+                 latent_channels: int = 32):
         super().__init__()
         H, W = grid_size
-        self.n_cells = H * W           # =1024
-        self.pos_mlp = pos_mlp
+        self.H, self.W = H, W
+        self.n_cells  = H * W
 
-        # 1) invert the single down‐conv: 32→16 (we split 32→16+16 in VAE)
-        #    so input to decoder is 16 channels
-        #    we upsample 16×16→32×32 in one step
-        self.up = nn.Sequential(
-            nn.ConvTranspose2d(
-                in_channels=16,
-                out_channels=4,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                output_padding=1,
-                bias=False
-            ),
-            nn.BatchNorm2d(4),
+        # match the embedder’s channel math:
+        E  = latent_channels // 4   # content‐MLP hidden dim
+        C2 = latent_channels // 2   # z’s channel count
+
+        # first upsample: C2→E, length N→2N
+        self.deconv1 = nn.Sequential(
+            nn.ConvTranspose1d(in_channels=C2, out_channels=E,
+                               kernel_size=3, stride=2, padding=1, output_padding=1, bias=False),
+            nn.BatchNorm1d(E),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        # second upsample: E→E, length 2N→4N
+        self.deconv2 = nn.Sequential(
+            nn.ConvTranspose1d(in_channels=E, out_channels=E,
+                               kernel_size=3, stride=2, padding=1, output_padding=1, bias=False),
+            nn.BatchNorm1d(E),
             nn.LeakyReLU(0.2, inplace=True),
         )
 
-        # 2) project channels 4→3 for the block embeddings
-        self.cell_unproj = nn.Linear(4, block_emb_dim)
+        # project back to original block‐embedding dim
+        self.cell_unproj = nn.Linear(E, block_emb_dim)
 
     def forward(self, z: torch.Tensor, spans: torch.Tensor) -> torch.Tensor:
-        """
-        z:     (B,16,16,16)
-        spans: (B, N, 3)
-        returns recon_emb: (B, N, 3)
-        """
-        B, _, _, _ = z.shape
+        B, C2, H, W = z.shape
+        N = spans.size(1)
 
-        # 1) upsample → (B,4,32,32)
-        x = self.up(z)
+        # fuse H×W → sequence of length H*W
+        x = z.view(B, C2, H*W)
 
-        # 2) flatten to (B,1024,4)
-        x = x.view(B, 4, self.n_cells).permute(0, 2, 1)
+        # 1) upsample → (B, E, 2*H*W)
+        x = self.deconv1(x)
 
-        # 3) linear 4→3 → (B,1024,3)
+        # 2) upsample → (B, E, 4*H*W)
+        x = self.deconv2(x)
+
+        # 3) → (B, 4*H*W, E)
+        x = x.permute(0, 2, 1)
+
+        # 4) pad back to original N
+        seq_len = 4 * H * W
+        if N < seq_len:
+            x = x[:, :N, :]
+
+        # 5) project E→D
         x = self.cell_unproj(x)
 
-        # 4) unpad back to N
-        N = spans.shape[1]
-        if N < self.n_cells:
-            x = x[:, :N, :]  # (B, N, 3)
+        return x    # (B, N, block_emb_dim)
 
-        # 5) subtract positional delta
-        delta = self.pos_mlp(spans)         # (B, N, 3)
-        recon = x - delta                   # (B, N, 3)
-
-        return recon
 
 
 class SNPVAE(nn.Module):
-    def __init__(self, grid_size=(32,32), block_emb_dim=3, pos_emb_dim=16, latent_channels=32):
+    def __init__(
+        self,
+        grid_size=(16,16),
+        block_emb_dim=3,
+        pos_emb_dim=16,
+        latent_channels=32
+    ):
         super().__init__()
-        # 1) joint embedder now yields (B,32,16,16)
-        self.joint_embedder = JointBlockEmbedder(block_emb_dim, pos_emb_dim, grid_size)
+
+        # 1) Embedder: content‐MLP + FiLM + Conv1d↓ → (B,32,16,16)
+        self.joint_embedder = JointBlockEmbedder(
+            block_emb_dim   = block_emb_dim,
+            pos_emb_dim     = pos_emb_dim,
+            grid_size       = grid_size,
+            latent_channels = latent_channels,
+        )
 
         # 2) VAE head: split 32→(16+16) for mean/logvar
-        #    → DiagonalGaussianDistribution will take exactly (B,32,16,16)
-        #    and chunk it into two (B,16,16,16)
+        #    DiagonalGaussianDistribution expects a 32-channel map
+        #    and splits it internally into two 16-ch tensors.
         
-        # 3) single up-conv to get back to 32×32
-        self.spatial_decoder = nn.Sequential(
-            # 16×16→32×32, 16→4 channels
-            nn.ConvTranspose2d(16, 8, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(8),
-            nn.LeakyReLU(0.2, inplace=True),
-            # collapse to 4 channels full-res
-            nn.Conv2d(8, 4, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(4),
-            nn.LeakyReLU(0.2, inplace=True),
+        # 3) Decoder: mirror of embedder
+        #    Needs the original span→delta-MLP from the embedder
+        self.joint_decoder = JointBlockDecoder(
+            grid_size       = grid_size,
+            block_emb_dim   = block_emb_dim,
+            pos_emb_dim     = pos_emb_dim,
+            latent_channels = latent_channels,
         )
-        # 4) reshape back to (B,4,32,32) → (B,1024,4) → (B,1024,4) permute → (B,1024,4)
-        #     then subtract delta, project back to 3‐dim, and return.
-        self.cell_unproj = nn.Linear(4, block_emb_dim)
-        self.pos_mlp = self.joint_embedder.pos_mlp
-        
-        self.joint_decoder = JointBlockDecoder(self.pos_mlp, grid_size = grid_size, block_emb_dim = block_emb_dim)
 
     def encode(self, block_embs, spans):
-        x = self.joint_embedder(block_embs, spans)     # (B,32,16,16)
-        params = x                                      # (B,32,16,16)
-        dist = DiagonalGaussianDistribution(params)     # will chunk → two 16‐ch maps
-        z = dist.sample()                              # (B,16,16,16)
+        """
+        block_embs: (B, N, D)
+        spans:      (B, N, 3)
+        returns:
+          z:    (B,16,16,16)
+          dist: DiagonalGaussianDistribution over z
+        """
+        x = self.joint_embedder(block_embs, spans)   # (B,32,16,16)
+        dist = DiagonalGaussianDistribution(x)       # splits 32→16+16 internally
+        z = dist.sample()                            # (B,16,16,16)
         return z, dist
 
     def decode(self, z, spans):
+        """
+        z:     (B,16,16,16)
+        spans: (B, N, 3)
+        returns:
+          recon_emb: (B, N, D)
+        """
         return self.joint_decoder(z, spans)
 
     def forward(self, block_embs, spans):
         z, dist = self.encode(block_embs, spans)
-        return self.decode(z, spans), dist
+        recon = self.decode(z, spans)
+        return recon, dist
