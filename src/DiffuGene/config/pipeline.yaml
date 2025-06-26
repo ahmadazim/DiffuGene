@@ -95,6 +95,13 @@ generation:
   batch_size: 64
   num_time_steps: 1000
   num_inference_steps: 100
+  
+  # Decoding parameters (to convert latents back to SNP space)
+  decode_samples: true
+  vae_model_path: "${global.model_root}/joint_embed/vae_model.pt"
+  pca_loadings_dir: "${global.data_root}/haploblocks_embeddings/loadings"
+  recoded_dir: "${global.data_root}/haploblocks_recoded"
+  decoded_output_dir: "${global.data_root}/generated_samples/decoded_snps"
 
 # Pipeline execution control
 pipeline:

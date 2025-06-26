@@ -29,7 +29,7 @@ import warnings
 import pandas as pd
 warnings.filterwarnings('ignore')
 
-from .config import load_config, get_default_config_path
+from .config import load_config, get_default_config_path, expand_variables
 from .utils import setup_logging, get_logger, ensure_dir_exists, load_blocks_for_chr
 
 logger = get_logger(__name__)
@@ -129,7 +129,30 @@ class DiffuGenePipeline:
             
         elif step_name == 'generation':
             output_path = self.config['generation']['output_path']
-            return os.path.exists(output_path)
+            latents_exist = os.path.exists(output_path)
+            
+            # If decoding is enabled, also check for decoded samples
+            gen_config = self.config['generation']
+            if gen_config.get('decode_samples', False):
+                # Ensure the decoded output directory path is properly expanded for checking
+                temp_config = {
+                    'global': self.config['global'],
+                    'joint_embed': self.config['joint_embed'],
+                    'block_embed': self.config['block_embed'],
+                    'data_prep': self.config['data_prep'],
+                    'generation': gen_config
+                }
+                expanded_config = expand_variables(temp_config)
+                decoded_dir = expanded_config['generation']['decoded_output_dir']
+                
+                if os.path.exists(decoded_dir):
+                    pattern = os.path.join(decoded_dir, f"*chr{int(self.config['global']['chromosome'])}_block_*_decoded.pt")
+                    decoded_samples_exist = len(glob.glob(pattern)) > 0
+                    return latents_exist and decoded_samples_exist
+                else:
+                    return False
+            else:
+                return latents_exist
             
         return False
     
@@ -354,9 +377,44 @@ class DiffuGenePipeline:
         logger.info("STEP 5: Sample Generation")
         logger.info("=" * 60)
         
-        if self.check_step_outputs('generation'):
-            logger.info("Generated samples found, skipping...")
+        gen_config = self.config['generation']
+        output_path = gen_config['output_path']
+        latents_exist = os.path.exists(output_path)
+        
+        # Check if decoding is needed and if decoded samples exist
+        decode_enabled = gen_config.get('decode_samples', False)
+        decoded_samples_exist = False
+        
+        if decode_enabled:
+            # Ensure the decoded output directory path is properly expanded for checking
+            temp_config = {
+                'global': self.config['global'],
+                'joint_embed': self.config['joint_embed'],
+                'block_embed': self.config['block_embed'],
+                'data_prep': self.config['data_prep'],
+                'generation': gen_config
+            }
+            expanded_config = expand_variables(temp_config)
+            decoded_dir = expanded_config['generation']['decoded_output_dir']
+            
+            if os.path.exists(decoded_dir):
+                pattern = os.path.join(decoded_dir, f"*chr{int(self.config['global']['chromosome'])}_block_*_decoded.pt")
+                decoded_samples_exist = len(glob.glob(pattern)) > 0
+        
+        # Determine what needs to be done
+        if latents_exist and (not decode_enabled or decoded_samples_exist):
+            logger.info("All required outputs found, skipping generation step...") 
             return
+        elif latents_exist and decode_enabled and not decoded_samples_exist:
+            logger.info("Latents exist but decoded samples missing - running decode-only...")
+            self._run_decode_only(output_path, gen_config)
+            return
+        else:
+            logger.info("Running full generation pipeline...")
+            if not latents_exist:
+                logger.info("Latents not found - will generate new samples")
+            if decode_enabled and not decoded_samples_exist:
+                logger.info("Decoded samples not found - will decode after generation")
         
         # Import and run sample generation
         from .diffusion.generate import generate
@@ -364,16 +422,98 @@ class DiffuGenePipeline:
         
         # Prepare arguments (ensure proper types)
         args = SimpleNamespace()
-        gen_config = self.config['generation']
         args.model_path = gen_config['model_path']
-        args.output_path = gen_config['output_path']
+        args.output_path = output_path
         args.num_samples = int(gen_config['num_samples'])
         args.batch_size = int(gen_config['batch_size'])
         args.num_time_steps = int(gen_config['num_time_steps'])
         args.num_inference_steps = int(gen_config['num_inference_steps'])
         
+        # Add decoding parameters if enabled
+        if decode_enabled:
+            # Ensure paths are properly expanded
+            temp_config = {
+                'global': self.config['global'],
+                'joint_embed': self.config['joint_embed'],
+                'block_embed': self.config['block_embed'],
+                'data_prep': self.config['data_prep'],
+                'generation': gen_config
+            }
+            expanded_config = expand_variables(temp_config)
+            expanded_gen_config = expanded_config['generation']
+            
+            args.decode_samples = True
+            args.vae_model_path = expanded_gen_config['vae_model_path']
+            args.pca_loadings_dir = expanded_gen_config['pca_loadings_dir']
+            args.recoded_dir = expanded_gen_config['recoded_dir']
+            args.decoded_output_dir = expanded_gen_config['decoded_output_dir']
+            args.basename = self.config['global']['basename']
+            args.chromosome = int(self.config['global']['chromosome'])
+            
+            logger.info("Decoding enabled - samples will be decoded to SNP space")
+            logger.info(f"VAE model path: {args.vae_model_path}")
+            logger.info(f"PCA loadings dir: {args.pca_loadings_dir}")
+            logger.info(f"Decoded output dir: {args.decoded_output_dir}")
+        else:
+            args.decode_samples = False
+            logger.info("Decoding disabled - only latent samples will be generated")
+        
         generate(args)
         logger.info("Sample generation completed successfully")
+    
+    def _run_decode_only(self, latents_path, gen_config):
+        """Run decoding only on existing latent samples."""
+        logger.info("Loading existing latent samples for decoding...")
+        
+        # Import decoding functions
+        from .diffusion.generate import load_vae_model, load_pca_models, load_spans_data, decode_samples, save_decoded_samples
+        
+        try:
+            # Ensure all paths are properly expanded using the full config context
+            # Create a temporary config dict with the generation section to expand variables
+            temp_config = {
+                'global': self.config['global'],
+                'joint_embed': self.config['joint_embed'],
+                'block_embed': self.config['block_embed'],
+                'data_prep': self.config['data_prep'],
+                'generation': gen_config
+            }
+            expanded_config = expand_variables(temp_config)
+            expanded_gen_config = expanded_config['generation']
+            
+            # Load existing latents
+            latents = torch.load(latents_path, map_location='cpu')
+            logger.info(f"Loaded latents: {latents.shape}")
+            
+            # Load VAE model with expanded path
+            vae_model_path = expanded_gen_config['vae_model_path']
+            logger.info(f"Loading VAE model from {vae_model_path}")
+            vae_model = load_vae_model(vae_model_path, device="cuda")
+            
+            # Load PCA models with expanded path
+            pca_loadings_dir = expanded_gen_config['pca_loadings_dir']
+            logger.info(f"Loading PCA models from {pca_loadings_dir}")
+            pca_models, block_info = load_pca_models(pca_loadings_dir, int(self.config['global']['chromosome']))
+            
+            # Load spans data with expanded path
+            recoded_dir = expanded_gen_config['recoded_dir']
+            logger.info(f"Loading spans data from {recoded_dir}")
+            spans = load_spans_data(recoded_dir, self.config['global']['basename'], int(self.config['global']['chromosome']))
+            
+            # Decode samples
+            decoded_snps = decode_samples(latents, vae_model, spans, pca_models, device="cuda")
+            
+            # Save decoded samples with expanded path
+            decoded_output_dir = expanded_gen_config['decoded_output_dir']
+            logger.info(f"Saving decoded samples to {decoded_output_dir}")
+            save_decoded_samples(decoded_snps, decoded_output_dir, self.config['global']['basename'], int(self.config['global']['chromosome']))
+            
+            logger.info("Decode-only operation completed successfully!")
+            
+        except Exception as e:
+            logger.error(f"Error during decode-only operation: {e}")
+            logger.info("You may need to regenerate the samples entirely.")
+            raise
     
     def run_pipeline(self, steps: List[str] = None):
         """Run the complete pipeline or specified steps."""
@@ -439,6 +579,9 @@ Examples:
   
   # Force rerun all steps
   python -m DiffuGene.pipeline --force-rerun
+  
+  # Decode existing latent samples only
+  python -m DiffuGene.pipeline --decode-only
         """
     )
     
@@ -460,6 +603,12 @@ Examples:
         '--force-rerun',
         action='store_true',
         help='Force rerun all steps even if outputs exist'
+    )
+    
+    parser.add_argument(
+        '--decode-only',
+        action='store_true',
+        help='Only decode existing latent samples (skips generation if latents exist)'
     )
     
     parser.add_argument(
@@ -485,6 +634,19 @@ Examples:
     # Override force_rerun if specified
     if args.force_rerun:
         pipeline.config['pipeline']['force_rerun'] = True
+    
+    # Handle decode-only mode
+    if args.decode_only:
+        if args.steps and 'generation' not in args.steps:
+            print("Warning: --decode-only specified but 'generation' not in --steps. Adding 'generation' step.")
+            args.steps.append('generation')
+        elif not args.steps:
+            args.steps = ['generation']
+        
+        # Enable decoding in config if not already enabled
+        if not pipeline.config['generation'].get('decode_samples', False):
+            print("Warning: decode_samples is False in config, enabling it for --decode-only mode")
+            pipeline.config['generation']['decode_samples'] = True
     
     # Run pipeline
     pipeline.run_pipeline(args.steps)

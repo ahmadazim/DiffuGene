@@ -399,8 +399,26 @@ def train(args):
 
     # Save model
     os.makedirs(os.path.dirname(args.model_save_path), exist_ok=True)
-    torch.save(model.state_dict(), args.model_save_path)
-    logger.info(f"Model saved to {args.model_save_path}")
+    
+    # Save model with configuration for future compatibility
+    final_model_data = {
+        'model_state_dict': model.state_dict(),
+        'config': {
+            'grid_h': args.grid_h,
+            'grid_w': args.grid_w,
+            'block_dim': args.block_dim,
+            'pos_dim': args.pos_dim,
+            'latent_channels': args.latent_channels
+        },
+        'training_info': {
+            'epochs': args.epochs,
+            'final_epoch': epoch,
+            'lr': args.lr,
+            'kld_weight': args.kld_weight
+        }
+    }
+    torch.save(final_model_data, args.model_save_path)
+    logger.info(f"Model with config saved to {args.model_save_path}")
 
 def evaluate_model(model, dataset, pca_blocks, batch_size):
     """Comprehensive evaluation of model on SNP reconstruction."""
