@@ -26,10 +26,11 @@ class SNPBlocksDataset(Dataset):
     Expects:
       - spans_file:   CSV with columns [block_file, chr, start, end]
     """
-    def __init__(self, spans_file: str, recoded_dir: str, load_snps: bool = True):
+    def __init__(self, spans_file: str, recoded_dir: str, load_snps: bool = True, scale_pc_embeddings: bool = False):
         if load_snps:
             logger.info("Loading dataset...")
         self.df = pd.read_csv(spans_file)
+        self.scale_pc_embeddings = scale_pc_embeddings
         # load all embeddings into memory
         embs = []
         scaled_spans = []
@@ -90,6 +91,13 @@ class SNPBlocksDataset(Dataset):
         self.block_embs = block_embs.permute(1, 0, 2)         # (N_train, N_blocks, max_dim)
         self.spans = torch.tensor(scaled_spans, dtype=torch.float32)       # (N_blocks, 3) - ensure float32
         
+        # Apply PC embedding scaling if requested
+        self.pc_scales = None
+        self.pc_means = None
+        if self.scale_pc_embeddings:
+            self._apply_pc_scaling()
+            logger.info(f"Applied PC embedding scaling. Scales shape: {self.pc_scales.shape}")
+        
         # transpose true_snps_blocks → per‐sample lists
         N_blocks = len(true_snps_blocks)
         N_train  = self.block_embs.size(0)
@@ -111,6 +119,30 @@ class SNPBlocksDataset(Dataset):
         # return one sample: block_embs, spans
         emb, spans, true_snps = self.block_embs[idx], self.spans, self.true_snps[idx]
         return emb, spans, true_snps
+    
+    def _apply_pc_scaling(self):
+        """Apply standardization to PC embeddings across all samples and blocks."""
+        # self.block_embs shape: (N_train, N_blocks, max_dim)
+        
+        # Flatten to (N_train * N_blocks, max_dim) to compute global statistics
+        flattened = self.block_embs.reshape(-1, self.block_embs.size(-1))  # (N_train * N_blocks, max_dim)
+        
+        # Compute mean and std for each PC dimension across all samples and blocks
+        # Note: embeddings are already zero-mean from PCA, but we compute mean anyway for robustness
+        self.pc_means = flattened.mean(dim=0)  # (max_dim,)
+        self.pc_stds = flattened.std(dim=0, unbiased=False)  # (max_dim,)
+        
+        # Avoid division by zero for padded dimensions (should have std=0)
+        self.pc_stds[self.pc_stds == 0] = 1.0
+        
+        # Apply standardization: (x - mean) / std
+        self.block_embs = (self.block_embs - self.pc_means.unsqueeze(0).unsqueeze(0)) / self.pc_stds.unsqueeze(0).unsqueeze(0)
+        
+        # Store inverse scaling factors for reconstruction
+        self.pc_scales = self.pc_stds  # We'll need to multiply by this and add mean to unscale
+        
+        logger.info(f"PC scaling stats - Mean range: [{self.pc_means.min():.4f}, {self.pc_means.max():.4f}], "
+                   f"Std range: [{self.pc_stds.min():.4f}, {self.pc_stds.max():.4f}]")
 
 def load_pca_blocks(embeddings_dir):
     """Load PCA blocks for SNP reconstruction with dimension metadata."""
@@ -185,6 +217,28 @@ def load_pca_blocks(embeddings_dir):
     
     return pca_blocks
 
+def unscale_embeddings(embeddings, pc_means, pc_scales):
+    """Reverse the PC scaling applied during training.
+    
+    Args:
+        embeddings: (batch_size, n_blocks, k) - scaled embeddings
+        pc_means: (k,) - means used for scaling  
+        pc_scales: (k,) - standard deviations used for scaling
+    
+    Returns:
+        unscaled_embeddings: (batch_size, n_blocks, k) - original scale embeddings
+    """
+    if pc_means is None or pc_scales is None:
+        return embeddings  # No scaling was applied
+    
+    # Ensure scaling factors are on the same device as embeddings
+    device = embeddings.device
+    pc_means = pc_means.to(device)
+    pc_scales = pc_scales.to(device)
+    
+    # Reverse standardization: x_orig = x_scaled * std + mean
+    return embeddings * pc_scales.unsqueeze(0).unsqueeze(0) + pc_means.unsqueeze(0).unsqueeze(0)
+
 def create_embedding_masks(pca_blocks, max_dim, device="cuda"):
     """Create masks for valid (non-padded) dimensions in block embeddings."""
     masks = []
@@ -216,9 +270,17 @@ def masked_mse_loss(pred, target, mask, reduction='mean'):
 def train(args):
     setup_logging()
     
+    # Initialize epoch variable to avoid UnboundLocalError when resuming from completed training
+    epoch = 0
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Using device: {device}")
+    
     # Create two datasets: one without SNPs (faster), one with SNPs (for SNP loss phases)
-    ds_no_snps = SNPBlocksDataset(args.spans_file, args.recoded_dir, load_snps=False)
-    ds_with_snps = SNPBlocksDataset(args.spans_file, args.recoded_dir, load_snps=True)
+    scale_pc = getattr(args, 'scale_pc_embeddings', False)
+    ds_no_snps = SNPBlocksDataset(args.spans_file, args.recoded_dir, load_snps=False, scale_pc_embeddings=scale_pc)
+    ds_with_snps = SNPBlocksDataset(args.spans_file, args.recoded_dir, load_snps=True, scale_pc_embeddings=scale_pc)
     # For evaluation, always use dataset with SNPs
     ds_eval = ds_with_snps
     
@@ -237,13 +299,13 @@ def train(args):
         block_emb_dim   = args.block_dim,
         pos_emb_dim     = args.pos_dim,
         latent_channels = args.latent_channels
-    ).cuda()
+    ).to(device)
 
     # Load PCA blocks for SNP reconstruction
     pca_blocks = load_pca_blocks(args.embeddings_dir)
     
     # Create embedding dimension masks for padded dimensions
-    embedding_mask = create_embedding_masks(pca_blocks, args.block_dim, device="cuda")
+    embedding_mask = create_embedding_masks(pca_blocks, args.block_dim, device=device)
     
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     
@@ -255,7 +317,7 @@ def train(args):
         os.path.exists(args.checkpoint_path)):
         logger.info(f"Loading initial checkpoint from {args.checkpoint_path}")
         try:
-            checkpoint = torch.load(args.checkpoint_path, map_location='cuda')
+            checkpoint = torch.load(args.checkpoint_path, map_location=device)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
@@ -300,8 +362,8 @@ def train(args):
                 emb, spans, _ = batch_data  # raw_snps will be empty list
             
             # Move to GPU and ensure correct types
-            emb = emb.float().cuda()
-            spans = spans.float().cuda()
+            emb = emb.float().to(device)
+            spans = spans.float().to(device)
             
             # Forward pass
             recon_emb, dist = model(emb, spans)
@@ -317,9 +379,11 @@ def train(args):
             
             # Add SNP reconstruction loss if in SNP phase - EXACTLY like original train.py
             if use_snp_loss:
-                # Follow original train.py EXACTLY:
+                # Unscale embeddings before PCA decoding if scaling was applied
+                recon_emb_unscaled = unscale_embeddings(recon_emb, current_ds.pc_means, current_ds.pc_scales)
+                
                 decoded_snps = [
-                    pca_blocks[idx].decode(recon_emb[:, idx, :])
+                    pca_blocks[idx].decode(recon_emb_unscaled[:, idx, :])
                     for idx in range(len(pca_blocks))
                 ]
                 
@@ -408,7 +472,8 @@ def train(args):
             'grid_w': args.grid_w,
             'block_dim': args.block_dim,
             'pos_dim': args.pos_dim,
-            'latent_channels': args.latent_channels
+            'latent_channels': args.latent_channels,
+            'scale_pc_embeddings': scale_pc
         },
         'training_info': {
             'epochs': args.epochs,
@@ -417,6 +482,14 @@ def train(args):
             'kld_weight': args.kld_weight
         }
     }
+    
+    # Save PC scaling factors if they were used
+    if scale_pc and ds_with_snps.pc_means is not None:
+        final_model_data['pc_scaling'] = {
+            'pc_means': ds_with_snps.pc_means,
+            'pc_scales': ds_with_snps.pc_scales
+        }
+        logger.info("Saved PC scaling factors with model")
     torch.save(final_model_data, args.model_save_path)
     logger.info(f"Model with config saved to {args.model_save_path}")
 
@@ -443,9 +516,12 @@ def evaluate_model(model, dataset, pca_blocks, batch_size):
             # Forward pass
             recon_emb, _ = model(emb, spans)
             
+            # Unscale embeddings before PCA decoding if scaling was applied
+            recon_emb_unscaled = unscale_embeddings(recon_emb, dataset.pc_means, dataset.pc_scales)
+            
             # Evaluation following original script exactly
             decoded = [
-                pca_blocks[idx].decode(recon_emb[:, idx, :])
+                pca_blocks[idx].decode(recon_emb_unscaled[:, idx, :])
                 for idx in range(len(pca_blocks))
             ]
             # MSE
@@ -491,6 +567,7 @@ def main():
     parser.add_argument("--snp-start-epoch", type=int, default=10)
     parser.add_argument("--decoded-mse-weight", type=float, default=1e-2)
     parser.add_argument("--eval-frequency", type=int, default=10, help="Evaluation and checkpoint frequency (epochs)")
+    parser.add_argument("--scale-pc-embeddings", action="store_true", help="Standardize PC embeddings across samples/blocks before VAE training")
     
     args = parser.parse_args()
     train(args)

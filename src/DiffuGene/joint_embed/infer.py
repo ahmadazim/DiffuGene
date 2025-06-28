@@ -6,15 +6,22 @@ import os
 
 from ..utils import setup_logging, get_logger
 from .vae import SNPVAE
-from .train import SNPBlocksDataset
+from .train import SNPBlocksDataset, unscale_embeddings
 
 logger = get_logger(__name__)
 
 def inference(args):
     setup_logging()
     
+    # Handle both old and new model save formats to determine if PC scaling was used
+    checkpoint = torch.load(args.model_path, map_location='cpu')
+    if isinstance(checkpoint, dict) and 'config' in checkpoint:
+        scale_pc_embeddings = checkpoint['config'].get('scale_pc_embeddings', False)
+    else:
+        scale_pc_embeddings = False
+    
     # Load dataset first to get actual embedding dimension
-    dataset = SNPBlocksDataset(args.spans_file, args.recoded_dir, load_snps=False)
+    dataset = SNPBlocksDataset(args.spans_file, args.recoded_dir, load_snps=False, scale_pc_embeddings=scale_pc_embeddings)
     
     # Get the actual embedding dimension from the dataset
     actual_block_dim = dataset.block_embs.shape[-1]
@@ -39,10 +46,25 @@ def inference(args):
         # New format with metadata
         model.load_state_dict(checkpoint['model_state_dict'])
         logger.info("Loaded model from new format with metadata")
+        
+        # Load PC scaling factors if they exist
+        pc_means = None
+        pc_scales = None
+        if 'pc_scaling' in checkpoint and scale_pc_embeddings:
+            pc_means = checkpoint['pc_scaling']['pc_means'].cuda()
+            pc_scales = checkpoint['pc_scaling']['pc_scales'].cuda()
+            logger.info("Loaded PC scaling factors from saved model")
+        elif scale_pc_embeddings:
+            # Use scaling factors from dataset if not in model (for compatibility)
+            pc_means = dataset.pc_means.cuda() if dataset.pc_means is not None else None
+            pc_scales = dataset.pc_scales.cuda() if dataset.pc_scales is not None else None
+            logger.info("Using PC scaling factors from dataset")
     else:
         # Old format - direct state dict
         model.load_state_dict(checkpoint)
         logger.info("Loaded model from old format")
+        pc_means = None
+        pc_scales = None
     model.eval()
     
     # Encode all data

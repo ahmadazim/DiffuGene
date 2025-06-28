@@ -97,7 +97,9 @@ def train(
             #     logger.info(f"[DEBUG] normalized input per-channel std: {x.std(dim=(0,2,3)).cpu().tolist()}")
 
             # sample random timesteps and noise, then add noise via HF scheduler
-            t     = torch.randint(0, num_time_steps, (batch_size,), device=x.device)
+            # t = torch.randint(0, num_time_steps, (batch_size,), device=x.device)
+            idx = torch.randint(0, num_time_steps, (batch_size,), device=x.device)
+            t = scheduler.timesteps[idx]
             noise = torch.randn_like(x)
             x_clean = x
             x = scheduler.add_noise(x_clean, noise, t)

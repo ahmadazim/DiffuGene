@@ -318,6 +318,7 @@ class DiffuGenePipeline:
         args.snp_start_epoch = int(train_config['snp_start_epoch'])
         args.decoded_mse_weight = float(train_config['decoded_mse_weight'])
         args.eval_frequency = int(train_config['eval_frequency'])
+        args.scale_pc_embeddings = bool(train_config.get('scale_pc_embeddings', False))
         
         # Run VAE training
         vae_train(args)
