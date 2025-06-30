@@ -114,128 +114,147 @@ def load_vae_model(vae_model_path, device="cuda"):
     logger.info("VAE model loaded successfully")
     return vae_model
 
-def load_pca_models(pca_loadings_dir, chromosome):
-    """Load all PCA models for the given chromosome."""
+def load_pca_models(pca_loadings_dir, chromosomes):
+    """Load all PCA models for the given chromosome(s)."""
     logger.info(f"Loading PCA models from {pca_loadings_dir}")
     
-    # Find all PCA model files for this chromosome
-    # The actual pattern is: *_chr{chromosome}_block*_pca_loadings.pt
-    pattern = os.path.join(pca_loadings_dir, f"*chr{chromosome}_block*_pca_loadings.pt")
-    pca_files = sorted(glob.glob(pattern))
-    
-    if not pca_files:
-        raise FileNotFoundError(f"No PCA model files found for chromosome {chromosome} in {pca_loadings_dir}")
+    # Handle both single chromosome (int) and multiple chromosomes (list)
+    if isinstance(chromosomes, int):
+        chromosomes = [chromosomes]
     
     pca_models = {}
     block_info = {}
     
-    for pca_file in pca_files:
-        # Extract block information from filename
-        # Expected format: "all_hm3_15k_chr22_blockXXX_pca_loadings.pt"
-        basename = os.path.basename(pca_file)
+    for chromosome in chromosomes:
+        logger.info(f"Loading PCA models for chromosome {chromosome}")
         
-        # Extract block number using regex
-        match = re.search(r'block(\d+)_pca_loadings\.pt$', basename)
-        if not match:
-            logger.warning(f"Could not extract block number from {basename}")
+        # Find all PCA model files for this chromosome
+        # The actual pattern is: *_chr{chromosome}_block*_pca_loadings.pt
+        pattern = os.path.join(pca_loadings_dir, f"*chr{chromosome}_block*_pca_loadings.pt")
+        pca_files = sorted(glob.glob(pattern))
+        
+        if not pca_files:
+            logger.warning(f"No PCA model files found for chromosome {chromosome} in {pca_loadings_dir}")
             continue
-            
-        block_id = match.group(1)
         
-        # Load the PCA model from PyTorch format
-        # We need to reconstruct the PCA_Block object from the saved loadings
-        try:
-            # Load the loadings (components) - may be numpy array or torch tensor
-            loadings = torch.load(pca_file, map_location='cpu', weights_only=False)
+        for pca_file in pca_files:
+            # Extract block information from filename
+            # Expected format: "all_hm3_15k_chr22_blockXXX_pca_loadings.pt"
+            basename = os.path.basename(pca_file)
             
-            # Convert numpy array to torch tensor if needed
-            if isinstance(loadings, np.ndarray):
-                loadings = torch.from_numpy(loadings).float()
-            elif not isinstance(loadings, torch.Tensor):
-                loadings = torch.tensor(loadings).float()
-            
-            # Load corresponding means file - shape is (n_snps,)
-            means_file = pca_file.replace('/loadings/', '/means/').replace('_pca_loadings.pt', '_pca_means.pt')
-            if not os.path.exists(means_file):
-                logger.warning(f"Means file not found: {means_file}")
+            # Extract block number using regex
+            match = re.search(r'block(\d+)_pca_loadings\.pt$', basename)
+            if not match:
+                logger.warning(f"Could not extract block number from {basename}")
                 continue
-            means = torch.load(means_file, map_location='cpu', weights_only=False)
-            
-            # Convert means to tensor if needed
-            if isinstance(means, np.ndarray):
-                means = torch.from_numpy(means).float()
-            elif not isinstance(means, torch.Tensor):
-                means = torch.tensor(means).float()
-            
-            # Load metadata if available
-            metadata_file = pca_file.replace('_pca_loadings.pt', '_pca_metadata.pt').replace('/loadings/', '/metadata/')
-            metadata = None
-            if os.path.exists(metadata_file):
-                metadata = torch.load(metadata_file, map_location='cpu', weights_only=False)
-            
-            # Get dimensions from metadata or infer from loadings and means
-            if metadata and isinstance(metadata, dict):
-                k = metadata.get('k', 3)
-                actual_k = metadata.get('actual_k', k)
-            else:
-                # Infer from shapes - means tells us n_snps
-                n_snps = len(means)
                 
-                # Determine which dimension of loadings is actual_k
-                if loadings.shape[0] == n_snps:
-                    # loadings is (n_snps, actual_k) - as expected from pca.components_.T
-                    actual_k = loadings.shape[1]
-                elif loadings.shape[1] == n_snps:
-                    # loadings is (actual_k, n_snps) - need to transpose
-                    actual_k = loadings.shape[0]
-                    loadings = loadings.T
+            block_num = match.group(1)
+            # Create unique block ID that includes chromosome to avoid conflicts
+            block_id = f"{chromosome}_{block_num}"
+            
+            # Load the PCA model from PyTorch format
+            # We need to reconstruct the PCA_Block object from the saved loadings
+            try:
+                # Load the loadings (components) - may be numpy array or torch tensor
+                loadings = torch.load(pca_file, map_location='cpu', weights_only=False)
+                
+                # Convert numpy array to torch tensor if needed
+                if isinstance(loadings, np.ndarray):
+                    loadings = torch.from_numpy(loadings).float()
+                elif not isinstance(loadings, torch.Tensor):
+                    loadings = torch.tensor(loadings).float()
+                
+                # Load corresponding means file - shape is (n_snps,)
+                means_file = pca_file.replace('/loadings/', '/means/').replace('_pca_loadings.pt', '_pca_means.pt')
+                if not os.path.exists(means_file):
+                    logger.warning(f"Means file not found: {means_file}")
+                    continue
+                means = torch.load(means_file, map_location='cpu', weights_only=False)
+                
+                # Convert means to tensor if needed
+                if isinstance(means, np.ndarray):
+                    means = torch.from_numpy(means).float()
+                elif not isinstance(means, torch.Tensor):
+                    means = torch.tensor(means).float()
+                
+                # Load metadata if available
+                metadata_file = pca_file.replace('_pca_loadings.pt', '_pca_metadata.pt').replace('/loadings/', '/metadata/')
+                metadata = None
+                if os.path.exists(metadata_file):
+                    metadata = torch.load(metadata_file, map_location='cpu', weights_only=False)
+                
+                # Get dimensions from metadata or infer from loadings and means
+                if metadata and isinstance(metadata, dict):
+                    k = metadata.get('k', 3)
+                    actual_k = metadata.get('actual_k', k)
                 else:
-                    # Can't determine from shapes, assume smaller dimension is actual_k
-                    if loadings.shape[0] <= loadings.shape[1]:
-                        actual_k = loadings.shape[0]
-                        loadings = loadings.T  # Make it (n_snps, actual_k)
-                    else:
+                    # Infer from shapes - means tells us n_snps
+                    n_snps = len(means)
+                    
+                    # Determine which dimension of loadings is actual_k
+                    if loadings.shape[0] == n_snps:
+                        # loadings is (n_snps, actual_k) - as expected from pca.components_.T
                         actual_k = loadings.shape[1]
-                    logger.warning(f"Block {block_id}: Could not match loadings shape {loadings.shape} with means shape {means.shape}, assuming actual_k={actual_k}")
+                    elif loadings.shape[1] == n_snps:
+                        # loadings is (actual_k, n_snps) - need to transpose
+                        actual_k = loadings.shape[0]
+                        loadings = loadings.T
+                    else:
+                        # Can't determine from shapes, assume smaller dimension is actual_k
+                        if loadings.shape[0] <= loadings.shape[1]:
+                            actual_k = loadings.shape[0]
+                            loadings = loadings.T  # Make it (n_snps, actual_k)
+                        else:
+                            actual_k = loadings.shape[1]
+                        logger.warning(f"Block {block_id}: Could not match loadings shape {loadings.shape} with means shape {means.shape}, assuming actual_k={actual_k}")
+                    
+                    k = actual_k  # Assume no padding for old format
                 
-                k = actual_k  # Assume no padding for old format
-            
-            # Ensure loadings are in (n_snps, actual_k) format, then transpose to (actual_k, n_snps) for PCA_Block
-            if loadings.shape[0] != len(means):
-                loadings = loadings.T
-            components = loadings.T  # (actual_k, n_snps)
-            
-            # Create PCA_Block object
-            pca_model = PCA_Block(k=k)
-            pca_model.actual_k = actual_k
-            pca_model.components_ = components  # (actual_k, n_snps)
-            pca_model.means = means  # (n_snps,)
-            
-            pca_models[block_id] = pca_model
-            
-            # Store block info (useful for debugging)
-            block_info[block_id] = {
-                'file': pca_file,
-                'k': k,
-                'actual_k': actual_k,
-                'n_snps': len(means) if means is not None else 0,
-                'loadings_shape': tuple(loadings.shape),
-                'components_shape': tuple(components.shape)
-            }
-            
-        except Exception as e:
-            logger.warning(f"Failed to load PCA model from {pca_file}: {e}")
-            continue
+                # Ensure loadings are in (n_snps, actual_k) format, then transpose to (actual_k, n_snps) for PCA_Block
+                if loadings.shape[0] != len(means):
+                    loadings = loadings.T
+                components = loadings.T  # (actual_k, n_snps)
+                
+                # Create PCA_Block object
+                pca_model = PCA_Block(k=k)
+                pca_model.actual_k = actual_k
+                pca_model.components_ = components  # (actual_k, n_snps)
+                pca_model.means = means  # (n_snps,)
+                
+                pca_models[block_id] = pca_model
+                
+                # Store block info (useful for debugging)
+                block_info[block_id] = {
+                    'file': pca_file,
+                    'chromosome': chromosome,
+                    'block_num': block_num,
+                    'k': k,
+                    'actual_k': actual_k,
+                    'n_snps': len(means) if means is not None else 0,
+                    'loadings_shape': tuple(loadings.shape),
+                    'components_shape': tuple(components.shape)
+                }
+                
+            except Exception as e:
+                logger.warning(f"Failed to load PCA model from {pca_file}: {e}")
+                continue
     
-    logger.info(f"Loaded {len(pca_models)} PCA models")
-    # for block_id, info in sorted(block_info.items(), key=lambda x: int(x[0])):
-    #     logger.info(f"Block {block_id}: k={info['k']}, actual_k={info['actual_k']}, n_snps={info['n_snps']}, loadings_shape={info['loadings_shape']}, components_shape={info['components_shape']}")
+    if not pca_models:
+        raise FileNotFoundError(f"No PCA model files found for any of the chromosomes {chromosomes} in {pca_loadings_dir}")
     
+    logger.info(f"Loaded {len(pca_models)} PCA models across {len(chromosomes)} chromosomes")
     return pca_models, block_info
 
-def load_spans_data(recoded_dir, basename, chromosome):
+def load_spans_data(recoded_dir, basename, chromosomes):
     """Load the spans data needed for VAE decoding."""
-    # The spans data is stored as a CSV file, not a .pt file
+    # Handle both single chromosome (int) and multiple chromosomes (list)
+    if isinstance(chromosomes, int):
+        chromosomes = [chromosomes]
+    
+    # The spans data is stored as a CSV file
+    # For multi-chromosome, use the "all" suffix
+    chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
+    
     # Look for the CSV file created during block embedding step
     spans_file = os.path.join(recoded_dir.replace('haploblocks_recoded', 'haploblocks'), 
                               f"{basename}_chr{chromosome}_blocks_3PC.csv")
@@ -260,7 +279,7 @@ def load_spans_data(recoded_dir, basename, chromosome):
         scaled_spans.append([chr_norm, start_norm, end_norm])
     
     spans = torch.tensor(scaled_spans, dtype=torch.float32)  # (n_blocks, 3)
-    logger.info(f"Loaded spans data from CSV: {spans.shape}")
+    logger.info(f"Loaded spans data from CSV: {spans.shape} blocks from {len(chromosomes)} chromosomes")
     return spans
 
 def decode_samples(generated_latents, vae_model, spans, pca_models, device="cuda"):
@@ -345,29 +364,56 @@ def decode_samples(generated_latents, vae_model, spans, pca_models, device="cuda
     logger.info(f"Successfully decoded {len(decoded_snps)} blocks")
     return decoded_snps
 
-def save_decoded_samples(decoded_snps, output_dir, basename, chromosome):
+def save_decoded_samples(decoded_snps, output_dir, basename, chromosomes):
     """Save decoded SNPs to files."""
     os.makedirs(output_dir, exist_ok=True)
     
-    # Save individual block files
+    # Handle both single chromosome (int) and multiple chromosomes (list)
+    if isinstance(chromosomes, int):
+        chromosomes = [chromosomes]
+    
+    # Group blocks by chromosome for saving
+    chr_blocks = {}
     for block_id, snps in decoded_snps.items():
-        block_file = os.path.join(output_dir, f"{basename}_chr{chromosome}_block_{block_id}_decoded.pt")
-        # Convert to tensor and save
-        if isinstance(snps, torch.Tensor):
-            torch.save(snps, block_file)
+        # Extract chromosome from block_id (format: "chr_blocknum")
+        if '_' in block_id:
+            chr_num, block_num = block_id.split('_', 1)
+            chr_num = int(chr_num)
         else:
-            torch.save(torch.from_numpy(snps), block_file)
-        # logger.info(f"Saved block {block_id}: {snps.shape} to {block_file}")
+            # Fallback for old format
+            chr_num = chromosomes[0] if len(chromosomes) == 1 else 22
+            block_num = block_id
+        
+        if chr_num not in chr_blocks:
+            chr_blocks[chr_num] = {}
+        chr_blocks[chr_num][block_num] = snps
+    
+    # Save individual block files organized by chromosome
+    total_blocks = 0
+    for chr_num, blocks in chr_blocks.items():
+        for block_num, snps in blocks.items():
+            block_file = os.path.join(output_dir, f"{basename}_chr{chr_num}_block_{block_num}_decoded.pt")
+            # Convert to tensor and save
+            if isinstance(snps, torch.Tensor):
+                torch.save(snps, block_file)
+            else:
+                torch.save(torch.from_numpy(snps), block_file)
+        total_blocks += len(blocks)
+        logger.info(f"Saved {len(blocks)} blocks for chromosome {chr_num}")
     
     # Save summary info
-    summary_file = os.path.join(output_dir, f"{basename}_chr{chromosome}_decode_summary.txt")
+    chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
+    summary_file = os.path.join(output_dir, f"{basename}_chr{chr_suffix}_decode_summary.txt")
     with open(summary_file, 'w') as f:
-        f.write(f"Decoded SNPs Summary for {basename} chromosome {chromosome}\n")
-        f.write(f"Number of blocks: {len(decoded_snps)}\n")
+        f.write(f"Decoded SNPs Summary for {basename} chromosomes {chromosomes}\n")
+        f.write(f"Number of chromosomes: {len(chr_blocks)}\n")
+        f.write(f"Total blocks: {total_blocks}\n")
         f.write(f"Sample count: {next(iter(decoded_snps.values())).shape[0]}\n")
-        f.write("\nBlock details:\n")
-        for block_id, snps in decoded_snps.items():
-            f.write(f"Block {block_id}: {snps.shape[1]} SNPs\n")
+        f.write("\nChromosome details:\n")
+        for chr_num, blocks in sorted(chr_blocks.items()):
+            f.write(f"Chromosome {chr_num}: {len(blocks)} blocks\n")
+            for block_num, snps in sorted(blocks.items(), key=lambda x: int(x[0])):
+                f.write(f"  Block {block_num}: {snps.shape[1]} SNPs\n")
     
     logger.info(f"Saved decode summary to {summary_file}")
 
@@ -447,7 +493,8 @@ def generate(args):
         num_train_timesteps=args.num_time_steps,
         beta_schedule="linear",
         beta_start=1e-4,
-        beta_end=0.02
+        beta_end=0.02, 
+        clip_sample=False
     )
     scheduler.set_timesteps(args.num_inference_steps, device="cuda")
     
@@ -455,8 +502,9 @@ def generate(args):
     model_dir = os.path.dirname(args.model_path)
     # Extract model name from model path (without extension)
     model_name = os.path.splitext(os.path.basename(args.model_path))[0]
-    channel_means = torch.load(os.path.join(model_dir, f"train_{model_name}_channel_means.pt"), map_location='cuda', weights_only=False)
-    channel_stds = torch.load(os.path.join(model_dir, f"train_{model_name}_channel_stds.pt"), map_location='cuda', weights_only=False)
+    # channel_means = torch.load(os.path.join(model_dir, f"train_{model_name}_channel_means.pt"), map_location='cuda', weights_only=False)
+    # channel_stds = torch.load(os.path.join(model_dir, f"train_{model_name}_channel_stds.pt"), map_location='cuda', weights_only=False)
+    sigma_hat = torch.load(os.path.join(model_dir, f"train_{model_name}_sigma.pt"), map_location='cuda', weights_only=False)
     
     # Generate samples
     logger.info(f"Generating {args.num_samples} samples...")
@@ -478,7 +526,8 @@ def generate(args):
                 latents = scheduler.step(noise_pred, t, latents).prev_sample
         
         # Denormalize
-        latents = latents * channel_stds[None, :, None, None] + channel_means[None, :, None, None]
+        # latents = latents * channel_stds[None, :, None, None] + channel_means[None, :, None, None]
+        latents = latents * sigma_hat
         all_samples.append(latents.cpu())
     
     # Concatenate all samples
@@ -498,17 +547,20 @@ def generate(args):
             # Load VAE model
             vae_model = load_vae_model(args.vae_model_path, device="cuda")
             
-            # Load PCA models
-            pca_models, block_info = load_pca_models(args.pca_loadings_dir, args.chromosome)
+            # Handle chromosomes argument (can be list or single chromosome)
+            chromosomes = getattr(args, 'chromosomes', getattr(args, 'chromosome', 22))
             
-            # Load spans data
-            spans = load_spans_data(args.recoded_dir, args.basename, args.chromosome)
+            # Load PCA models for all chromosomes
+            pca_models, block_info = load_pca_models(args.pca_loadings_dir, chromosomes)
+            
+            # Load spans data for all chromosomes
+            spans = load_spans_data(args.recoded_dir, args.basename, chromosomes)
             
             # Decode samples
             decoded_snps = decode_samples(all_samples, vae_model, spans, pca_models, device="cuda")
             
             # Save decoded samples
-            save_decoded_samples(decoded_snps, args.decoded_output_dir, args.basename, args.chromosome)
+            save_decoded_samples(decoded_snps, args.decoded_output_dir, args.basename, chromosomes)
             
             logger.info("Sample decoding completed successfully!")
             

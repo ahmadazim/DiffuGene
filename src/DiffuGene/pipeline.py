@@ -34,39 +34,102 @@ from .utils import setup_logging, get_logger, ensure_dir_exists, load_blocks_for
 
 logger = get_logger(__name__)
 
+def get_chromosome_list(chromosome_spec):
+    """Get list of chromosomes to process based on chromosome specification.
+    
+    Args:
+        chromosome_spec: Either "all" or specific chromosome number
+        
+    Returns:
+        List of chromosome numbers to process
+    """
+    if str(chromosome_spec).lower() == "all":
+        return list(range(1, 23))  # Chromosomes 1-22
+    else:
+        return [int(chromosome_spec)]
+
 def create_embedding_spans_csv(config, embeddings_dir, pca_k):
     """Create CSV file listing all embedding files with their genomic coordinates."""
     logger.info("Creating embedding spans CSV...")
     
-    # Load LD blocks from the original block definition file
-    block_file = f"{config['data_prep']['block_folder']}/{config['global']['basename']}_chr{int(config['global']['chromosome'])}_blocks.blocks.det"
+    chromosomes = get_chromosome_list(config['global']['chromosome'])
+    all_spans = []
     
-    if not os.path.exists(block_file):
-        raise FileNotFoundError(f"Block definition file not found: {block_file}")
+    for chr_num in chromosomes:
+        # Load LD blocks from the original block definition file
+        block_file = f"{config['data_prep']['block_folder']}/{config['global']['basename']}_chr{chr_num}_blocks.blocks.det"
+        
+        if not os.path.exists(block_file):
+            logger.warning(f"Block definition file not found for chr {chr_num}: {block_file}")
+            continue
+        
+        LD_blocks = load_blocks_for_chr(block_file, chr_num)
+        
+        # Create DataFrame with block information for this chromosome
+        for i, block in enumerate(LD_blocks):
+            block_spans = [block.chr, block.bp1, block.bp2]
+            # Add embedding file paths (using actual block numbers from embeddings)
+            block_file_path = os.path.join(
+                embeddings_dir,
+                f"{config['global']['basename']}_chr{block.chr}_block{i+1}_embeddings.pt"
+            )
+            all_spans.append([block_file_path, block.chr, block.bp1, block.bp2])
     
-    LD_blocks = load_blocks_for_chr(block_file, int(config['global']['chromosome']))
+    if not all_spans:
+        raise RuntimeError("No valid chromosome data found for embedding spans CSV")
     
-    # Create DataFrame with block information
-    block_spans = []
-    for i, block in enumerate(LD_blocks):
-        block_spans.append([block.chr, block.bp1, block.bp2])
-    
-    df = pd.DataFrame(block_spans, columns=["chr", "start", "end"])
-    
-    # Add embedding file paths (using actual block numbers from embeddings)
-    df["block_file"] = [
-        os.path.join(
-            embeddings_dir,
-            f"{config['global']['basename']}_chr{row.chr}_block{idx+1}_embeddings.pt"
-        )
-        for idx, row in df.iterrows()
-    ]
-    df = df[["block_file", "chr", "start", "end"]]
+    df = pd.DataFrame(all_spans, columns=["block_file", "chr", "start", "end"])
     
     # Create unique CSV filename with PC information
-    csv_path = f"{config['data_prep']['block_folder']}/{config['global']['basename']}_chr{int(config['global']['chromosome'])}_blocks_{pca_k}PC.csv"
+    chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
+    csv_path = f"{config['data_prep']['block_folder']}/{config['global']['basename']}_chr{chr_suffix}_blocks_{pca_k}PC.csv"
     df.to_csv(csv_path, index=False)
-    logger.info(f"Embedding spans CSV saved to {csv_path}")
+    logger.info(f"Embedding spans CSV saved to {csv_path} with {len(all_spans)} blocks from {len(chromosomes)} chromosomes")
+    
+    return csv_path
+
+def create_multi_chromosome_spans_csv(config, embeddings_dir, pca_k, chromosomes):
+    """Create a unified CSV file for multiple chromosomes."""
+    logger.info(f"Creating multi-chromosome embedding spans CSV for chromosomes: {chromosomes}")
+    
+    all_spans = []
+    total_blocks = 0
+    
+    for chr_num in chromosomes:
+        # Load LD blocks from the original block definition file
+        block_file = f"{config['data_prep']['block_folder']}/{config['global']['basename']}_chr{chr_num}_blocks.blocks.det"
+        
+        if not os.path.exists(block_file):
+            logger.warning(f"Block definition file not found for chr {chr_num}: {block_file}")
+            continue
+        
+        LD_blocks = load_blocks_for_chr(block_file, chr_num)
+        chr_blocks = 0
+        
+        # Create DataFrame with block information for this chromosome
+        for i, block in enumerate(LD_blocks):
+            # Add embedding file paths (using actual block numbers from embeddings)
+            block_file_path = os.path.join(
+                embeddings_dir,
+                f"{config['global']['basename']}_chr{block.chr}_block{i+1}_embeddings.pt"
+            )
+            # Verify the embedding file exists
+            if os.path.exists(block_file_path):
+                all_spans.append([block_file_path, block.chr, block.bp1, block.bp2])
+                chr_blocks += 1
+        
+        total_blocks += chr_blocks
+        logger.info(f"Added {chr_blocks} blocks from chromosome {chr_num}")
+    
+    if not all_spans:
+        raise RuntimeError("No valid embedding files found for any chromosome")
+    
+    df = pd.DataFrame(all_spans, columns=["block_file", "chr", "start", "end"])
+    
+    # Create unique CSV filename with PC information for all chromosomes
+    csv_path = f"{config['data_prep']['block_folder']}/{config['global']['basename']}_chrall_blocks_{pca_k}PC.csv"
+    df.to_csv(csv_path, index=False)
+    logger.info(f"Multi-chromosome embedding spans CSV saved to {csv_path} with {total_blocks} total blocks from {len(chromosomes)} chromosomes")
     
     return csv_path
 
@@ -102,21 +165,39 @@ class DiffuGenePipeline:
         if self.config['pipeline'].get('force_rerun', False):
             return False
             
+        chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+        
         if step_name == 'data_prep':
-            # Check if recoded block files exist
-            pattern = os.path.join(
-                self.config['data_prep']['recoded_block_folder'],
-                f"{self.config['global']['basename']}_chr{int(self.config['global']['chromosome'])}_block*_recodeA.raw"
-            )
-            return len(glob.glob(pattern)) > 0
+            # Check if recoded block files exist for all required chromosomes
+            all_chr_exist = True
+            for chr_num in chromosomes:
+                pattern = os.path.join(
+                    self.config['data_prep']['recoded_block_folder'],
+                    f"{self.config['global']['basename']}_chr{chr_num}_block*_recodeA.raw"
+                )
+                if len(glob.glob(pattern)) == 0:
+                    all_chr_exist = False
+                    break
+            return all_chr_exist
             
         elif step_name == 'block_embed':
-            # Check if both embeddings and spans CSV exist
+            # Check if both embeddings and spans CSV exist for all chromosomes
             embeddings_dir = self.config['block_embed']['output_dirs']['embeddings']
-            pattern = f"{embeddings_dir}/*_embeddings.pt"
             pca_k = int(self.config['block_embed']['pca_k'])
-            spans_csv = f"{self.config['data_prep']['block_folder']}/{self.config['global']['basename']}_chr{int(self.config['global']['chromosome'])}_blocks_{pca_k}PC.csv"
-            return len(glob.glob(pattern)) > 0 and os.path.exists(spans_csv)
+            
+            # Check embeddings exist for all chromosomes
+            all_emb_exist = True
+            for chr_num in chromosomes:
+                pattern = f"{embeddings_dir}/*_chr{chr_num}_*_embeddings.pt"
+                if len(glob.glob(pattern)) == 0:
+                    all_emb_exist = False
+                    break
+            
+            # Check spans CSV exists
+            chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
+            spans_csv = f"{self.config['data_prep']['block_folder']}/{self.config['global']['basename']}_chr{chr_suffix}_blocks_{pca_k}PC.csv"
+            
+            return all_emb_exist and os.path.exists(spans_csv)
             
         elif step_name == 'joint_embed':
             model_path = self.config['joint_embed']['model_save_path']
@@ -146,8 +227,14 @@ class DiffuGenePipeline:
                 decoded_dir = expanded_config['generation']['decoded_output_dir']
                 
                 if os.path.exists(decoded_dir):
-                    pattern = os.path.join(decoded_dir, f"*chr{int(self.config['global']['chromosome'])}_block_*_decoded.pt")
-                    decoded_samples_exist = len(glob.glob(pattern)) > 0
+                    # Check for decoded samples across all chromosomes
+                    chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+                    decoded_samples_exist = True
+                    for chr_num in chromosomes:
+                        pattern = os.path.join(decoded_dir, f"*chr{chr_num}_block_*_decoded.pt")
+                        if len(glob.glob(pattern)) == 0:
+                            decoded_samples_exist = False
+                            break
                     return latents_exist and decoded_samples_exist
                 else:
                     return False
@@ -170,28 +257,41 @@ class DiffuGenePipeline:
         from .block_embed.run import main as data_prep_main
         from types import SimpleNamespace
         
-        # Prepare arguments (ensure proper types)
-        args = SimpleNamespace()
-        args.basename = self.config['global']['basename']
-        args.chrNo = int(self.config['global']['chromosome'])
-        args.genetic_binary_folder = self.config['data_prep']['genetic_binary_folder']
-        args.block_folder = self.config['data_prep']['block_folder']
-        args.recoded_block_folder = self.config['data_prep']['recoded_block_folder']
-        args.snplist_folder = self.config['data_prep']['snplist_folder']
-        args.embedding_folder = self.config['block_embed']['output_dirs']['embeddings']
+        chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+        logger.info(f"Processing chromosomes: {chromosomes}")
         
-        # Add PLINK parameters from config (ensure proper types)
-        plink_config = self.config['data_prep']['plink']
-        args.plink_max_kb = int(plink_config['max_kb'])
-        args.plink_min_maf = float(plink_config['min_maf'])
-        args.plink_strong_lowci = float(plink_config['strong_lowci'])
-        args.plink_strong_highci = float(plink_config['strong_highci'])
-        args.plink_recomb_highci = float(plink_config['recomb_highci'])
-        args.plink_inform_frac = float(plink_config['inform_frac'])
+        # Process each chromosome
+        for chr_num in chromosomes:
+            logger.info(f"Processing chromosome {chr_num}...")
+            
+            # Prepare arguments (ensure proper types)
+            args = SimpleNamespace()
+            args.basename = self.config['global']['basename']
+            args.chrNo = chr_num
+            args.genetic_binary_folder = self.config['data_prep']['genetic_binary_folder']
+            args.block_folder = self.config['data_prep']['block_folder']
+            args.recoded_block_folder = self.config['data_prep']['recoded_block_folder']
+            args.snplist_folder = self.config['data_prep']['snplist_folder']
+            args.embedding_folder = self.config['block_embed']['output_dirs']['embeddings']
+            
+            # Add PLINK parameters from config (ensure proper types)
+            plink_config = self.config['data_prep']['plink']
+            args.plink_max_kb = int(plink_config['max_kb'])
+            args.plink_min_maf = float(plink_config['min_maf'])
+            args.plink_strong_lowci = float(plink_config['strong_lowci'])
+            args.plink_strong_highci = float(plink_config['strong_highci'])
+            args.plink_recomb_highci = float(plink_config['recomb_highci'])
+            args.plink_inform_frac = float(plink_config['inform_frac'])
+            
+            # Run data preparation for this chromosome
+            try:
+                data_prep_main(args)
+                logger.info(f"Data preparation completed successfully for chromosome {chr_num}")
+            except Exception as e:
+                logger.error(f"Data preparation failed for chromosome {chr_num}: {e}")
+                raise
         
-        # Run data preparation
-        data_prep_main(args)
-        logger.info("Data preparation completed successfully")
+        logger.info("Data preparation completed successfully for all chromosomes")
     
     def run_block_embed(self):
         """Step 2: Block-wise PCA embedding."""
@@ -203,22 +303,17 @@ class DiffuGenePipeline:
             logger.info("Block embedding outputs found, skipping...")
             return
         
-        # Find all recoded block files
-        pattern = os.path.join(
-            self.config['data_prep']['recoded_block_folder'],
-            f"{self.config['global']['basename']}_chr{int(self.config['global']['chromosome'])}_block*_recodeA.raw"
-        )
-        raw_files = glob.glob(pattern)
-        logger.info(f"Found {len(raw_files)} block files to process")
+        chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+        logger.info(f"Processing block embeddings for chromosomes: {chromosomes}")
         
-        # Process each block
+        # Process each chromosome
         from .block_embed.fit_pca import main as fit_pca_main
         import re
         from tqdm import tqdm
         
-        # Collect metrics for summary
-        block_metrics = []
-        failed_blocks = []
+        # Collect metrics for summary across all chromosomes
+        all_block_metrics = []
+        all_failed_blocks = []
         
         # Prepare config paths for fit_pca (ensure proper types)
         config_paths = {
@@ -228,51 +323,84 @@ class DiffuGenePipeline:
             'pca_k': int(self.config['block_embed']['pca_k'])
         }
         
-        with tqdm(raw_files, desc="Processing blocks", unit="block") as pbar:
-            for raw_file in pbar:
-                # Extract block number
-                match = re.search(r'block(\d+)', raw_file)
-                if not match:
-                    logger.warning(f"Could not extract block number from {raw_file}")
-                    continue
-                
-                block_no = match.group(1)
-                pbar.set_postfix(block=block_no)
-                
-                try:
-                    result = fit_pca_main(
-                        chrNo=str(int(self.config['global']['chromosome'])),
-                        blockNo=block_no,
-                        config_paths=config_paths
-                    )
-                    if result:
-                        block_metrics.append(result)
-                except Exception as e:
-                    logger.warning(f"Error processing block {block_no}: {e}")
-                    failed_blocks.append(block_no)
-                    continue
+        for chr_num in chromosomes:
+            logger.info(f"Processing blocks for chromosome {chr_num}...")
+            
+            # Find all recoded block files for this chromosome
+            pattern = os.path.join(
+                self.config['data_prep']['recoded_block_folder'],
+                f"{self.config['global']['basename']}_chr{chr_num}_block*_recodeA.raw"
+            )
+            raw_files = glob.glob(pattern)
+            logger.info(f"Found {len(raw_files)} block files for chromosome {chr_num}")
+            
+            if not raw_files:
+                logger.warning(f"No block files found for chromosome {chr_num}, skipping...")
+                continue
+            
+            # Collect metrics for this chromosome
+            chr_block_metrics = []
+            chr_failed_blocks = []
+            
+            with tqdm(raw_files, desc=f"Chr {chr_num} blocks", unit="block") as pbar:
+                for raw_file in pbar:
+                    # Extract block number
+                    match = re.search(r'block(\d+)', raw_file)
+                    if not match:
+                        logger.warning(f"Could not extract block number from {raw_file}")
+                        continue
+                    
+                    block_no = match.group(1)
+                    pbar.set_postfix(chr=chr_num, block=block_no)
+                    
+                    try:
+                        result = fit_pca_main(
+                            chrNo=str(chr_num),
+                            blockNo=block_no,
+                            config_paths=config_paths
+                        )
+                        if result:
+                            chr_block_metrics.append(result)
+                            all_block_metrics.append(result)
+                    except Exception as e:
+                        logger.warning(f"Error processing chr {chr_num} block {block_no}: {e}")
+                        chr_failed_blocks.append(f"{chr_num}:{block_no}")
+                        all_failed_blocks.append(f"{chr_num}:{block_no}")
+                        continue
+            
+            # Report per-chromosome summary
+            if chr_block_metrics:
+                mse_values = [m['mse'] for m in chr_block_metrics]
+                acc_values = [m['accuracy'] for m in chr_block_metrics]
+                logger.info(f"Chr {chr_num} summary: {len(chr_block_metrics)} blocks, "
+                           f"MSE={np.mean(mse_values):.4f}±{np.std(mse_values):.4f}, "
+                           f"Acc={np.mean(acc_values):.4f}±{np.std(acc_values):.4f}")
         
         # Create embedding spans CSV after all embeddings are generated
         embeddings_dir = self.config['block_embed']['output_dirs']['embeddings']
         pca_k = int(self.config['block_embed']['pca_k'])
-        spans_csv_path = create_embedding_spans_csv(self.config, embeddings_dir, pca_k)
         
-        # Report summary statistics
-        if block_metrics:
-            mse_values = [m['mse'] for m in block_metrics]
-            acc_values = [m['accuracy'] for m in block_metrics]
+        if len(chromosomes) > 1:
+            spans_csv_path = create_multi_chromosome_spans_csv(self.config, embeddings_dir, pca_k, chromosomes)
+        else:
+            spans_csv_path = create_embedding_spans_csv(self.config, embeddings_dir, pca_k)
+        
+        # Report overall summary statistics
+        if all_block_metrics:
+            mse_values = [m['mse'] for m in all_block_metrics]
+            acc_values = [m['accuracy'] for m in all_block_metrics]
             
-            logger.info(f"Block embedding summary:")
-            logger.info(f"  Processed: {len(block_metrics)} blocks")
-            logger.info(f"  Failed: {len(failed_blocks)} blocks")
+            logger.info(f"Overall block embedding summary:")
+            logger.info(f"  Processed: {len(all_block_metrics)} blocks across {len(chromosomes)} chromosomes")
+            logger.info(f"  Failed: {len(all_failed_blocks)} blocks")
             logger.info(f"  Mean MSE: {np.mean(mse_values):.6f} ± {np.std(mse_values):.6f}")
             logger.info(f"  Mean Accuracy: {np.mean(acc_values):.4f} ± {np.std(acc_values):.4f}")
             logger.info(f"  MSE range: [{np.min(mse_values):.6f}, {np.max(mse_values):.6f}]")
             logger.info(f"  Accuracy range: [{np.min(acc_values):.4f}, {np.max(acc_values):.4f}]")
         else:
-            logger.error("No blocks were processed successfully")
+            logger.error("No blocks were processed successfully for any chromosome")
         
-        logger.info("Block embedding completed successfully")
+        logger.info("Block embedding completed successfully for all chromosomes")
     
     def run_joint_embed(self):
         """Step 3: Joint VAE embedding."""
@@ -290,7 +418,9 @@ class DiffuGenePipeline:
         
         # Use the PC-specific spans file created in block embedding step
         pca_k = int(self.config['block_embed']['pca_k'])
-        spans_file = f"{self.config['data_prep']['block_folder']}/{self.config['global']['basename']}_chr{int(self.config['global']['chromosome'])}_blocks_{pca_k}PC.csv"
+        chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+        chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
+        spans_file = f"{self.config['data_prep']['block_folder']}/{self.config['global']['basename']}_chr{chr_suffix}_blocks_{pca_k}PC.csv"
         
         # Prepare arguments
         args = SimpleNamespace()
@@ -399,8 +529,14 @@ class DiffuGenePipeline:
             decoded_dir = expanded_config['generation']['decoded_output_dir']
             
             if os.path.exists(decoded_dir):
-                pattern = os.path.join(decoded_dir, f"*chr{int(self.config['global']['chromosome'])}_block_*_decoded.pt")
-                decoded_samples_exist = len(glob.glob(pattern)) > 0
+                # Check for decoded samples across all chromosomes
+                chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+                decoded_samples_exist = True
+                for chr_num in chromosomes:
+                    pattern = os.path.join(decoded_dir, f"*chr{chr_num}_block_*_decoded.pt")
+                    if len(glob.glob(pattern)) == 0:
+                        decoded_samples_exist = False
+                        break
         
         # Determine what needs to be done
         if latents_exist and (not decode_enabled or decoded_samples_exist):
@@ -449,7 +585,7 @@ class DiffuGenePipeline:
             args.recoded_dir = expanded_gen_config['recoded_dir']
             args.decoded_output_dir = expanded_gen_config['decoded_output_dir']
             args.basename = self.config['global']['basename']
-            args.chromosome = int(self.config['global']['chromosome'])
+            args.chromosomes = get_chromosome_list(self.config['global']['chromosome'])
             
             logger.info("Decoding enabled - samples will be decoded to SNP space")
             logger.info(f"VAE model path: {args.vae_model_path}")

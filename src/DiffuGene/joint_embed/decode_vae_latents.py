@@ -22,8 +22,13 @@ from src.DiffuGene.utils import setup_logging, get_logger
 setup_logging()
 logger = get_logger(__name__)
 
-def load_pca_blocks(embeddings_dir):
-    """Load PCA blocks for SNP reconstruction with dimension metadata."""
+def load_pca_blocks(embeddings_dir, chromosome=None):
+    """Load PCA blocks for SNP reconstruction with dimension metadata.
+    
+    Args:
+        embeddings_dir: Directory containing PCA models
+        chromosome: Chromosome number (optional, for filtering files)
+    """
     logger.info("Loading PCA blocks...")
     pca_blocks = []
     load_dir = os.path.join(embeddings_dir, "loadings")
@@ -31,7 +36,14 @@ def load_pca_blocks(embeddings_dir):
     metadata_dir = os.path.join(embeddings_dir, "metadata")
     
     # Get all PCA loading files and sort them numerically by block number
-    load_files = glob.glob(os.path.join(load_dir, "*_pca_loadings.pt"))
+    if chromosome is not None:
+        # More specific pattern if chromosome is provided
+        load_files = glob.glob(os.path.join(load_dir, f"*_chr{chromosome}_block*_pca_loadings.pt"))
+    else:
+        load_files = glob.glob(os.path.join(load_dir, "*_pca_loadings.pt"))
+    
+    if not load_files:
+        raise FileNotFoundError(f"No PCA loading files found in {load_dir}. Expected pattern: *_pca_loadings.pt")
     
     # Extract block numbers and sort numerically
     def extract_block_number(filepath):
@@ -40,18 +52,46 @@ def load_pca_blocks(embeddings_dir):
         return int(match.group(1)) if match else 0
     
     load_files_sorted = sorted(load_files, key=extract_block_number)
+    logger.info(f"Found {len(load_files_sorted)} PCA loading files")
     
     for load_file in load_files_sorted:
         block_base = os.path.basename(load_file).replace("_pca_loadings.pt", "")
-        means_file = os.path.join(mean_dir, f"{block_base}_pca_means.pt")
-        metadata_file = os.path.join(metadata_dir, f"{block_base}_pca_metadata.pt")
         
-        loadings = torch.load(load_file, map_location="cuda", weights_only=False)    # (n_snps, k)
-        means = torch.load(means_file, map_location="cuda", weights_only=False)      # (n_snps,)
+        # Find corresponding means and metadata files using flexible patterns
+        means_pattern = os.path.join(mean_dir, f"{block_base}_pca_means.pt")
+        metadata_pattern = os.path.join(metadata_dir, f"{block_base}_pca_metadata.pt")
+        
+        # Check if exact files exist, otherwise use glob pattern
+        if not os.path.exists(means_pattern):
+            # Extract block info and find using pattern
+            block_match = re.search(r'_chr(\d+)_block(\d+)', block_base)
+            if block_match:
+                chr_num, block_num = block_match.groups()
+                means_files = glob.glob(os.path.join(mean_dir, f"*_chr{chr_num}_block{block_num}_pca_means.pt"))
+                if means_files:
+                    means_pattern = means_files[0]
+                    logger.debug(f"Using means file: {means_pattern}")
+                else:
+                    raise FileNotFoundError(f"No means file found for block {block_num}")
+        
+        if not os.path.exists(metadata_pattern):
+            # Extract block info and find using pattern  
+            block_match = re.search(r'_chr(\d+)_block(\d+)', block_base)
+            if block_match:
+                chr_num, block_num = block_match.groups()
+                metadata_files = glob.glob(os.path.join(metadata_dir, f"*_chr{chr_num}_block{block_num}_pca_metadata.pt"))
+                if metadata_files:
+                    metadata_pattern = metadata_files[0]
+                    logger.debug(f"Using metadata file: {metadata_pattern}")
+        
+        # Load the files
+        # NOTE: Training saves pca.components_.T, so loadings are (n_snps, actual_k)
+        loadings = torch.load(load_file, map_location="cuda", weights_only=False)    # (n_snps, actual_k) 
+        means = torch.load(means_pattern, map_location="cuda", weights_only=False)   # (n_snps,)
         
         # Load metadata if available (backwards compatibility)
-        if os.path.exists(metadata_file):
-            metadata = torch.load(metadata_file, map_location="cpu", weights_only=False)
+        if os.path.exists(metadata_pattern):
+            metadata = torch.load(metadata_pattern, map_location="cpu", weights_only=False)
             k = metadata['k']
             actual_k = metadata['actual_k']
         else:
@@ -78,6 +118,7 @@ def load_pca_blocks(embeddings_dir):
         
         pca_block = PCA_Block(k=k)
         pca_block.actual_k = actual_k
+        # Transpose back: (n_snps, actual_k) -> (actual_k, n_snps) for PCA_Block format
         pca_block.components_ = loadings.T if hasattr(loadings, 'T') else loadings.transpose()  # (actual_k, n_snps)
         pca_block.means = means
         pca_blocks.append(pca_block)
@@ -137,7 +178,7 @@ def load_spans_file(spans_file):
     logger.info(f"Loaded spans for {len(scaled_spans)} blocks")
     return spans_tensor
 
-def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_file, batch_size=32):
+def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_file, batch_size=32, chromosome=None):
     """
     Decode VAE latents back to original SNP space.
     
@@ -148,6 +189,7 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
         spans_file: CSV file with block positioning info
         output_file: Where to save the reconstructed SNPs
         batch_size: Batch size for processing
+        chromosome: Chromosome number (optional, for better file matching)
     """
     
     # Set device
@@ -203,7 +245,7 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     logger.info(f"VAE model loaded with config: {config}")
     
     # 3. Load PCA blocks
-    pca_blocks = load_pca_blocks(embeddings_dir)
+    pca_blocks = load_pca_blocks(embeddings_dir, chromosome=chromosome)
     
     # 4. Load spans for positioning
     spans = load_spans_file(spans_file)
@@ -306,6 +348,8 @@ def main():
                         help="Where to save the reconstructed SNPs (.pt)")
     parser.add_argument("--batch-size", type=int, default=32,
                         help="Batch size for processing (default: 32)")
+    parser.add_argument("--chromosome", type=int, default=None,
+                        help="Chromosome number (helps with file matching, e.g., 22)")
     
     args = parser.parse_args()
     
@@ -326,7 +370,8 @@ def main():
         embeddings_dir=args.embeddings_dir,
         spans_file=args.spans_file,
         output_file=args.output_file,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        chromosome=args.chromosome
     )
 
 if __name__ == "__main__":
@@ -353,3 +398,11 @@ if __name__ == "__main__":
 #     --output-file data/VAE_embeddings/all_hm3_15k_chr22_VAE_decoded_${i}PCscale.pt \
 #     --batch-size 256
 # done
+
+# python src/DiffuGene/joint_embed/decode_vae_latents.py \
+#     --latents-file data/generated_samples/generated_latents_all_hm3_45k_4PCscale.pt \
+#     --model-file models/joint_embed/vae_model_4PCscale.pt \
+#     --embeddings-dir data/haploblocks_embeddings_4PC \
+#     --spans-file data/work_encode/encoding_all_hm3_45k_chr22/all_hm3_45k_chr22_blocks_4PC_inference.csv \
+#     --output-file data/generated_samples/generated_decoded_all_hm3_45k_4PCscale.pt \
+#     --batch-size 256

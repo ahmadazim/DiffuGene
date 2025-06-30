@@ -5,19 +5,19 @@ import math
 import numpy as np
 import random
 
-class SinusoidalEmbeddings(nn.Module):
-    def __init__(self, time_steps:int, embed_dim: int):
-        super().__init__()
-        position = torch.arange(time_steps).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0, embed_dim, 2).float() * -(math.log(10000.0) / embed_dim))
-        embeddings = torch.zeros(time_steps, embed_dim, requires_grad=False)
-        embeddings[:, 0::2] = torch.sin(position * div)
-        embeddings[:, 1::2] = torch.cos(position * div)
-        # self.embeddings = embeddings
-        self.register_buffer('embeddings', embeddings)
+# class SinusoidalEmbeddings(nn.Module):
+#     def __init__(self, time_steps:int, embed_dim: int):
+#         super().__init__()
+#         position = torch.arange(time_steps).unsqueeze(1).float()
+#         div = torch.exp(torch.arange(0, embed_dim, 2).float() * -(math.log(10000.0) / embed_dim))
+#         embeddings = torch.zeros(time_steps, embed_dim, requires_grad=False)
+#         embeddings[:, 0::2] = torch.sin(position * div)
+#         embeddings[:, 1::2] = torch.cos(position * div)
+#         # self.embeddings = embeddings
+#         self.register_buffer('embeddings', embeddings)
 
-    def forward(self, x, t):
-        return self.embeddings[t]#.to(x.device)
+#     def forward(self, x, t):
+#         return self.embeddings[t]#.to(x.device)
 
 
 class LatentUNET2D(nn.Module):
@@ -34,28 +34,10 @@ class LatentUNET2D(nn.Module):
     ):
         super().__init__()
         # sinusoidal time embeddings
-        self.time_embed = SinusoidalEmbeddings(time_steps, embed_dim=512)
-
-        # UNet2D backbone
-        # self.unet = UNet2DModel(
-        #     sample_size=(16, 16),
-        #     in_channels=input_channels,
-        #     out_channels=output_channels,
-        #     layers_per_block=layers_per_block,
-        #     block_out_channels=[256, 256, 512, 512],
-        #     down_block_types   = ["DownBlock2D",
-        #                           "AttnDownBlock2D", 
-        #                           "AttnDownBlock2D", 
-        #                           "DownBlock2D"],
-        #     up_block_types     = ["UpBlock2D",
-        #                           "AttnUpBlock2D",
-        #                           "AttnUpBlock2D",
-        #                           "UpBlock2D"],
-        #     attention_head_dim = 64
-        # )
+        # self.time_embed = SinusoidalEmbeddings(time_steps, embed_dim=512)
         
         # initial channel expansion 16 -> 128
-        self.input_proj = nn.Conv2d(input_channels, 128, kernel_size=1)
+        self.input_proj = nn.Conv2d(input_channels, 128, kernel_size=3, padding=1)
 
         self.unet = UNet2DModel(
             sample_size=(16, 16),
@@ -80,7 +62,7 @@ class LatentUNET2D(nn.Module):
              attention_head_dim=64,
         )
         # final channel contraction 128 -> 16
-        self.output_proj = nn.Conv2d(128, output_channels, kernel_size=1)
+        self.output_proj = nn.Conv2d(128, output_channels, kernel_size=3, padding=1)
 
     def forward(
         self,
@@ -91,10 +73,6 @@ class LatentUNET2D(nn.Module):
         x: (B,16,16,16)
         t: (B,)
         """
-        # add time embeddings if needed by custom layers
-        _ = self.time_embed(x, t)
-        # # Diffusers UNet2DModel expects (B,C,H,W)
-        # return self.unet(x, t).sample
         # expand channels, run through UNet, then project back
         x = self.input_proj(x)
         x = self.unet(x, t).sample
