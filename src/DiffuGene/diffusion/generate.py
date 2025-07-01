@@ -5,7 +5,7 @@ import torch
 import os
 import glob
 import re
-from diffusers import DDPMScheduler
+from diffusers import DDIMScheduler #DDPMScheduler
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
@@ -475,12 +475,13 @@ def generate(args):
     model.eval()
     
     # Initialize scheduler
-    scheduler = DDPMScheduler(
+    scheduler = DDIMScheduler(
         num_train_timesteps=args.num_time_steps,
         beta_schedule="linear",
         beta_start=1e-4,
         beta_end=0.02, 
-        clip_sample=False
+        clip_sample=False, 
+        prediction_type="epsilon"
     )
     scheduler.set_timesteps(args.num_inference_steps, device="cuda")
     
@@ -509,7 +510,13 @@ def generate(args):
                 noise_pred = model(latents, t.expand(batch_size))
                 
                 # Scheduler step
-                latents = scheduler.step(noise_pred, t, latents).prev_sample
+                # latents = scheduler.step(noise_pred, t, latents).prev_sample
+                latents = scheduler.step(
+                    model_output=noise_pred,
+                    timestep=t,
+                    sample=latents,
+                    eta=0.0
+                ).prev_sample
         
         # Denormalize
         # latents = latents * channel_stds[None, :, None, None] + channel_means[None, :, None, None]
