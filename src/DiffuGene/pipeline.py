@@ -148,6 +148,411 @@ class DiffuGenePipeline:
         if self.config['global']['random_seed']:
             torch.manual_seed(int(self.config['global']['random_seed']))
     
+    def get_spans_file_path(self, step: str) -> str:
+        """Get the spans file path for a given dataset step.
+        
+        Args:
+            step: Pipeline step name ('pca', 'vae_test', 'diffusion', 'diffusion_val')
+            
+        Returns:
+            Path to the spans file for this step's dataset
+        """
+        basename = self.get_dataset_basename(step)
+        if basename is None:
+            return None
+            
+        chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+        chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
+        pca_k = int(self.config['block_embed']['pca_k'])
+        
+        # Map step to meaningful suffix
+        step_suffix_map = {
+            'pca': 'pca_train',
+            'vae': 'vae_train', 
+            'vae_test': 'vae_test',
+            'diffusion': 'diffusion_train',
+            'diffusion_val': 'diffusion_val'
+        }
+        
+        step_suffix = step_suffix_map.get(step, step)
+        spans_filename = f"{basename}_{step_suffix}_chr{chr_suffix}_blocks_{pca_k}PC.csv"
+        
+        return os.path.join(self.config['data_prep']['block_folder'], spans_filename)
+    
+    def get_dataset_fam_file(self, step: str) -> str:
+        """Get the appropriate fam file for a given pipeline step.
+        
+        Args:
+            step: Pipeline step name ('pca', 'vae', 'diffusion', 'vae_test', 'diffusion_val')
+            
+        Returns:
+            Path to the fam file to use for this step
+        """
+        training_data = self.config.get('training_data', {})
+        evaluation_data = self.config.get('evaluation_data', {})
+        
+        # Get the default fam file path
+        default_fam = os.path.join(
+            self.config['data_prep']['genetic_binary_folder'],
+            f"{self.config['global']['basename']}.fam"
+        )
+        
+        if step == 'pca':
+            fam_file = training_data.get('pca_fam') or default_fam
+        elif step == 'vae':
+            # Fall back: vae_fam -> pca_fam -> default
+            fam_file = (training_data.get('vae_fam') or 
+                       training_data.get('pca_fam') or 
+                       default_fam)
+        elif step == 'diffusion':
+            # Fall back: diffusion_fam -> vae_fam -> pca_fam -> default
+            fam_file = (training_data.get('diffusion_fam') or
+                       training_data.get('vae_fam') or
+                       training_data.get('pca_fam') or
+                       default_fam)
+        elif step == 'vae_test':
+            fam_file = evaluation_data.get('vae_test_fam')
+        elif step == 'diffusion_val':
+            fam_file = evaluation_data.get('diffusion_val_fam')
+        else:
+            raise ValueError(f"Unknown step: {step}")
+        
+        # Return None if evaluation data not specified or is null
+        if step in ['vae_test', 'diffusion_val'] and not fam_file:
+            return None
+            
+        # Use default if not specified for training steps
+        if not fam_file:
+            fam_file = default_fam
+            
+        return fam_file
+    
+    def get_dataset_basename(self, step: str) -> str:
+        """Get a unique basename for a given pipeline step dataset.
+        
+        Args:
+            step: Pipeline step name
+            
+        Returns:
+            Basename to use for this step's data files
+        """
+        fam_file = self.get_dataset_fam_file(step)
+        if fam_file is None:
+            return None
+            
+        # Use the fam filename (without extension) as basename modifier
+        fam_basename = os.path.splitext(os.path.basename(fam_file))[0]
+        original_basename = self.config['global']['basename']
+        
+        # If using the default fam file, use original basename
+        default_fam_basename = original_basename
+        if fam_basename == default_fam_basename:
+            return original_basename
+        else:
+            return f"{original_basename}_{fam_basename}"
+    
+    def should_run_evaluation_step(self, step: str) -> bool:
+        """Check if an evaluation step should be run based on config.
+        
+        Args:
+            step: Evaluation step name ('vae_evaluation', 'diffusion_val_encoding')
+            
+        Returns:
+            True if the step should be run
+        """
+        if not self.config.get('pipeline', {}).get(f'run_{step}', False):
+            return False
+            
+        if step == 'vae_evaluation':
+            return self.get_dataset_fam_file('vae_test') is not None
+        elif step == 'diffusion_val_encoding':
+            return self.get_dataset_fam_file('diffusion_val') is not None
+        elif step == 'diffusion_encoding':
+            # Run if diffusion training data is different from VAE training data
+            diffusion_fam = self.get_dataset_fam_file('diffusion')
+            vae_fam = self.get_dataset_fam_file('vae')
+            return diffusion_fam != vae_fam
+            
+        return False
+    
+    def run_data_encoding(self, step: str, output_suffix: str = None) -> tuple:
+        """Encode genetic data using pre-trained models.
+        
+        Args:
+            step: Dataset step name ('vae', 'vae_test', 'diffusion', 'diffusion_val')
+            output_suffix: Optional suffix for output files
+            
+        Returns:
+            Tuple of (latents_path, spans_file_path)
+        """
+        fam_file = self.get_dataset_fam_file(step)
+        if fam_file is None:
+            return None, None
+            
+        basename = self.get_dataset_basename(step)
+        
+        logger.info(f"Encoding {step} data: {fam_file} -> {basename}")
+        
+        # Setup for encoding with proper PLINK strategy
+        genetic_binary_folder = self.config['data_prep']['genetic_binary_folder']
+        original_basename = self.config['global']['basename']
+        
+        # Determine PLINK strategy for encoding
+        if basename != original_basename:
+            # Multi-dataset mode: create temporary files for the encoding process
+            logger.info(f"Setting up encoding for different dataset: {basename}")
+            
+            # We'll create a temporary dataset with the proper files
+            temp_work_dir = os.path.join(self.config['global']['data_root'], f"temp_dataset_{basename}")
+            ensure_dir_exists(temp_work_dir)
+            
+            # Copy original bed/bim files to temp location with new basename
+            original_bed = self.config['global'].get('bed_file', 
+                os.path.join(genetic_binary_folder, f"{original_basename}.bed"))
+            original_bim = self.config['global'].get('bim_file',
+                os.path.join(genetic_binary_folder, f"{original_basename}.bim"))
+            
+            temp_bed = os.path.join(temp_work_dir, f"{basename}.bed")
+            temp_bim = os.path.join(temp_work_dir, f"{basename}.bim")
+            temp_fam = os.path.join(temp_work_dir, f"{basename}.fam")
+            
+            # Copy files (we'll clean up later)
+            import shutil
+            if not os.path.exists(temp_bed):
+                shutil.copy2(original_bed, temp_bed)
+            if not os.path.exists(temp_bim):
+                shutil.copy2(original_bim, temp_bim)
+            if not os.path.exists(temp_fam):
+                shutil.copy2(fam_file, temp_fam)
+            
+            # Use temp directory for encoding
+            encoding_genetic_folder = temp_work_dir
+            encoding_basename = basename
+            
+            logger.info(f"Created temporary dataset files in {temp_work_dir}")
+        else:
+            # Single dataset mode: use original files
+            encoding_genetic_folder = genetic_binary_folder
+            encoding_basename = basename
+        
+        # Import the encoding script functionality
+        import sys
+        import subprocess
+        from pathlib import Path
+        
+        # Prepare paths
+        chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+        chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
+        pca_basename = self.get_dataset_basename('pca')
+        
+        # PCA loadings directory
+        pca_loadings_dir = self.config['block_embed']['output_dirs']['loadings']
+        
+        # VAE model path
+        vae_model_path = self.config['joint_embed']['model_save_path']
+        
+        # Final output path
+        if output_suffix:
+            output_filename = f"{basename}_chr{chr_suffix}_VAE_latents_{output_suffix}.pt"
+        else:
+            output_filename = f"{basename}_chr{chr_suffix}_VAE_latents_{self.config['global']['unique_id']}.pt"
+        final_output_path = os.path.join(
+            os.path.dirname(self.config['joint_embed']['latents_output_path']),
+            output_filename
+        )
+        
+        # Work directory
+        work_dir = os.path.join(self.config['global']['data_root'], f"work_encode_{step}")
+        
+        # Get model parameters from config
+        model_config = self.config['joint_embed']['model']
+        
+        # Use the encode_genetic_data.py script functionality
+        encode_script_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "scripts", "encode_genetic_data.py"
+        )
+        
+        # For multiple chromosomes, we need to process all chromosomes together
+        if len(chromosomes) > 1:
+            logger.info(f"Processing all {len(chromosomes)} chromosomes together...")
+            
+            # Create unified work directory
+            unified_work_dir = os.path.join(work_dir, "unified_encoding")
+            unified_recoded_dir = os.path.join(unified_work_dir, "recoded_blocks")
+            unified_embeddings_dir = os.path.join(unified_work_dir, "embeddings")
+            unified_snplist_dir = os.path.join(unified_work_dir, "snplists")
+            
+            for dir_path in [unified_work_dir, unified_recoded_dir, unified_embeddings_dir, unified_snplist_dir]:
+                ensure_dir_exists(dir_path)
+            
+            # Import necessary functions from the encoding script
+            sys.path.insert(0, os.path.dirname(encode_script_path))
+            try:
+                from encode_genetic_data import run_plink_recode_blocks, apply_pretrained_pca
+            except ImportError:
+                # Import from the full path
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("encode_genetic_data", encode_script_path)
+                encode_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(encode_module)
+                run_plink_recode_blocks = encode_module.run_plink_recode_blocks
+                apply_pretrained_pca = encode_module.apply_pretrained_pca
+            
+            all_spans = []
+            successful_chromosomes = []
+            
+            # Process each chromosome
+            for chr_num in chromosomes:
+                logger.info(f"Processing chromosome {chr_num}...")
+                
+                # Block file for this chromosome (from PCA training)
+                block_file = f"{self.config['data_prep']['block_folder']}/{pca_basename}_chr{chr_num}_blocks.blocks.det"
+                
+                # Check if block file exists
+                if not os.path.exists(block_file):
+                    logger.warning(f"Block file not found for chromosome {chr_num}: {block_file}")
+                    continue
+                
+                try:
+                    # Step 1: Recode genetic blocks for this chromosome
+                    recoded_files = run_plink_recode_blocks(
+                        plink_basename=encoding_basename,
+                        genetic_binary_folder=encoding_genetic_folder,
+                        chromosome=chr_num,
+                        block_file=block_file,
+                        output_dir=unified_recoded_dir,
+                        snplist_folder=unified_snplist_dir
+                    )
+                    
+                    if not recoded_files:
+                        logger.warning(f"No blocks recoded for chromosome {chr_num}")
+                        continue
+                    
+                    # Step 2: Apply pre-trained PCA to each block
+                    means_dir = os.path.join(os.path.dirname(pca_loadings_dir), "means")
+                    if not os.path.exists(means_dir):
+                        means_dir = pca_loadings_dir.replace("loadings", "means")
+                    
+                    for raw_file in recoded_files:
+                        try:
+                            embeddings, block_no = apply_pretrained_pca(
+                                raw_file=raw_file,
+                                loadings_dir=pca_loadings_dir,
+                                means_dir=means_dir,
+                                basename=encoding_basename,
+                                chromosome=chr_num,
+                                k=self.config['block_embed']['pca_k']
+                            )
+                            
+                            # Save embeddings
+                            embedding_file = os.path.join(
+                                unified_embeddings_dir,
+                                f"{basename}_chr{chr_num}_block{block_no}_embeddings.pt"
+                            )
+                            torch.save(embeddings, embedding_file)
+                            
+                            # Add to spans
+                            LD_blocks = load_blocks_for_chr(block_file, chr_num)
+                            block_idx = int(block_no) - 1  # Convert to 0-based index
+                            if block_idx < len(LD_blocks):
+                                block = LD_blocks[block_idx]
+                                all_spans.append([embedding_file, block.chr, block.bp1, block.bp2])
+                            
+                        except Exception as e:
+                            logger.warning(f"Failed to process {raw_file}: {e}")
+                            continue
+                    
+                    successful_chromosomes.append(chr_num)
+                    logger.info(f"Successfully processed chromosome {chr_num}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to process chromosome {chr_num}: {e}")
+                    continue
+            
+            if not successful_chromosomes:
+                raise RuntimeError("No chromosomes were successfully processed")
+            
+            # Create unified spans CSV using consistent naming
+            df = pd.DataFrame(all_spans, columns=["block_file", "chr", "start", "end"])
+            unified_spans_file = self.get_spans_file_path(step)
+            ensure_dir_exists(os.path.dirname(unified_spans_file))
+            df.to_csv(unified_spans_file, index=False)
+            logger.info(f"Created spans file with {len(all_spans)} blocks from {len(successful_chromosomes)} chromosomes: {unified_spans_file}")
+            
+            # Run VAE inference using unified data
+            from .joint_embed.infer import inference as vae_inference
+            from types import SimpleNamespace
+            
+            vae_args = SimpleNamespace()
+            vae_args.model_path = vae_model_path
+            vae_args.spans_file = unified_spans_file
+            vae_args.recoded_dir = unified_recoded_dir
+            vae_args.output_path = final_output_path
+            vae_args.grid_h = int(model_config['grid_h'])
+            vae_args.grid_w = int(model_config['grid_w'])
+            vae_args.block_dim = int(model_config['block_dim'])
+            vae_args.pos_dim = int(model_config['pos_dim'])
+            vae_args.latent_channels = int(model_config['latent_channels'])
+            
+            logger.info("Running unified VAE inference...")
+            vae_inference(vae_args)
+            
+            output_path = final_output_path
+            spans_file_path = unified_spans_file
+            logger.info(f"Multi-chromosome encoding completed: {output_path}")
+        
+        else:
+            # Single chromosome processing (original logic)
+            chr_num = chromosomes[0]
+            logger.info(f"Processing single chromosome {chr_num}...")
+            
+            # Block file for this chromosome (from PCA training)
+            block_file = f"{self.config['data_prep']['block_folder']}/{pca_basename}_chr{chr_num}_blocks.blocks.det"
+            
+            cmd = [
+                sys.executable, encode_script_path,
+                "--basename", encoding_basename,
+                "--genetic-binary-folder", encoding_genetic_folder,
+                "--chromosome", str(chr_num),
+                "--block-file", block_file,
+                "--pca-loadings-dir", pca_loadings_dir,
+                "--vae-model-path", vae_model_path,
+                "--output-path", final_output_path,
+                "--work-dir", work_dir,
+                "--pca-k", str(self.config['block_embed']['pca_k']),
+                "--grid-h", str(model_config['grid_h']),
+                "--grid-w", str(model_config['grid_w']),
+                "--block-dim", str(model_config['block_dim']),
+                "--pos-dim", str(model_config['pos_dim']),
+                "--latent-channels", str(model_config['latent_channels'])
+            ]
+            
+            logger.info(f"Running encoding command: {' '.join(cmd)}")
+            
+            try:
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+                logger.info(f"Encoding completed successfully for {step}")
+                output_path = final_output_path
+                # For single chromosome, we need to create the spans file path
+                spans_file_path = self.get_spans_file_path(step)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Encoding failed for {step}: {e}")
+                logger.error(f"stdout: {e.stdout}")
+                logger.error(f"stderr: {e.stderr}")
+                raise
+        
+        # Cleanup temporary dataset files if created
+        if basename != original_basename and 'temp_work_dir' in locals():
+            try:
+                import shutil
+                shutil.rmtree(temp_work_dir)
+                logger.info(f"Cleaned up temporary dataset directory: {temp_work_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temporary directory {temp_work_dir}: {e}")
+        
+        return output_path, spans_file_path
+    
     def setup_logging(self):
         """Setup logging based on config."""
         log_config = self.config.get('logging', {})
@@ -169,11 +574,12 @@ class DiffuGenePipeline:
         
         if step_name == 'data_prep':
             # Check if recoded block files exist for all required chromosomes
+            pca_basename = self.get_dataset_basename('pca')
             all_chr_exist = True
             for chr_num in chromosomes:
                 pattern = os.path.join(
                     self.config['data_prep']['recoded_block_folder'],
-                    f"{self.config['global']['basename']}_chr{chr_num}_block*_recodeA.raw"
+                    f"{pca_basename}_chr{chr_num}_block*_recodeA.raw"
                 )
                 if len(glob.glob(pattern)) == 0:
                     all_chr_exist = False
@@ -183,7 +589,6 @@ class DiffuGenePipeline:
         elif step_name == 'block_embed':
             # Check if both embeddings and spans CSV exist for all chromosomes
             embeddings_dir = self.config['block_embed']['output_dirs']['embeddings']
-            pca_k = int(self.config['block_embed']['pca_k'])
             
             # Check embeddings exist for all chromosomes
             all_emb_exist = True
@@ -193,9 +598,8 @@ class DiffuGenePipeline:
                     all_emb_exist = False
                     break
             
-            # Check spans CSV exists
-            chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
-            spans_csv = f"{self.config['data_prep']['block_folder']}/{self.config['global']['basename']}_chr{chr_suffix}_blocks_{pca_k}PC.csv"
+            # Check automatically generated spans CSV exists
+            spans_csv = self.get_spans_file_path('pca')
             
             return all_emb_exist and os.path.exists(spans_csv)
             
@@ -207,6 +611,25 @@ class DiffuGenePipeline:
         elif step_name == 'diffusion':
             model_path = self.config['diffusion']['model_output_path']
             return os.path.exists(model_path)
+            
+        elif step_name == 'vae_evaluation':
+            if not self.should_run_evaluation_step('vae_evaluation'):
+                return True  # Skip if not needed
+            test_latents_path = self.config['joint_embed']['evaluation']['test_latents_path']
+            test_reconstructions_path = self.config['joint_embed']['evaluation']['test_reconstructions_path']
+            return os.path.exists(test_latents_path) and os.path.exists(test_reconstructions_path)
+            
+        elif step_name == 'diffusion_encoding':
+            if not self.should_run_evaluation_step('diffusion_encoding'):
+                return True  # Skip if not needed
+            diffusion_train_latents_path = self.config['diffusion']['encoding']['diffusion_train_latents_path']
+            return os.path.exists(diffusion_train_latents_path)
+            
+        elif step_name == 'diffusion_val_encoding':
+            if not self.should_run_evaluation_step('diffusion_val_encoding'):
+                return True  # Skip if not needed
+            diffusion_val_latents_path = self.config['diffusion']['encoding']['diffusion_val_latents_path']
+            return os.path.exists(diffusion_val_latents_path)
             
         elif step_name == 'generation':
             output_path = self.config['generation']['output_path']
@@ -253,6 +676,15 @@ class DiffuGenePipeline:
             logger.info("Data prep outputs found, skipping...")
             return
         
+        # Get the dataset for PCA training
+        pca_fam_file = self.get_dataset_fam_file('pca')
+        pca_basename = self.get_dataset_basename('pca')
+        
+        logger.info(f"Using PCA training data: {pca_fam_file}")
+        logger.info(f"PCA dataset basename: {pca_basename}")
+        
+        # No symlinks needed - we'll pass the actual file paths directly
+        
         # Import and run the data prep module
         from .block_embed.run import main as data_prep_main
         from types import SimpleNamespace
@@ -260,19 +692,49 @@ class DiffuGenePipeline:
         chromosomes = get_chromosome_list(self.config['global']['chromosome'])
         logger.info(f"Processing chromosomes: {chromosomes}")
         
+        # Get the actual file paths for the genetic data
+        genetic_binary_folder = self.config['data_prep']['genetic_binary_folder']
+        original_basename = self.config['global']['basename']
+        
+        # Determine the PLINK strategy
+        if pca_basename != original_basename:
+            # Multi-dataset mode: use global bfile with --keep
+            global_bfile_path = self.config['global'].get('bed_file', 
+                os.path.join(genetic_binary_folder, f"{original_basename}"))
+            # Remove .bed extension if present
+            if global_bfile_path.endswith('.bed'):
+                global_bfile_path = global_bfile_path[:-4]
+            keep_fam_file = pca_fam_file
+            use_keep_strategy = True
+            logger.info(f"Multi-dataset mode: --bfile {global_bfile_path} --keep {keep_fam_file}")
+        else:
+            # Single dataset mode: use dataset-specific bfile
+            global_bfile_path = os.path.join(genetic_binary_folder, pca_basename)
+            keep_fam_file = None
+            use_keep_strategy = False
+            logger.info(f"Single dataset mode: --bfile {global_bfile_path}")
+        
         # Process each chromosome
+        failed_chromosomes = []
+        successful_chromosomes = []
+        
         for chr_num in chromosomes:
             logger.info(f"Processing chromosome {chr_num}...")
             
             # Prepare arguments (ensure proper types)
             args = SimpleNamespace()
-            args.basename = self.config['global']['basename']
+            args.basename = pca_basename
             args.chrNo = chr_num
-            args.genetic_binary_folder = self.config['data_prep']['genetic_binary_folder']
+            args.genetic_binary_folder = genetic_binary_folder
             args.block_folder = self.config['data_prep']['block_folder']
             args.recoded_block_folder = self.config['data_prep']['recoded_block_folder']
             args.snplist_folder = self.config['data_prep']['snplist_folder']
             args.embedding_folder = self.config['block_embed']['output_dirs']['embeddings']
+            
+            # Add PLINK strategy arguments
+            args.global_bfile = global_bfile_path
+            if use_keep_strategy:
+                args.keep_fam_file = keep_fam_file
             
             # Add PLINK parameters from config (ensure proper types)
             plink_config = self.config['data_prep']['plink']
@@ -287,11 +749,32 @@ class DiffuGenePipeline:
             try:
                 data_prep_main(args)
                 logger.info(f"Data preparation completed successfully for chromosome {chr_num}")
+                successful_chromosomes.append(chr_num)
             except Exception as e:
                 logger.error(f"Data preparation failed for chromosome {chr_num}: {e}")
-                raise
+                failed_chromosomes.append(chr_num)
+                
+                # Continue with other chromosomes if this is not the only one
+                if len(chromosomes) > 1:
+                    logger.warning(f"Continuing with remaining chromosomes...")
+                    continue
+                else:
+                    raise
         
-        logger.info("Data preparation completed successfully for all chromosomes")
+        # Report summary
+        if successful_chromosomes:
+            logger.info(f"Data preparation completed successfully for {len(successful_chromosomes)} chromosomes: {successful_chromosomes}")
+        if failed_chromosomes:
+            logger.warning(f"Data preparation failed for {len(failed_chromosomes)} chromosomes: {failed_chromosomes}")
+        
+        if not successful_chromosomes:
+            raise RuntimeError("Data preparation failed for all chromosomes")
+        elif failed_chromosomes:
+            logger.info(f"Continuing pipeline with {len(successful_chromosomes)} successful chromosomes")
+        
+        # No cleanup needed since we're not using symlinks
+        
+        logger.info("Data preparation phase completed")
     
     def run_block_embed(self):
         """Step 2: Block-wise PCA embedding."""
@@ -315,11 +798,12 @@ class DiffuGenePipeline:
         all_block_metrics = []
         all_failed_blocks = []
         
-        # Prepare config paths for fit_pca (ensure proper types)
+        # Prepare config paths for fit_pca (ensure proper types) 
+        pca_basename = self.get_dataset_basename('pca')
         config_paths = {
             'recoded_dir': self.config['data_prep']['recoded_block_folder'],
             'output_dirs': self.config['block_embed']['output_dirs'],
-            'basename': self.config['global']['basename'],
+            'basename': pca_basename,
             'pca_k': int(self.config['block_embed']['pca_k'])
         }
         
@@ -329,7 +813,7 @@ class DiffuGenePipeline:
             # Find all recoded block files for this chromosome
             pattern = os.path.join(
                 self.config['data_prep']['recoded_block_folder'],
-                f"{self.config['global']['basename']}_chr{chr_num}_block*_recodeA.raw"
+                f"{pca_basename}_chr{chr_num}_block*_recodeA.raw"
             )
             raw_files = glob.glob(pattern)
             logger.info(f"Found {len(raw_files)} block files for chromosome {chr_num}")
@@ -376,14 +860,43 @@ class DiffuGenePipeline:
                            f"MSE={np.mean(mse_values):.4f}±{np.std(mse_values):.4f}, "
                            f"Acc={np.mean(acc_values):.4f}±{np.std(acc_values):.4f}")
         
-        # Create embedding spans CSV after all embeddings are generated
+        # Create embedding spans CSV using consistent naming
         embeddings_dir = self.config['block_embed']['output_dirs']['embeddings']
         pca_k = int(self.config['block_embed']['pca_k'])
         
-        if len(chromosomes) > 1:
-            spans_csv_path = create_multi_chromosome_spans_csv(self.config, embeddings_dir, pca_k, chromosomes)
+        # Get consistent spans file path for PCA training data
+        spans_csv_path = self.get_spans_file_path('pca')
+        ensure_dir_exists(os.path.dirname(spans_csv_path))
+        
+        # Create the spans data
+        all_spans = []
+        for chr_num in chromosomes:
+            # Load LD blocks from the original block definition file
+            block_file = f"{self.config['data_prep']['block_folder']}/{pca_basename}_chr{chr_num}_blocks.blocks.det"
+            
+            if not os.path.exists(block_file):
+                logger.warning(f"Block definition file not found for chr {chr_num}: {block_file}")
+                continue
+            
+            LD_blocks = load_blocks_for_chr(block_file, chr_num)
+            
+            # Create DataFrame with block information for this chromosome
+            for i, block in enumerate(LD_blocks):
+                # Add embedding file paths (using actual block numbers from embeddings)
+                block_file_path = os.path.join(
+                    embeddings_dir,
+                    f"{pca_basename}_chr{block.chr}_block{i+1}_embeddings.pt"
+                )
+                if os.path.exists(block_file_path):
+                    all_spans.append([block_file_path, block.chr, block.bp1, block.bp2])
+        
+        # Save spans CSV
+        if all_spans:
+            df = pd.DataFrame(all_spans, columns=["block_file", "chr", "start", "end"])
+            df.to_csv(spans_csv_path, index=False)
+            logger.info(f"Created PCA training spans file: {spans_csv_path} with {len(all_spans)} blocks")
         else:
-            spans_csv_path = create_embedding_spans_csv(self.config, embeddings_dir, pca_k)
+            logger.error("No valid embedding files found for spans CSV creation")
         
         # Report overall summary statistics
         if all_block_metrics:
@@ -412,21 +925,38 @@ class DiffuGenePipeline:
             logger.info("Joint embedding outputs found, skipping...")
             return
         
+        # Get the datasets for VAE training
+        vae_fam_file = self.get_dataset_fam_file('vae')
+        vae_basename = self.get_dataset_basename('vae')
+        pca_basename = self.get_dataset_basename('pca')  # For spans file
+        
+        logger.info(f"Using VAE training data: {vae_fam_file}")
+        logger.info(f"VAE dataset basename: {vae_basename}")
+        
         # Import and run VAE training
         from .joint_embed.train import train as vae_train
         from types import SimpleNamespace
         
-        # Use the PC-specific spans file created in block embedding step
-        pca_k = int(self.config['block_embed']['pca_k'])
-        chromosomes = get_chromosome_list(self.config['global']['chromosome'])
-        chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
-        spans_file = f"{self.config['data_prep']['block_folder']}/{self.config['global']['basename']}_chr{chr_suffix}_blocks_{pca_k}PC.csv"
+        # Use the automatically generated spans file for VAE training data
+        spans_file = self.get_spans_file_path('vae')
+        
+        # Check if VAE training data is different from PCA training data
+        if vae_basename != pca_basename:
+            logger.info("VAE training data differs from PCA training data - encoding VAE data first...")
+            # For now, we'll use the PCA data paths and log a warning
+            logger.warning("Multi-dataset VAE training not implemented - using PCA training data")
+            recoded_dir = self.config['joint_embed']['recoded_dir']
+            embeddings_dir = self.config['joint_embed']['embeddings_dir']
+        else:
+            # Use the original data paths
+            recoded_dir = self.config['joint_embed']['recoded_dir']
+            embeddings_dir = self.config['joint_embed']['embeddings_dir']
         
         # Prepare arguments
         args = SimpleNamespace()
         args.spans_file = spans_file
-        args.recoded_dir = self.config['joint_embed']['recoded_dir']
-        args.embeddings_dir = self.config['joint_embed']['embeddings_dir']
+        args.recoded_dir = recoded_dir
+        args.embeddings_dir = embeddings_dir
         args.model_save_path = self.config['joint_embed']['model_save_path']
         args.checkpoint_path = self.config['joint_embed']['checkpoint_path']
         
@@ -460,7 +990,7 @@ class DiffuGenePipeline:
         infer_args = SimpleNamespace()
         infer_args.model_path = self.config['joint_embed']['model_save_path']  # Use final trained model
         infer_args.spans_file = spans_file
-        infer_args.recoded_dir = self.config['joint_embed']['recoded_dir']
+        infer_args.recoded_dir = recoded_dir
         infer_args.output_path = self.config['joint_embed']['latents_output_path']
         infer_args.grid_h = int(model_config['grid_h'])
         infer_args.grid_w = int(model_config['grid_w'])
@@ -471,6 +1001,176 @@ class DiffuGenePipeline:
         vae_inference(infer_args)
         logger.info("Joint embedding completed successfully")
     
+    def run_vae_evaluation(self):
+        """Step 3.5: VAE evaluation on test data."""
+        logger.info("=" * 60)
+        logger.info("STEP 3.5: VAE Evaluation")
+        logger.info("=" * 60)
+        
+        if not self.should_run_evaluation_step('vae_evaluation'):
+            logger.info("VAE evaluation not requested or test data not specified, skipping...")
+            return
+        
+        # Check if evaluation outputs already exist
+        test_latents_path = self.config['joint_embed']['evaluation']['test_latents_path']
+        test_reconstructions_path = self.config['joint_embed']['evaluation']['test_reconstructions_path']
+        
+        if os.path.exists(test_latents_path) and os.path.exists(test_reconstructions_path):
+            logger.info("VAE evaluation outputs found, skipping...")
+            return
+        
+        logger.info("Running VAE evaluation on test data...")
+        
+        # Encode test data to get latents
+        encoding_result = self.run_data_encoding('vae_test', 'test')
+        
+        if encoding_result is None or encoding_result[0] is None:
+            logger.error("Failed to encode VAE test data")
+            return
+        
+        test_latents_path_actual, test_spans_file = encoding_result
+        
+        # Decode the latents back to SNP space for evaluation
+        logger.info("Decoding test latents for reconstruction evaluation...")
+        
+        try:
+            # Import and run decoding
+            import subprocess
+            import sys
+            
+            # Get paths
+            chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+            chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
+            pca_basename = self.get_dataset_basename('pca')
+            vae_test_basename = self.get_dataset_basename('vae_test')
+            
+            # VAE model and embeddings paths
+            vae_model_path = self.config['joint_embed']['model_save_path']
+            embeddings_dir = self.config['joint_embed']['embeddings_dir']
+            
+            # Use the spans file created during test data encoding
+            spans_file = test_spans_file
+            
+            # Output path for reconstructions
+            test_reconstructions_path_actual = test_reconstructions_path.replace(
+                self.config['global']['unique_id'],
+                f"{self.config['global']['unique_id']}_test"
+            )
+            
+            # Run decoding using the decode_vae_latents.py script
+            decode_script_path = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)),
+                "joint_embed", "decode_vae_latents.py"
+            )
+            
+            cmd = [
+                sys.executable, decode_script_path,
+                "--latents-file", test_latents_path_actual,
+                "--model-file", vae_model_path,
+                "--embeddings-dir", embeddings_dir,
+                "--spans-file", spans_file,
+                "--output-file", test_reconstructions_path_actual,
+                "--batch-size", "256"
+            ]
+            
+            if chr_suffix != "all":
+                cmd.extend(["--chromosome", str(chr_suffix)])
+            
+            logger.info(f"Running decoding command: {' '.join(cmd)}")
+            
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            logger.info("VAE test data decoding completed successfully")
+            
+            # Copy outputs to expected paths
+            if test_latents_path_actual != test_latents_path:
+                import shutil
+                ensure_dir_exists(os.path.dirname(test_latents_path))
+                shutil.copy2(test_latents_path_actual, test_latents_path)
+            
+            if test_reconstructions_path_actual != test_reconstructions_path:
+                ensure_dir_exists(os.path.dirname(test_reconstructions_path))
+                shutil.copy2(test_reconstructions_path_actual, test_reconstructions_path)
+            
+            logger.info(f"VAE evaluation completed successfully!")
+            logger.info(f"  Test latents: {test_latents_path}")
+            logger.info(f"  Test reconstructions: {test_reconstructions_path}")
+            
+        except Exception as e:
+            logger.error(f"VAE evaluation failed: {e}")
+            raise
+    
+    def run_diffusion_encoding(self):
+        """Step 3.7: Encode diffusion training data if different from VAE training data."""
+        logger.info("=" * 60)
+        logger.info("STEP 3.7: Diffusion Training Data Encoding")
+        logger.info("=" * 60)
+        
+        if not self.should_run_evaluation_step('diffusion_encoding'):
+            logger.info("Diffusion training data is same as VAE training data, skipping encoding...")
+            return
+        
+        # Check if encoding output already exists
+        diffusion_train_latents_path = self.config['diffusion']['encoding']['diffusion_train_latents_path']
+        
+        if os.path.exists(diffusion_train_latents_path):
+            logger.info("Diffusion training latents found, skipping encoding...")
+            return
+        
+        logger.info("Encoding diffusion training data...")
+        
+        # Encode diffusion training data
+        encoding_result = self.run_data_encoding('diffusion', 'diffusion_train')
+        
+        if encoding_result is None or encoding_result[0] is None:
+            logger.error("Failed to encode diffusion training data")
+            return
+        
+        encoded_path, diffusion_spans_file = encoding_result
+        
+        # Copy to expected location if different
+        if encoded_path != diffusion_train_latents_path:
+            import shutil
+            ensure_dir_exists(os.path.dirname(diffusion_train_latents_path))
+            shutil.copy2(encoded_path, diffusion_train_latents_path)
+        
+        logger.info(f"Diffusion training data encoding completed: {diffusion_train_latents_path}")
+    
+    def run_diffusion_val_encoding(self):
+        """Step 4.5: Encode diffusion validation data."""
+        logger.info("=" * 60)
+        logger.info("STEP 4.5: Diffusion Validation Data Encoding")
+        logger.info("=" * 60)
+        
+        if not self.should_run_evaluation_step('diffusion_val_encoding'):
+            logger.info("Diffusion validation data not specified, skipping...")
+            return
+        
+        # Check if encoding output already exists
+        diffusion_val_latents_path = self.config['diffusion']['encoding']['diffusion_val_latents_path']
+        
+        if os.path.exists(diffusion_val_latents_path):
+            logger.info("Diffusion validation latents found, skipping encoding...")
+            return
+        
+        logger.info("Encoding diffusion validation data...")
+        
+        # Encode diffusion validation data
+        encoding_result = self.run_data_encoding('diffusion_val', 'diffusion_val')
+        
+        if encoding_result is None or encoding_result[0] is None:
+            logger.error("Failed to encode diffusion validation data")
+            return
+        
+        encoded_path, diffusion_val_spans_file = encoding_result
+        
+        # Copy to expected location if different
+        if encoded_path != diffusion_val_latents_path:
+            import shutil
+            ensure_dir_exists(os.path.dirname(diffusion_val_latents_path))
+            shutil.copy2(encoded_path, diffusion_val_latents_path)
+        
+        logger.info(f"Diffusion validation data encoding completed: {diffusion_val_latents_path}")
+    
     def run_diffusion(self):
         """Step 4: Diffusion model training."""
         logger.info("=" * 60)
@@ -480,6 +1180,16 @@ class DiffuGenePipeline:
         if self.check_step_outputs('diffusion'):
             logger.info("Diffusion model found, skipping...")
             return
+        
+        # Determine which latents to use for diffusion training
+        if self.should_run_evaluation_step('diffusion_encoding'):
+            # Use separately encoded diffusion training latents
+            train_embed_dataset_path = self.config['diffusion']['encoding']['diffusion_train_latents_path']
+            logger.info(f"Using separate diffusion training latents: {train_embed_dataset_path}")
+        else:
+            # Use VAE training latents
+            train_embed_dataset_path = self.config['diffusion']['train_embed_dataset_path']
+            logger.info(f"Using VAE training latents: {train_embed_dataset_path}")
         
         # Import and run diffusion training
         from .diffusion.train import train as diffusion_train
@@ -497,7 +1207,7 @@ class DiffuGenePipeline:
             lr=float(train_config['learning_rate']),
             checkpoint_path=self.config['diffusion']['checkpoint_path'],
             model_output_path=self.config['diffusion']['model_output_path'],
-            train_embed_dataset_path=self.config['diffusion']['train_embed_dataset_path']
+            train_embed_dataset_path=train_embed_dataset_path
         )
         
         logger.info("Diffusion training completed successfully")
@@ -582,7 +1292,8 @@ class DiffuGenePipeline:
             args.decode_samples = True
             args.vae_model_path = expanded_gen_config['vae_model_path']
             args.pca_loadings_dir = expanded_gen_config['pca_loadings_dir']
-            args.recoded_dir = expanded_gen_config['recoded_dir']
+            # Use the spans file from VAE training data (same as generation uses VAE training embeddings)
+            args.spans_file = self.get_spans_file_path('vae')
             args.decoded_output_dir = expanded_gen_config['decoded_output_dir']
             args.basename = self.config['global']['basename']
             args.chromosomes = get_chromosome_list(self.config['global']['chromosome'])
@@ -632,10 +1343,10 @@ class DiffuGenePipeline:
             logger.info(f"Loading PCA models from {pca_loadings_dir}")
             pca_models, block_info = load_pca_models(pca_loadings_dir, int(self.config['global']['chromosome']))
             
-            # Load spans data with expanded path
-            recoded_dir = expanded_gen_config['recoded_dir']
-            logger.info(f"Loading spans data from {recoded_dir}")
-            spans = load_spans_data(recoded_dir, self.config['global']['basename'], int(self.config['global']['chromosome']))
+            # Load spans data from VAE training data (used for generation)
+            spans_file = self.get_spans_file_path('vae')
+            logger.info(f"Loading spans data from {spans_file}")
+            spans = load_spans_data(spans_file)
             
             # Decode samples
             decoded_snps = decode_samples(latents, vae_model, spans, pca_models, device="cuda")
@@ -661,7 +1372,10 @@ class DiffuGenePipeline:
             ('data_prep', self.run_data_prep, pipeline_config.get('run_data_prep', True)),
             ('block_embed', self.run_block_embed, pipeline_config.get('run_block_embed', True)),
             ('joint_embed', self.run_joint_embed, pipeline_config.get('run_joint_embed', True)),
+            ('vae_evaluation', self.run_vae_evaluation, pipeline_config.get('run_vae_evaluation', True)),
+            ('diffusion_encoding', self.run_diffusion_encoding, pipeline_config.get('run_diffusion_encoding', True)),
             ('diffusion', self.run_diffusion, pipeline_config.get('run_diffusion', True)),
+            ('diffusion_val_encoding', self.run_diffusion_val_encoding, pipeline_config.get('run_diffusion_val_encoding', True)),
             ('generation', self.run_generation, pipeline_config.get('run_generation', True))
         ]
         
@@ -732,7 +1446,7 @@ Examples:
     parser.add_argument(
         '--steps',
         nargs='+',
-        choices=['data_prep', 'block_embed', 'joint_embed', 'diffusion', 'generation'],
+        choices=['data_prep', 'block_embed', 'joint_embed', 'vae_evaluation', 'diffusion_encoding', 'diffusion', 'diffusion_val_encoding', 'generation'],
         help='Specific steps to run (default: run all enabled steps)'
     )
     
@@ -758,11 +1472,14 @@ Examples:
     
     if args.list_steps:
         print("Available pipeline steps:")
-        print("  1. data_prep    - Data preparation and LD block inference")
-        print("  2. block_embed  - Block-wise PCA embedding")
-        print("  3. joint_embed  - Joint VAE embedding")
-        print("  4. diffusion    - Diffusion model training")
-        print("  5. generation   - Sample generation")
+        print("  1. data_prep             - Data preparation and LD block inference")
+        print("  2. block_embed           - Block-wise PCA embedding")
+        print("  3. joint_embed           - Joint VAE embedding")
+        print("  4. vae_evaluation        - VAE evaluation on test data")
+        print("  5. diffusion_encoding    - Encode diffusion training data")
+        print("  6. diffusion             - Diffusion model training")
+        print("  7. diffusion_val_encoding - Encode diffusion validation data")
+        print("  8. generation            - Sample generation")
         return
     
     # Initialize pipeline

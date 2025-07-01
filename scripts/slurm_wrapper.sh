@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH -p gpu_requeue
 #SBATCH --gres=gpu:1
-#SBATCH --mem=60G
-#SBATCH -t 1-00:00:00
-#SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_%j.out
-#SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_%j.err
+#SBATCH --mem=100G
+#SBATCH -t 3-00:00:00
+#SBATCH -c 4
+#SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_%j.out
+#SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_%j.err
 
 conda init
 eval "$(conda shell.bash hook)"
@@ -15,9 +16,9 @@ module load R gcc cmake
 nvidia-smi
 unset CUDA_VISIBLE_DEVICES
 
-yaml_filename=$1
+yaml_file=$1
 
 difdir=/n/home03/ahmadazim/WORKING/genGen/DiffuGene
-${difdir}/scripts/run_pipeline.sh --config ${difdir}/src/DiffuGene/config/${yaml_filename} 
+${difdir}/scripts/run_pipeline.sh --config ${yaml_file} 
 
-# for pc in 3 4 5; do sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh pipeline_${pc}PC.yaml; done
+# sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh /n/home03/ahmadazim/WORKING/genGen/UKB/pipeline_ukb_allchr_unrel_britishWhite.yaml

@@ -54,7 +54,19 @@ def run_plink_recode_blocks(plink_basename, genetic_binary_folder, chromosome,
     snplist_files = glob.glob(snplist_pattern)
     logger.info(f"Created {len(snplist_files)} SNP list files")
     
-    # Recode each block using PLINK with --extract (EXACT same as training)
+    # For encoding, we expect the caller to handle the PLINK setup strategy
+    # But we'll support both standard and --keep approaches
+    
+    # Determine if we need to use --keep strategy
+    # This would be indicated by plink_basename being different from the actual genetic data files
+    actual_bfile = os.path.join(genetic_binary_folder, plink_basename)
+    
+    # Check if the files exist with this basename
+    if not os.path.exists(f"{actual_bfile}.bed"):
+        logger.warning(f"PLINK files not found with basename {actual_bfile}")
+        # The pipeline should handle creating proper file setup
+    
+    # Recode each block using PLINK with --extract
     ensure_dir_exists(output_dir)
     recoded_files = []
     
@@ -72,10 +84,10 @@ def run_plink_recode_blocks(plink_basename, genetic_binary_folder, chromosome,
             f"{plink_basename}_chr{chromosome}_block{block_no}_recodeA"
         )
         
-        # Use EXACT same PLINK command as training
+        # Use standard PLINK command - the pipeline will ensure proper file setup
         cmd = [
             "plink",
-            "--bfile", os.path.join(genetic_binary_folder, plink_basename),
+            "--bfile", actual_bfile,
             "--chr", str(chromosome),
             "--extract", snpfile,
             "--recodeA",

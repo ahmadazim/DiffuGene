@@ -69,6 +69,9 @@ def load_blocks_for_chr(fn: str, chr_no: int) -> List[Block]:
     Returns:
         List of Block namedtuples
     """
+    if not os.path.exists(fn):
+        raise FileNotFoundError(f"Block definition file not found: {fn}")
+    
     blocks = []
     with open(fn) as f:
         next(f)  # skip header

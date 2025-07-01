@@ -245,29 +245,15 @@ def load_pca_models(pca_loadings_dir, chromosomes):
     logger.info(f"Loaded {len(pca_models)} PCA models across {len(chromosomes)} chromosomes")
     return pca_models, block_info
 
-def load_spans_data(recoded_dir, basename, chromosomes):
+def load_spans_data(spans_file_path):
     """Load the spans data needed for VAE decoding."""
-    # Handle both single chromosome (int) and multiple chromosomes (list)
-    if isinstance(chromosomes, int):
-        chromosomes = [chromosomes]
+    if not os.path.exists(spans_file_path):
+        raise FileNotFoundError(f"Spans file not found: {spans_file_path}")
     
-    # The spans data is stored as a CSV file
-    # For multi-chromosome, use the "all" suffix
-    chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
-    
-    # Look for the CSV file created during block embedding step
-    spans_file = os.path.join(recoded_dir.replace('haploblocks_recoded', 'haploblocks'), 
-                              f"{basename}_chr{chromosome}_blocks_3PC.csv")
-    
-    # Try different PC versions if the specific one doesn't exist
-    if not os.path.exists(spans_file):
-        raise FileNotFoundError(f"No spans CSV file found for chromosome {chromosome}")
-    
-    if not os.path.exists(spans_file):
-        raise FileNotFoundError(f"Spans file not found: {spans_file}")
+    logger.info(f"Loading spans data from: {spans_file_path}")
     
     # Load CSV and create spans tensor like in SNPBlocksDataset
-    df = pd.read_csv(spans_file)
+    df = pd.read_csv(spans_file_path)
     
     MAX_COORD_CHR22 = 50_818_468
     scaled_spans = []
@@ -279,7 +265,7 @@ def load_spans_data(recoded_dir, basename, chromosomes):
         scaled_spans.append([chr_norm, start_norm, end_norm])
     
     spans = torch.tensor(scaled_spans, dtype=torch.float32)  # (n_blocks, 3)
-    logger.info(f"Loaded spans data from CSV: {spans.shape} blocks from {len(chromosomes)} chromosomes")
+    logger.info(f"Loaded spans data: {spans.shape} blocks")
     return spans
 
 def decode_samples(generated_latents, vae_model, spans, pca_models, device="cuda"):
@@ -553,8 +539,8 @@ def generate(args):
             # Load PCA models for all chromosomes
             pca_models, block_info = load_pca_models(args.pca_loadings_dir, chromosomes)
             
-            # Load spans data for all chromosomes
-            spans = load_spans_data(args.recoded_dir, args.basename, chromosomes)
+            # Load spans data from explicitly specified file
+            spans = load_spans_data(args.spans_file)
             
             # Decode samples
             decoded_snps = decode_samples(all_samples, vae_model, spans, pca_models, device="cuda")
@@ -582,7 +568,7 @@ def main():
     parser.add_argument("--decode-samples", action="store_true", help="Decode generated samples to SNP space")
     parser.add_argument("--vae-model-path", type=str, help="Path to trained VAE model")
     parser.add_argument("--pca-loadings-dir", type=str, help="Directory containing PCA model files")
-    parser.add_argument("--recoded-dir", type=str, help="Directory containing spans data")
+    parser.add_argument("--spans-file", type=str, help="Path to spans CSV file")
     parser.add_argument("--decoded-output-dir", type=str, help="Directory to save decoded SNPs")
     parser.add_argument("--basename", type=str, help="Dataset basename")
     parser.add_argument("--chromosome", type=int, help="Chromosome number")
