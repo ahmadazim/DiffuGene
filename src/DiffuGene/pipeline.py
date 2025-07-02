@@ -1198,17 +1198,54 @@ class DiffuGenePipeline:
         model_config = self.config['diffusion']['model']
         train_config = self.config['diffusion']['training']
         
-        diffusion_train(
-            batch_size=int(train_config['batch_size']),
-            num_time_steps=int(train_config['num_time_steps']),
-            num_epochs=int(train_config['num_epochs']),
-            seed=int(self.config['global']['random_seed']),
-            ema_decay=float(train_config['ema_decay']),
-            lr=float(train_config['learning_rate']),
-            checkpoint_path=self.config['diffusion']['checkpoint_path'],
-            model_output_path=self.config['diffusion']['model_output_path'],
-            train_embed_dataset_path=train_embed_dataset_path
-        )
+        # Check if conditional generation is enabled
+        conditional_config = self.config['diffusion'].get('conditional', {})
+        is_conditional = conditional_config.get('enabled', False)
+        
+        # Basic training arguments
+        train_args = {
+            'batch_size': int(train_config['batch_size']),
+            'num_time_steps': int(train_config['num_time_steps']),
+            'num_epochs': int(train_config['num_epochs']),
+            'seed': int(self.config['global']['random_seed']),
+            'ema_decay': float(train_config['ema_decay']),
+            'lr': float(train_config['learning_rate']),
+            'checkpoint_path': self.config['diffusion']['checkpoint_path'],
+            'model_output_path': self.config['diffusion']['model_output_path'],
+            'train_embed_dataset_path': train_embed_dataset_path
+        }
+        
+        # Add conditional arguments if enabled
+        if is_conditional:
+            logger.info("Training conditional diffusion model")
+            
+            # Determine which fam file to use for covariates
+            if self.should_run_evaluation_step('diffusion_encoding'):
+                # Use diffusion training fam file
+                covariate_fam_file = self.get_dataset_fam_file('diffusion')
+            else:
+                # Use VAE training fam file
+                covariate_fam_file = self.get_dataset_fam_file('vae')
+            
+            train_args.update({
+                'conditional': True,
+                'covariate_file': conditional_config['covariate_file'],
+                'fam_file': covariate_fam_file,
+                'cond_dim': model_config.get('cond_dim', 10),
+                'binary_cols': conditional_config.get('binary_cols', []),
+                'categorical_cols': conditional_config.get('categorical_cols', [])
+            })
+            
+            logger.info(f"Conditional training parameters:")
+            logger.info(f"  Covariate file: {train_args['covariate_file']}")
+            logger.info(f"  Training fam file: {train_args['fam_file']}")
+            logger.info(f"  Binary variables: {len(train_args['binary_cols'])}")
+            logger.info(f"  Categorical variables: {len(train_args['categorical_cols'])}")
+        else:
+            logger.info("Training unconditional diffusion model")
+            train_args['conditional'] = False
+        
+        diffusion_train(**train_args)
         
         logger.info("Diffusion training completed successfully")
     
@@ -1275,6 +1312,25 @@ class DiffuGenePipeline:
         args.batch_size = int(gen_config['batch_size'])
         args.num_time_steps = int(gen_config['num_time_steps'])
         args.num_inference_steps = int(gen_config['num_inference_steps'])
+        
+        # Add conditional generation settings
+        diffusion_conditional_config = self.config['diffusion'].get('conditional', {})
+        if diffusion_conditional_config.get('enabled', False):
+            # For conditional generation, pass covariate file and appropriate fam file
+            args.covariate_file = diffusion_conditional_config['covariate_file']
+            
+            # Use the same fam file as used for diffusion training
+            if self.should_run_evaluation_step('diffusion_encoding'):
+                args.fam_file = self.get_dataset_fam_file('diffusion')
+            else:
+                args.fam_file = self.get_dataset_fam_file('vae')
+                
+            args.random_seed = self.config['global']['random_seed']
+            
+            logger.info("Conditional generation enabled:")
+            logger.info(f"  Covariate file: {args.covariate_file}")
+            logger.info(f"  Fam file: {args.fam_file}")
+            logger.info(f"  Random seed: {args.random_seed}")
         
         # Add decoding parameters if enabled
         if decode_enabled:

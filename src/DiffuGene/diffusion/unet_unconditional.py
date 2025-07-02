@@ -1,36 +1,45 @@
-from diffusers import UNet2DConditionModel, DDPMScheduler
+from diffusers import UNet2DModel, DDPMScheduler
 import torch
 import torch.nn as nn
 import math
 import numpy as np
 import random
 
+# class SinusoidalEmbeddings(nn.Module):
+#     def __init__(self, time_steps:int, embed_dim: int):
+#         super().__init__()
+#         position = torch.arange(time_steps).unsqueeze(1).float()
+#         div = torch.exp(torch.arange(0, embed_dim, 2).float() * -(math.log(10000.0) / embed_dim))
+#         embeddings = torch.zeros(time_steps, embed_dim, requires_grad=False)
+#         embeddings[:, 0::2] = torch.sin(position * div)
+#         embeddings[:, 1::2] = torch.cos(position * div)
+#         # self.embeddings = embeddings
+#         self.register_buffer('embeddings', embeddings)
+
+#     def forward(self, x, t):
+#         return self.embeddings[t]#.to(x.device)
+
+
 class LatentUNET2D(nn.Module):
     """
-    2D UNet for 64x64x64 latent embeddings using Diffusers' UNet2DConditionModel.
+    2D UNet for 64x64x64 latent embeddings using Diffusers' UNet2DModel.
     Input/output: (B,64,64,64)
     """
     def __init__(
         self,
         input_channels: int = 64,
         output_channels: int = 64,
-        cond_dim: int = 10,
         time_steps: int = 1000,
         layers_per_block: int = 2,
     ):
         super().__init__()
-
-        # initial channel expansion 64 -> 256
-        self.input_proj = nn.Conv2d(input_channels, 256, kernel_size=3, padding=1)
+        # sinusoidal time embeddings
+        # self.time_embed = SinusoidalEmbeddings(time_steps, embed_dim=512)
         
-        # embed covariates into the UNet's cross-attention space
-        self.cond_emb = nn.Sequential(
-            nn.Linear(cond_dim, 256),
-            nn.SiLU(),
-            nn.Linear(256, 256),
-        )
+        # initial channel expansion 16 -> 256
+        self.input_proj = nn.Conv2d(input_channels, 256, kernel_size=3, padding=1)
 
-        self.unet = UNet2DConditionModel(
+        self.unet = UNet2DModel(
             sample_size=(64, 64),
             in_channels=256,
             out_channels=256,
@@ -55,21 +64,23 @@ class LatentUNET2D(nn.Module):
             ],
             mid_block_type="UNetMidBlock2DSelfAttn",
             attention_head_dim=64,
-            cross_attention_dim=256,
         )
         # final channel contraction 256 -> 16
         self.output_proj = nn.Conv2d(256, output_channels, kernel_size=3, padding=1)
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, c: torch.Tensor):
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
         """
-        x: (B,64,64,64) latent map  
-        t: (B,)         timestep  
-        c: (B,cond_dim) covariates  
+        x: (B,64,64,64)
+        t: (B,)
         """
-        x = self.input_proj(x)                # (B,256,64,64)
-        cond_emb = self.cond_emb(c)           # (B,256)
-        x = self.unet(x, t, encoder_hidden_states=cond_emb).sample
-        x = self.output_proj(x)               # (B,64,64,64)
+        # expand channels, run through UNet, then project back
+        x = self.input_proj(x)
+        x = self.unet(x, t).sample
+        x = self.output_proj(x)
         return x
 
 

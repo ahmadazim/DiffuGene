@@ -10,12 +10,59 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 
-from ..utils import setup_logging, get_logger
-from .unet import LatentUNET2D
+from ..utils import setup_logging, get_logger, load_covariate_metadata, prepare_covariates_for_training, sample_training_covariates
+from .unet import LatentUNET2D as ConditionalUNET
+from .unet_unconditional import LatentUNET2D as UnconditionalUNET
 from ..joint_embed.vae import SNPVAE
 from ..block_embed.pca import PCA_Block
 
 logger = get_logger(__name__)
+
+def prepare_conditional_generation_data(model_dir, model_name, num_samples,
+                                       covariate_file, fam_file, random_seed=None):
+    """Prepare covariate data for conditional generation by sampling from training data.
+    
+    Args:
+        model_dir: Directory containing covariate metadata
+        model_name: Model name for metadata file
+        num_samples: Number of samples to generate
+        covariate_file: Path to covariate CSV file
+        fam_file: Path to training fam file
+        random_seed: Random seed for reproducible sampling
+    
+    Returns:
+        Tuple of (covariates_for_model, original_covariate_profiles)
+        - covariates_for_model: Tensor for model input (num_samples, cond_dim)
+        - original_covariate_profiles: Original covariate values for saving
+    """
+    # Load covariate metadata to get variable type information
+    metadata_path = os.path.join(model_dir, f"{model_name}_covariate_metadata.json")
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"Covariate metadata not found: {metadata_path}")
+    
+    covariate_names, norm_params = load_covariate_metadata(metadata_path)
+    
+    # Get variable type lists from metadata
+    binary_cols = norm_params.get('binary_cols', [])
+    categorical_cols = norm_params.get('categorical_cols', [])
+    
+    logger.info(f"Loaded covariate metadata: {len(covariate_names)} features")
+    logger.info(f"Binary variables: {binary_cols}")
+    logger.info(f"Categorical variables: {categorical_cols}")
+    
+    # Sample covariate profiles from actual training data
+    covariates_for_model, original_profiles = sample_training_covariates(
+        covariate_path=covariate_file,
+        fam_path=fam_file,
+        num_samples=num_samples,
+        binary_cols=binary_cols,
+        categorical_cols=categorical_cols,
+        random_seed=random_seed
+    )
+    
+    logger.info(f"Sampled covariate profiles from training data: {covariates_for_model.shape}")
+    
+    return covariates_for_model, original_profiles
 
 def load_vae_model(vae_model_path, device="cuda"):
     """Load the trained VAE model."""
@@ -406,9 +453,22 @@ def save_decoded_samples(decoded_snps, output_dir, basename, chromosomes):
 def generate(args):
     setup_logging()
     
-    # Load model
-    model = LatentUNET2D(input_channels=16, output_channels=16).cuda()
+    # Load checkpoint first to detect model type
     checkpoint = torch.load(args.model_path, map_location='cuda')
+    
+    # Detect if model is conditional or unconditional
+    is_conditional = checkpoint.get('conditional', False)
+    cond_dim = checkpoint.get('cond_dim', None)
+    
+    # Create appropriate model
+    if is_conditional:
+        if cond_dim is None:
+            raise ValueError("Conditional model detected but cond_dim not found in checkpoint")
+        logger.info(f"Loading conditional model with {cond_dim} covariate dimensions")
+        model = ConditionalUNET(input_channels=64, output_channels=64, cond_dim=cond_dim).cuda()
+    else:
+        logger.info("Loading unconditional model")
+        model = UnconditionalUNET(input_channels=64, output_channels=64).cuda()
     
     if 'ema' in checkpoint:
         logger.info("Loading EMA weights")
@@ -416,7 +476,7 @@ def generate(args):
             from timm.utils import ModelEmaV3
             
             # Create temporary EMA wrapper to load the saved EMA state
-            ema = ModelEmaV3(model, decay=0.9999)
+            ema = ModelEmaV3(model, decay=0.9)
             ema.load_state_dict(checkpoint['ema'])
             
             # Handle different timm versions - try multiple methods to copy EMA weights
@@ -493,6 +553,31 @@ def generate(args):
     # channel_stds = torch.load(os.path.join(model_dir, f"train_{model_name}_channel_stds.pt"), map_location='cuda', weights_only=False)
     sigma_hat = torch.load(os.path.join(model_dir, f"train_{model_name}_sigma.pt"), map_location='cuda', weights_only=False)
     
+    # Prepare conditional data if needed
+    covariates = None
+    original_covariate_profiles = None
+    if is_conditional:
+        model_dir = os.path.dirname(args.model_path)
+        model_name = os.path.splitext(os.path.basename(args.model_path))[0]
+        
+        # Get conditional generation arguments
+        covariate_file = getattr(args, 'covariate_file', None)
+        fam_file = getattr(args, 'fam_file', None)
+        random_seed = getattr(args, 'random_seed', None)
+        
+        if not covariate_file or not fam_file:
+            raise ValueError("Conditional generation requires --covariate-file and --fam-file arguments")
+        
+        covariates, original_covariate_profiles = prepare_conditional_generation_data(
+            model_dir=model_dir,
+            model_name=model_name,
+            num_samples=args.num_samples,
+            covariate_file=covariate_file,
+            fam_file=fam_file,
+            random_seed=random_seed
+        )
+        covariates = covariates.cuda()
+    
     # Generate samples
     logger.info(f"Generating {args.num_samples} samples...")
     all_samples = []
@@ -501,16 +586,23 @@ def generate(args):
         batch_size = min(args.batch_size, args.num_samples - i)
         
         # Start from random noise
-        latents = torch.randn(batch_size, 16, 16, 16, device="cuda")
+        latents = torch.randn(batch_size, 64, 64, 64, device="cuda")
+        
+        # Get batch covariates if conditional
+        batch_covariates = None
+        if is_conditional:
+            batch_covariates = covariates[i:i+batch_size]
         
         # Denoising loop
         with torch.no_grad():
             for t in tqdm(scheduler.timesteps, desc=f"Denoising batch {i//args.batch_size + 1}"):
-                # Model prediction
-                noise_pred = model(latents, t.expand(batch_size))
+                # Model prediction - conditional or unconditional
+                if is_conditional:
+                    noise_pred = model(latents, t.expand(batch_size), batch_covariates)
+                else:
+                    noise_pred = model(latents, t.expand(batch_size))
                 
                 # Scheduler step
-                # latents = scheduler.step(noise_pred, t, latents).prev_sample
                 latents = scheduler.step(
                     model_output=noise_pred,
                     timestep=t,
@@ -519,7 +611,6 @@ def generate(args):
                 ).prev_sample
         
         # Denormalize
-        # latents = latents * channel_stds[None, :, None, None] + channel_means[None, :, None, None]
         latents = latents * sigma_hat
         all_samples.append(latents.cpu())
     
@@ -531,6 +622,25 @@ def generate(args):
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
     torch.save(all_samples, args.output_path)
     logger.info(f"Latent samples saved to {args.output_path}")
+    
+    # Save covariate profiles if conditional generation
+    if is_conditional and original_covariate_profiles is not None:
+        # Save covariate profiles in the same directory as generated samples
+        output_dir = os.path.dirname(args.output_path)
+        covariate_output_path = os.path.join(output_dir, f"{model_name}_covariate_profiles.csv")
+        
+        # Load covariate metadata to get column names
+        metadata_path = os.path.join(model_dir, f"{model_name}_covariate_metadata.json")
+        covariate_names, _ = load_covariate_metadata(metadata_path)
+        
+        # Create DataFrame with original covariate profiles
+        covariate_df = pd.DataFrame(original_covariate_profiles, columns=covariate_names)
+        covariate_df.insert(0, 'sample_id', [f"sample_{i:06d}" for i in range(len(covariate_df))])
+        
+        # Save to CSV
+        covariate_df.to_csv(covariate_output_path, index=False)
+        logger.info(f"Covariate profiles saved to {covariate_output_path}")
+        logger.info(f"Saved {len(covariate_df)} covariate profiles with {len(covariate_names)} features")
     
     # Decode samples if decoding arguments are provided
     if hasattr(args, 'decode_samples') and args.decode_samples:
@@ -570,6 +680,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-time-steps", type=int, default=1000)
     parser.add_argument("--num-inference-steps", type=int, default=50)
+    
+    # Conditional generation arguments (for conditional models only)
+    parser.add_argument("--covariate-file", type=str, help="Path to covariate CSV file (for conditional models)")
+    parser.add_argument("--fam-file", type=str, help="Path to training fam file (for conditional models)")
+    parser.add_argument("--random-seed", type=int, help="Random seed for reproducible sampling")
     
     # Decoding arguments
     parser.add_argument("--decode-samples", action="store_true", help="Decode generated samples to SNP space")
