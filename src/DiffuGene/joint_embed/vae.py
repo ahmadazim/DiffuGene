@@ -9,7 +9,7 @@ from .distribution import DiagonalGaussianDistribution
 class JointBlockEmbedder(nn.Module):
     """
     1) content MLP: (B,N,D) → (B,N,E)
-    2) FiLM pos‐modulation: (B,N,E)
+    2) FiLM pos‐modulation: (B,N,E) using chromosome embeddings + continuous positions
     3) pad/truncate seq‐len → 4*H*W
     4) permute → (B, E, 4*H*W)
     5) Conv1d(stride=2)  → (B, C/2, 2*H*W)
@@ -17,79 +17,106 @@ class JointBlockEmbedder(nn.Module):
     7) reshape → (B, C, H, W)
     """
     def __init__(self,
+                 n_blocks: int,
                  block_emb_dim: int = 3,
                  pos_emb_dim: int   = 16,
-                 grid_size: tuple   = (16,16),
-                 latent_channels: int = 32):
+                 grid_size: tuple   = (64,64),
+                 latent_channels: int = 128):
         super().__init__()
         H, W = grid_size
         self.H, self.W = H, W
-        self.n_cells = H * W
+        self.n_blocks = n_blocks
 
-        # embed‐dim is a quarter of your final channels
-        E = latent_channels // 4
+        # 1) compute pad_len and # downsamples
+        base = 4 * H * W
+        ratio = n_blocks / base
+        k = max(0, math.ceil(math.log2(ratio)))   # number of stride-2 steps
+        self.k = k
+        pad_len = base * (2**k)
 
-        # 1) content MLP: D → E
+        # 2) compute total downsamples: k to reach 4HW from padded n_blocks + 2 to reach HW
+        num_downsamples = k + 2
+        E = latent_channels // (2**num_downsamples)
+        assert E * (2**num_downsamples) == latent_channels, "latent_channels must be divisible by 2**(k+2) for a clean conv path"
+        
+        # Chromosome embedding dimension (hardcoded)
+        chr_emb_dim = 8
+
+        # 3) content MLP: D → E
         self.content_mlp = nn.Sequential(
             nn.Linear(block_emb_dim, pos_emb_dim),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(pos_emb_dim, E),
         )
-        # 2) FiLM MLP: pos(3) → 2*E (γ,β)
+        
+        # 4) Chromosome embedding (1-22)
+        self.chr_embedding = nn.Embedding(num_embeddings=23, embedding_dim=chr_emb_dim)  # 0-22 (0 unused, 1-22)
+        
+        # 5) FiLM MLP: chr_emb + continuous positions → 2*E (γ,β)
+        in_dim = chr_emb_dim + 2  # chr_embed + start_norm + length_norm
         self.film_mlp = nn.Sequential(
-            nn.Linear(3, pos_emb_dim),
+            nn.Linear(in_dim, pos_emb_dim),
             nn.LeakyReLU(0.2, inplace=True),
             nn.Linear(pos_emb_dim, 2 * E),
         )
 
-        # 3–6) two strided Conv1d blocks: E→C/2→C
-        C2 = latent_channels // 2
-        self.conv1 = nn.Sequential(
-            nn.Conv1d(E,    C2, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm1d(C2),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv1d(C2, latent_channels, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm1d(latent_channels),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
+        # 6) strided Conv1d blocks: E→...→C, build k Conv1d blocks that gradually double channels
+        convs = []
+        in_ch = E
+        for _ in range(num_downsamples):
+            out_ch = in_ch * 2
+            convs.append(nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm1d(out_ch),
+                nn.LeakyReLU(0.2, inplace=True),
+            ))
+            in_ch = out_ch
+        assert in_ch == latent_channels, f"Expected final channels {latent_channels}, got {in_ch}"
+        self.convs = nn.ModuleList(convs)
 
     def forward(self, block_embs: torch.Tensor, spans: torch.Tensor) -> torch.Tensor:
         """
         block_embs: (B, N, D)
-        spans:      (B, N, 3)
+        spans:      (B, N, 3) where 3 = (chr_idx, start_norm, length_norm)
         returns:    (B, C, H, W)
         """
         B, N, D = block_embs.shape
         H, W    = self.H, self.W
+        base = 4 * H * W
+        pad_len = base * (2**self.k)
 
         # 1) content → (B,N,E)
         c = self.content_mlp(block_embs)
 
-        # 2) FiLM: compute (γ,β) from spans → apply
-        gam_bias = self.film_mlp(spans)            # (B,N,2E)
-        gamma, beta = gam_bias.chunk(2, dim=-1)   # each (B,N,E)
-        x = gamma * c + beta                      # (B,N,E)
+        # 2) Split spans: (chr_idx, start_norm, length_norm)
+        chr_idx, start_norm, length_norm = spans.chunk(3, dim=-1)  # each (B, N, 1)
+        
+        # 3) Get chromosome embedding
+        chr_emb = self.chr_embedding(chr_idx.long().squeeze(-1))     # (B, N, chr_emb_dim)
+        
+        # 4) Concatenate chromosome embedding with continuous positions
+        pos_cont = torch.cat([start_norm, length_norm], dim=-1)      # (B, N, 2)
+        film_input = torch.cat([chr_emb, pos_cont], dim=-1)          # (B, N, chr_emb_dim+2)
+        
+        # 5) FiLM: compute (γ,β) from film_input → apply
+        gam_bias = self.film_mlp(film_input)      # (B, N, 2E)
+        gamma, beta = gam_bias.chunk(2, dim=-1)   # each (B, N, E)
+        x = gamma * c + beta                      # (B, N, E)
 
-        # 3) pad/truncate sequence-length to exactly 4*H*W
-        seq_len = 4 * H * W
-        if N < seq_len:
-            pad = x.new_zeros((B, seq_len - N, x.size(-1)))
+        # 6) pad/truncate sequence-length to pad_len
+        if N < pad_len:
+            pad_sz = pad_len - N
+            pad = x.new_zeros((B, pad_sz, x.size(-1)))
             x = torch.cat([x, pad], dim=1)
-        else:
-            x = x[:, :seq_len]
 
-        # 4) → (B, E, seq_len)
+        # 7) → (B, E, pad_len)
         x = x.permute(0, 2, 1)
 
-        # 5) → (B, C/2, 2*H*W)
-        x = self.conv1(x)
+        # 8) → (B, C, H*W)
+        for conv in self.convs:
+            x = conv(x)
 
-        # 6) → (B, C, H*W)
-        x = self.conv2(x)
-
-        # 7) reshape to 2D grid
+        # 9) reshape to 2D grid
         return x.view(B, -1, H, W)                # (B, C, H, W)
 
 
@@ -98,37 +125,52 @@ class JointBlockDecoder(nn.Module):
     """
     Mirror of the embedder, but taking in z of shape (B, C2, H, W), where
     C2 = latent_channels // 2 == the number of sampled latent channels.
+    
+    Uses the same dynamic scaling logic as the encoder.
     """
     def __init__(self,
-                 grid_size: tuple   = (16,16),
-                 block_emb_dim: int = 3,
+                 n_blocks: int,
+                 grid_size: tuple   = (64,64),
+                 block_emb_dim: int = 4,
                  pos_emb_dim: int   = 16,
-                 latent_channels: int = 32):
+                 latent_channels: int = 128):
         super().__init__()
         H, W = grid_size
         self.H, self.W = H, W
-        self.n_cells  = H * W
+        self.n_blocks = n_blocks
 
-        # match the embedder’s channel math:
-        E  = latent_channels // 4   # content‐MLP hidden dim
-        C2 = latent_channels // 2   # z’s channel count
+        # 1) compute pad_len and # downsamples (same as encoder)
+        base = 4 * H * W
+        ratio = n_blocks / base
+        k = max(0, math.ceil(math.log2(ratio)))   # number of stride-2 steps
+        self.k = k
+        self.pad_len = base * (2**k)
 
-        # first upsample: C2→E, length N→2N
-        self.deconv1 = nn.Sequential(
-            nn.ConvTranspose1d(in_channels=C2, out_channels=E,
-                               kernel_size=3, stride=2, padding=1, output_padding=1, bias=False),
-            nn.BatchNorm1d(E),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-        # second upsample: E→E, length 2N→4N
-        self.deconv2 = nn.Sequential(
-            nn.ConvTranspose1d(in_channels=E, out_channels=E,
-                               kernel_size=3, stride=2, padding=1, output_padding=1, bias=False),
-            nn.BatchNorm1d(E),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
+        # 2) embed‐dims (same as encoder)
+        num_downsamples = k + 2
+        E = latent_channels // (2**num_downsamples)
+        assert E * (2**num_downsamples) == latent_channels, "latent_channels must be divisible by 2**(k+2) for a clean conv path"
+        C2 = latent_channels // 2   # z's channel count (sampled latents)
 
-        # project back to original block‐embedding dim
+        # 3) Build transposed conv layers: reverse of encoder
+        deconvs = []
+        in_ch = C2
+        for i in range(num_downsamples):
+            if i < num_downsamples - 1:
+                out_ch = in_ch // 2
+            else:
+                out_ch = in_ch
+            deconvs.append(nn.Sequential(
+                nn.ConvTranspose1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False),
+                nn.BatchNorm1d(out_ch),
+                nn.LeakyReLU(0.2, inplace=True),
+            ))
+            in_ch = out_ch
+        assert in_ch == E
+        
+        self.deconvs = nn.ModuleList(deconvs)
+
+        # 4) project back to original block‐embedding dim
         self.cell_unproj = nn.Linear(E, block_emb_dim)
 
     def forward(self, z: torch.Tensor, spans: torch.Tensor) -> torch.Tensor:
@@ -138,21 +180,18 @@ class JointBlockDecoder(nn.Module):
         # fuse H×W → sequence of length H*W
         x = z.view(B, C2, H*W)
 
-        # 1) upsample → (B, E, 2*H*W)
-        x = self.deconv1(x)
+        # Apply transposed convolutions to reverse the encoder
+        for deconv in self.deconvs:
+            x = deconv(x)
 
-        # 2) upsample → (B, E, 4*H*W)
-        x = self.deconv2(x)
-
-        # 3) → (B, 4*H*W, E)
+        # → (B, pad_len, E)
         x = x.permute(0, 2, 1)
 
-        # 4) pad back to original N
-        seq_len = 4 * H * W
-        if N < seq_len:
+        # pad/truncate back to original N
+        if N < self.pad_len:
             x = x[:, :N, :]
 
-        # 5) project E→D
+        # project E→block_emb_dim
         x = self.cell_unproj(x)
 
         return x    # (B, N, block_emb_dim)
@@ -162,28 +201,30 @@ class JointBlockDecoder(nn.Module):
 class SNPVAE(nn.Module):
     def __init__(
         self,
-        grid_size=(16,16),
+        n_blocks,
+        grid_size=(64,64),
         block_emb_dim=3,
         pos_emb_dim=16,
-        latent_channels=32
+        latent_channels=128
     ):
         super().__init__()
+        self.n_blocks = n_blocks
 
-        # 1) Embedder: content‐MLP + FiLM + Conv1d↓ → (B,32,16,16)
+        # 1) Embedder: content‐MLP + FiLM + Conv1d↓ → (B, latent_channels, H, W)
         self.joint_embedder = JointBlockEmbedder(
+            n_blocks        = n_blocks,
             block_emb_dim   = block_emb_dim,
             pos_emb_dim     = pos_emb_dim,
             grid_size       = grid_size,
             latent_channels = latent_channels,
         )
 
-        # 2) VAE head: split 32→(16+16) for mean/logvar
-        #    DiagonalGaussianDistribution expects a 32-channel map
-        #    and splits it internally into two 16-ch tensors.
+        # 2) VAE head: DiagonalGaussianDistribution expects a latent_channels-channel map
+        #    and splits it internally into two (latent_channels//2)-ch tensors for mean/logvar.
         
         # 3) Decoder: mirror of embedder
-        #    Needs the original span→delta-MLP from the embedder
         self.joint_decoder = JointBlockDecoder(
+            n_blocks        = n_blocks,
             grid_size       = grid_size,
             block_emb_dim   = block_emb_dim,
             pos_emb_dim     = pos_emb_dim,
@@ -193,20 +234,20 @@ class SNPVAE(nn.Module):
     def encode(self, block_embs, spans):
         """
         block_embs: (B, N, D)
-        spans:      (B, N, 3)
+        spans:      (B, N, 3) where 3 = (chr_idx, start_norm, length_norm)
         returns:
-          z:    (B,16,16,16)
+          z:    (B, latent_channels//2, H, W)
           dist: DiagonalGaussianDistribution over z
         """
-        x = self.joint_embedder(block_embs, spans)   # (B,32,16,16)
-        dist = DiagonalGaussianDistribution(x)       # splits 32→16+16 internally
-        z = dist.sample()                            # (B,16,16,16)
+        x = self.joint_embedder(block_embs, spans)   # (B, latent_channels, H, W)
+        dist = DiagonalGaussianDistribution(x)       # splits latent_channels → (latent_channels//2) + (latent_channels//2) internally
+        z = dist.sample()                            # (B, latent_channels//2, H, W)
         return z, dist
 
     def decode(self, z, spans):
         """
-        z:     (B,16,16,16)
-        spans: (B, N, 3)
+        z:     (B, latent_channels//2, H, W)
+        spans: (B, N, 3) where 3 = (chr_idx, start_norm, length_norm)
         returns:
           recon_emb: (B, N, D)
         """

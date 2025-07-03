@@ -302,7 +302,7 @@ def load_spans_data(spans_file_path):
     # Load CSV and create spans tensor like in SNPBlocksDataset
     df = pd.read_csv(spans_file_path)
     
-    MAX_COORD_CHR22 = 50_818_468
+    MAX_COORD_CHR22 = 50_818_468        # TODO: update for all chromosomes
     scaled_spans = []
     
     for _, row in df.iterrows():

@@ -35,13 +35,13 @@ from . import joint_embed
 from . import diffusion
 
 # Main classes for direct import
-from .block_embed import PCA_Block
-from .joint_embed import SNPVAE, SNPBlocksDataset  
+from .block_embed import PCA_Block, load_pca_blocks
+from .joint_embed import SNPVAE, BlockPCDataset, MemoryEfficientSNPLoader
 from .diffusion import LatentUNET2D
 
 __all__ = [
     # Modules
     "utils", "block_embed", "joint_embed", "diffusion",
     # Key classes
-    "PCA_Block", "SNPVAE", "SNPBlocksDataset", "LatentUNET2D"
+    "PCA_Block", "load_pca_blocks", "SNPVAE", "BlockPCDataset", "MemoryEfficientSNPLoader", "LatentUNET2D"
 ]

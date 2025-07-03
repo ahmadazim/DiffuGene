@@ -16,125 +16,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 from src.DiffuGene.joint_embed.vae import SNPVAE
 from src.DiffuGene.block_embed import PCA_Block
+from src.DiffuGene.joint_embed.memory_efficient_dataset import load_single_pca_block
 from src.DiffuGene.utils import setup_logging, get_logger
 
 # Setup logging
 setup_logging()
 logger = get_logger(__name__)
-
-def load_pca_blocks(embeddings_dir, chromosome=None):
-    """Load PCA blocks for SNP reconstruction with dimension metadata.
-    
-    Args:
-        embeddings_dir: Directory containing PCA models
-        chromosome: Chromosome number (optional, for filtering files)
-    """
-    logger.info("Loading PCA blocks...")
-    pca_blocks = []
-    load_dir = os.path.join(embeddings_dir, "loadings")
-    mean_dir = os.path.join(embeddings_dir, "means")
-    metadata_dir = os.path.join(embeddings_dir, "metadata")
-    
-    # Get all PCA loading files and sort them numerically by block number
-    if chromosome is not None:
-        # More specific pattern if chromosome is provided
-        load_files = glob.glob(os.path.join(load_dir, f"*_chr{chromosome}_block*_pca_loadings.pt"))
-    else:
-        load_files = glob.glob(os.path.join(load_dir, "*_pca_loadings.pt"))
-    
-    if not load_files:
-        raise FileNotFoundError(f"No PCA loading files found in {load_dir}. Expected pattern: *_pca_loadings.pt")
-    
-    # Extract block numbers and sort numerically
-    def extract_block_number(filepath):
-        filename = os.path.basename(filepath)
-        match = re.search(r'block(\d+)', filename)
-        return int(match.group(1)) if match else 0
-    
-    load_files_sorted = sorted(load_files, key=extract_block_number)
-    logger.info(f"Found {len(load_files_sorted)} PCA loading files")
-    
-    for load_file in load_files_sorted:
-        block_base = os.path.basename(load_file).replace("_pca_loadings.pt", "")
-        
-        # Find corresponding means and metadata files using flexible patterns
-        means_pattern = os.path.join(mean_dir, f"{block_base}_pca_means.pt")
-        metadata_pattern = os.path.join(metadata_dir, f"{block_base}_pca_metadata.pt")
-        
-        # Check if exact files exist, otherwise use glob pattern
-        if not os.path.exists(means_pattern):
-            # Extract block info and find using pattern
-            block_match = re.search(r'_chr(\d+)_block(\d+)', block_base)
-            if block_match:
-                chr_num, block_num = block_match.groups()
-                means_files = glob.glob(os.path.join(mean_dir, f"*_chr{chr_num}_block{block_num}_pca_means.pt"))
-                if means_files:
-                    means_pattern = means_files[0]
-                    logger.debug(f"Using means file: {means_pattern}")
-                else:
-                    raise FileNotFoundError(f"No means file found for block {block_num}")
-        
-        if not os.path.exists(metadata_pattern):
-            # Extract block info and find using pattern  
-            block_match = re.search(r'_chr(\d+)_block(\d+)', block_base)
-            if block_match:
-                chr_num, block_num = block_match.groups()
-                metadata_files = glob.glob(os.path.join(metadata_dir, f"*_chr{chr_num}_block{block_num}_pca_metadata.pt"))
-                if metadata_files:
-                    metadata_pattern = metadata_files[0]
-                    logger.debug(f"Using metadata file: {metadata_pattern}")
-        
-        # Load the files
-        # NOTE: Training saves pca.components_.T, so loadings are (n_snps, actual_k)
-        loadings = torch.load(load_file, map_location="cuda", weights_only=False)    # (n_snps, actual_k) 
-        means = torch.load(means_pattern, map_location="cuda", weights_only=False)   # (n_snps,)
-        
-        # Load metadata if available (backwards compatibility)
-        if os.path.exists(metadata_pattern):
-            metadata = torch.load(metadata_pattern, map_location="cpu", weights_only=False)
-            k = metadata['k']
-            actual_k = metadata['actual_k']
-        else:
-            # Fallback for old format - assume all dimensions are used
-            if hasattr(loadings, 'size') and callable(loadings.size):
-                k = loadings.size(1)
-            elif hasattr(loadings, 'shape'):
-                k = loadings.shape[1]
-            else:
-                raise ValueError(f"Unsupported loadings type: {type(loadings)}")
-            actual_k = k
-            logger.warning(f"No metadata found for {block_base}, assuming actual_k = k = {k}")
-        
-        # Convert to PyTorch tensors and ensure float32
-        if not isinstance(loadings, torch.Tensor):
-            loadings = torch.from_numpy(loadings).float().cuda()
-        else:
-            loadings = loadings.float()
-            
-        if not isinstance(means, torch.Tensor):
-            means = torch.from_numpy(means).float().cuda()
-        else:
-            means = means.float()
-        
-        pca_block = PCA_Block(k=k)
-        pca_block.actual_k = actual_k
-        # Transpose back: (n_snps, actual_k) -> (actual_k, n_snps) for PCA_Block format
-        pca_block.components_ = loadings.T if hasattr(loadings, 'T') else loadings.transpose()  # (actual_k, n_snps)
-        pca_block.means = means
-        pca_blocks.append(pca_block)
-    
-    logger.info(f"PCA blocks loaded. Found {len(pca_blocks)} blocks.")
-    
-    # Log dimension statistics
-    total_blocks = len(pca_blocks)
-    padded_blocks = sum(1 for pca in pca_blocks if pca.actual_k < pca.k)
-    if padded_blocks > 0:
-        logger.info(f"Dimension padding: {padded_blocks}/{total_blocks} blocks have actual_k < k")
-        for i, pca in enumerate(pca_blocks):
-            if pca.actual_k < pca.k:
-                logger.info(f"  Block {i}: k={pca.k}, actual_k={pca.actual_k} ({pca.k - pca.actual_k} padded dims)")
-    
-    return pca_blocks
 
 def unscale_embeddings(embeddings, pc_means, pc_scales):
     """Reverse the PC scaling applied during training.
@@ -165,22 +52,67 @@ def load_spans_file(spans_file):
     logger.info(f"Loading spans file: {spans_file}")
     df = pd.read_csv(spans_file)
     
-    # Create scaled spans (same as in training)
-    MAX_COORD_CHR22 = 50_818_468
+    # Chromosome lengths (GRCh37/hg19 reference) - same as in memory_efficient_dataset.py
+    CHROMOSOME_LENGTHS = {
+        1: 249250621, 2: 243199373, 3: 198022430, 4: 191154276, 5: 180915260,
+        6: 171115067, 7: 159138663, 8: 146364022, 9: 141213431, 10: 135534747,
+        11: 135006516, 12: 133851895, 13: 115169878, 14: 107349540, 15: 102531392,
+        16: 90338345, 17: 81195210, 18: 78077248, 19: 59128983, 20: 63025520,
+        21: 48129895, 22: 51304566,
+    }
+    
+    # Create chromosome-aware spans: (chr_idx, start_norm, length_norm)
     scaled_spans = []
     for _, row in df.iterrows():
-        chr_norm   = row.chr / 22
-        start_norm = row.start / MAX_COORD_CHR22
-        end_norm   = row.end / MAX_COORD_CHR22
-        scaled_spans.append([chr_norm, start_norm, end_norm])
+        chr_idx = int(row.chr)  # Keep as integer index (1-22)
+        
+        # Get chromosome-specific length
+        if chr_idx not in CHROMOSOME_LENGTHS:
+            raise ValueError(f"Unknown chromosome: {chr_idx}. Supported: {list(CHROMOSOME_LENGTHS.keys())}")
+        chrom_length = CHROMOSOME_LENGTHS[chr_idx]
+        
+        # Normalize start position by chromosome length
+        start_norm = row.start / chrom_length
+        
+        # Normalize block length by this chromosome's maximum length
+        block_length = row.end - row.start
+        length_norm = block_length / chrom_length
+        
+        scaled_spans.append([chr_idx, start_norm, length_norm])
     
     spans_tensor = torch.tensor(scaled_spans, dtype=torch.float32)  # (N_blocks, 3)
-    logger.info(f"Loaded spans for {len(scaled_spans)} blocks")
+    logger.info(f"Loaded spans for {len(scaled_spans)} blocks (chr_idx, start_norm, length_norm)")
     return spans_tensor
+
+def prepare_block_info_for_decoding(spans_file, chromosome=None):
+    """Prepare block information for on-demand PCA loading during decoding."""
+    logger.info(f"Preparing block info from spans file: {spans_file}")
+    df = pd.read_csv(spans_file)
+    
+    if chromosome is not None:
+        # Filter by chromosome if specified
+        df = df[df.chr == chromosome]
+        logger.info(f"Filtered to chromosome {chromosome}: {len(df)} blocks")
+    
+    block_info = []
+    for _, row in df.iterrows():
+        # Extract block information
+        filename = os.path.basename(row.block_file)
+        block_match = re.search(r'block(\d+)', filename)
+        if not block_match:
+            raise ValueError(f"Could not extract block number from {filename}")
+        block_no = int(block_match.group(1))
+        chr_num = int(row.chr)
+        block_base = os.path.basename(row.block_file).replace(".pt", "")
+        
+        block_info.append((chr_num, block_no, block_base))
+    
+    logger.info(f"Prepared block info for {len(block_info)} blocks")
+    return block_info
 
 def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_file, batch_size=32, chromosome=None):
     """
-    Decode VAE latents back to original SNP space.
+    Decode VAE latents back to original SNP space using on-demand PCA loading.
     
     Args:
         latents_file: Path to VAE latents (.pt file)
@@ -228,12 +160,16 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
             pc_means = model_data['pc_scaling']['pc_means'].to(device)
             pc_scales = model_data['pc_scaling']['pc_scales'].to(device)
             logger.info("Found PC scaling factors in model file")
+            
+        # Get n_blocks from saved config if available
+        saved_n_blocks = config.get('n_blocks', None)
     else:
         # Fallback for older model format
         raise ValueError("Model file must contain configuration. Please use a model saved with the current training script.")
     
     # Initialize VAE model
     model = SNPVAE(
+        n_blocks=n_blocks,
         grid_size=(config['grid_h'], config['grid_w']),
         block_emb_dim=config['block_dim'],
         pos_emb_dim=config['pos_dim'],
@@ -244,8 +180,8 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     model.eval()
     logger.info(f"VAE model loaded with config: {config}")
     
-    # 3. Load PCA blocks
-    pca_blocks = load_pca_blocks(embeddings_dir, chromosome=chromosome)
+    # 3. Prepare block info for on-demand PCA loading
+    block_info = prepare_block_info_for_decoding(spans_file, chromosome=chromosome)
     
     # 4. Load spans for positioning
     spans = load_spans_file(spans_file)
@@ -253,13 +189,28 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     
     # Verify dimensions match
     n_samples = latents.shape[0]
-    n_blocks = len(pca_blocks)
+    n_blocks = len(block_info)
     if spans.shape[0] != n_blocks:
-        raise ValueError(f"Spans file has {spans.shape[0]} blocks but PCA has {n_blocks} blocks")
+        raise ValueError(f"Spans file has {spans.shape[0]} blocks but block info has {n_blocks} blocks")
+    
+    # Validate against saved config if available
+    if saved_n_blocks is not None and saved_n_blocks != n_blocks:
+        logger.warning(f"Saved model n_blocks ({saved_n_blocks}) != current spans file n_blocks ({n_blocks}). Using current spans file.")
+    elif saved_n_blocks is not None:
+        logger.info(f"n_blocks matches saved model config: {n_blocks}")
     
     logger.info(f"Decoding {n_samples} samples across {n_blocks} blocks")
     
-    # 5. Decode in batches
+    # 5. Create PCA block cache for on-demand loading
+    pca_cache = {}
+    
+    def get_pca_block(block_idx):
+        """Get PCA block with caching."""
+        if block_idx not in pca_cache:
+            pca_cache[block_idx] = load_single_pca_block(embeddings_dir, block_info[block_idx])
+        return pca_cache[block_idx]
+    
+    # 6. Decode in batches
     all_reconstructed_snps = []
     
     with torch.no_grad():
@@ -277,19 +228,22 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
             # Unscale PC embeddings if scaling was applied during training
             decoded_pc_embeddings = unscale_embeddings(decoded_pc_embeddings, pc_means, pc_scales)
             
-            # PCA decode: PC embeddings → SNPs for each block
+            # PCA decode: PC embeddings → SNPs for each block (on-demand PCA loading)
             batch_reconstructed_snps = []
             for block_idx in range(n_blocks):
                 # Get PC embeddings for this block: (batch_size, block_dim)
                 block_pc_embeddings = decoded_pc_embeddings[:, block_idx, :]
                 
+                # Get PCA block on-demand
+                pca_block = get_pca_block(block_idx)
+                
                 # Decode using PCA block
-                reconstructed_snps = pca_blocks[block_idx].decode(block_pc_embeddings)  # (batch_size, n_snps_in_block)
+                reconstructed_snps = pca_block.decode(block_pc_embeddings)  # (batch_size, n_snps_in_block)
                 batch_reconstructed_snps.append(reconstructed_snps)
             
             all_reconstructed_snps.append(batch_reconstructed_snps)
     
-    # 6. Concatenate all batches
+    # 7. Concatenate all batches
     logger.info("Concatenating results from all batches...")
     final_reconstructed_snps = []
     
@@ -300,7 +254,7 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
         block_final = torch.cat(block_reconstructions, dim=0)  # (n_samples, n_snps_in_block)
         final_reconstructed_snps.append(block_final)
     
-    # 7. Save results
+    # 8. Save results
     logger.info(f"Saving reconstructed SNPs to: {output_file}")
     
     # Create output dictionary with metadata
@@ -326,6 +280,7 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     logger.info(f"  Total blocks: {n_blocks}")
     logger.info(f"  Total SNPs: {total_snps}")
     logger.info(f"  SNPs per block range: {min(snps.shape[1] for snps in final_reconstructed_snps)} - {max(snps.shape[1] for snps in final_reconstructed_snps)}")
+    logger.info(f"  PCA blocks loaded on-demand: {len(pca_cache)}")
     
     # Compute some basic statistics
     all_values = torch.cat([snps.flatten() for snps in final_reconstructed_snps])
@@ -335,7 +290,7 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     return output_data
 
 def main():
-    parser = argparse.ArgumentParser(description="Decode VAE latents back to original SNP space")
+    parser = argparse.ArgumentParser(description="Decode VAE latents back to original SNP space using memory-efficient approach")
     parser.add_argument("--latents-file", type=str, required=True,
                         help="Path to VAE latents file (.pt)")
     parser.add_argument("--model-file", type=str, required=True,

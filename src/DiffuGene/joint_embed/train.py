@@ -9,242 +9,80 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import pandas as pd
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from ..utils import read_raw, setup_logging, get_logger
-from ..block_embed import PCA_Block  
+from ..utils import setup_logging, get_logger
+from ..block_embed import PCA_Block, load_pca_blocks
 from .vae import SNPVAE
-
-MAX_COORD_CHR22 = 50_818_468
+from .memory_efficient_dataset import BlockPCDataset, MemoryEfficientSNPLoader, unscale_embeddings
+from .precompute_embeddings import precompute_embeddings
 
 logger = get_logger(__name__)
 
-class SNPBlocksDataset(Dataset):
-    """
-    Loads one chromosome's LD-block embeddings + spans as a single sample.
-    Expects:
-      - spans_file:   CSV with columns [block_file, chr, start, end]
-    """
-    def __init__(self, spans_file: str, recoded_dir: str, load_snps: bool = True, scale_pc_embeddings: bool = False):
-        if load_snps:
-            logger.info("Loading dataset...")
-        self.df = pd.read_csv(spans_file)
-        self.scale_pc_embeddings = scale_pc_embeddings
-        # load all embeddings into memory
-        embs = []
-        scaled_spans = []
-        true_snps_blocks = []
-        
-        # First pass: find the maximum embedding dimension
-        max_dim = 0
-        for _, row in self.df.iterrows():
-            emb = torch.load(row.block_file, weights_only=False)
-            if not isinstance(emb, torch.Tensor):
-                emb = torch.tensor(emb, dtype=torch.float32)
-            else:
-                emb = emb.float()
-            max_dim = max(max_dim, emb.shape[-1])  # Last dimension is the embedding dimension
-        
-        logger.info(f"Found maximum embedding dimension: {max_dim}")
-        
-        # Second pass: load and pad embeddings to max_dim
-        for _, row in self.df.iterrows():
-            emb = torch.load(row.block_file, weights_only=False)
-            if not isinstance(emb, torch.Tensor):
-                emb = torch.tensor(emb, dtype=torch.float32)
-            else:
-                emb = emb.float()  # Ensure float32
-            
-            # Pad embedding to max_dim if necessary
-            if emb.shape[-1] < max_dim:
-                # Pad with zeros to reach max_dim
-                pad_size = max_dim - emb.shape[-1]
-                if emb.dim() == 2:  # (n_samples, emb_dim)
-                    padding = torch.zeros(emb.shape[0], pad_size, dtype=torch.float32)
-                    emb = torch.cat([emb, padding], dim=1)
-                elif emb.dim() == 1:  # Single embedding vector
-                    padding = torch.zeros(pad_size, dtype=torch.float32)
-                    emb = torch.cat([emb, padding], dim=0)
-                logger.debug(f"Padded embedding from {emb.shape[-1] - pad_size} to {emb.shape[-1]} dimensions")
-            
-            embs.append(emb)
-            chr_norm   = row.chr / 22
-            start_norm = row.start / MAX_COORD_CHR22
-            end_norm   = row.end / MAX_COORD_CHR22
-            scaled_spans.append([chr_norm, start_norm, end_norm])
-
-            if load_snps:
-                # get the true snps
-                filename = os.path.basename(row.block_file)
-                block_no = re.search(r'block(\d+)', filename).group(1)
-                basename = os.path.basename(filename).split("_chr")[0]
-                p = os.path.join(
-                    recoded_dir, 
-                    f"{basename}_chr{row.chr}_block{block_no}_recodeA.raw"
-                ) 
-                rec = read_raw(p)
-                X = rec.impute().get_variants()
-                true_snps_blocks.append(torch.from_numpy(X).long())
-
-        block_embs = torch.stack(embs, dim=0).float()                 # (N_blocks, N_train, max_dim) - ensure float32
-        self.block_embs = block_embs.permute(1, 0, 2)         # (N_train, N_blocks, max_dim)
-        self.spans = torch.tensor(scaled_spans, dtype=torch.float32)       # (N_blocks, 3) - ensure float32
-        
-        # Apply PC embedding scaling if requested
-        self.pc_scales = None
-        self.pc_means = None
-        if self.scale_pc_embeddings:
-            self._apply_pc_scaling()
-            logger.info(f"Applied PC embedding scaling. Scales shape: {self.pc_scales.shape}")
-        
-        # transpose true_snps_blocks → per‐sample lists
-        N_blocks = len(true_snps_blocks)
-        N_train  = self.block_embs.size(0)
-        self.true_snps: list[list[torch.Tensor]] = []
-        for sample_idx in range(N_train):
-            if load_snps:
-                per_sample = [
-                    true_snps_blocks[blk_idx][sample_idx]
-                    for blk_idx in range(N_blocks)
-                ]
-            else:
-                per_sample = []
-            self.true_snps.append(per_sample)
-
-    def __len__(self):
-        return self.block_embs.size(0)
-
-    def __getitem__(self, idx):
-        # return one sample: block_embs, spans
-        emb, spans, true_snps = self.block_embs[idx], self.spans, self.true_snps[idx]
-        return emb, spans, true_snps
+def load_pca_metadata_only(embeddings_dir, spans_file):
+    """Load only PCA metadata for creating embedding masks without loading full PCA blocks.
     
-    def _apply_pc_scaling(self):
-        """Apply standardization to PC embeddings across all samples and blocks."""
-        # self.block_embs shape: (N_train, N_blocks, max_dim)
-        
-        # Flatten to (N_train * N_blocks, max_dim) to compute global statistics
-        flattened = self.block_embs.reshape(-1, self.block_embs.size(-1))  # (N_train * N_blocks, max_dim)
-        
-        # Compute mean and std for each PC dimension across all samples and blocks
-        # Note: embeddings are already zero-mean from PCA, but we compute mean anyway for robustness
-        self.pc_means = flattened.mean(dim=0)  # (max_dim,)
-        self.pc_stds = flattened.std(dim=0, unbiased=False)  # (max_dim,)
-        
-        # Avoid division by zero for padded dimensions (should have std=0)
-        self.pc_stds[self.pc_stds == 0] = 1.0
-        
-        # Apply standardization: (x - mean) / std
-        self.block_embs = (self.block_embs - self.pc_means.unsqueeze(0).unsqueeze(0)) / self.pc_stds.unsqueeze(0).unsqueeze(0)
-        
-        # Store inverse scaling factors for reconstruction
-        self.pc_scales = self.pc_stds  # We'll need to multiply by this and add mean to unscale
-        
-        logger.info(f"PC scaling stats - Mean range: [{self.pc_means.min():.4f}, {self.pc_means.max():.4f}], "
-                   f"Std range: [{self.pc_stds.min():.4f}, {self.pc_stds.max():.4f}]")
-
-def load_pca_blocks(embeddings_dir):
-    """Load PCA blocks for SNP reconstruction with dimension metadata."""
-    logger.info("Loading PCA blocks...")
-    pca_blocks = []
-    load_dir = os.path.join(embeddings_dir, "loadings")
-    mean_dir = os.path.join(embeddings_dir, "means")
+    Uses the spans file to determine correct block order (critical for multi-chromosome data).
+    """
+    logger.info("Loading PCA metadata for embedding masks...")
     metadata_dir = os.path.join(embeddings_dir, "metadata")
+    load_dir = os.path.join(embeddings_dir, "loadings")
     
-    # Get all PCA loading files and sort them numerically by block number
-    load_files = glob.glob(os.path.join(load_dir, "*_pca_loadings.pt"))
+    # Read spans file to get correct block order
+    df = pd.read_csv(spans_file)
     
-    # Extract block numbers and sort numerically
-    def extract_block_number(filepath):
-        filename = os.path.basename(filepath)
-        match = re.search(r'block(\d+)', filename)
-        return int(match.group(1)) if match else 0
-    
-    load_files_sorted = sorted(load_files, key=extract_block_number)
-    
-    for load_file in load_files_sorted:
-        block_base = os.path.basename(load_file).replace("_pca_loadings.pt", "")
-        means_file = os.path.join(mean_dir, f"{block_base}_pca_means.pt")
-        metadata_file = os.path.join(metadata_dir, f"{block_base}_pca_metadata.pt")
+    pca_metadata = []
+    for _, row in df.iterrows():
+        # Extract the exact prefix from the spans file path
+        # Spans file contains: {path}/{basename}_chr{chr}_block{block}_embeddings.pt
+        # PCA files are saved as: {basename}_chr{chr}_block{block}_pca_metadata.pt
+        block_file_path = row.block_file
         
-        loadings = torch.load(load_file, map_location="cuda", weights_only=False)    # (n_snps, k)
-        means = torch.load(means_file, map_location="cuda", weights_only=False)      # (n_snps,)
+        # Extract just the filename and remove _embeddings.pt suffix to get the prefix
+        filename = os.path.basename(block_file_path)
+        if filename.endswith('_embeddings.pt'):
+            prefix = filename[:-14]  # Remove '_embeddings.pt'
+        else:
+            raise ValueError(f"Unexpected embeddings file format: {filename}")
         
-        # Load metadata if available (backwards compatibility)
+        # Build metadata file path using exact prefix (no subdirectory)
+        metadata_file = os.path.join(metadata_dir, f"{prefix}_pca_metadata.pt")
+        
         if os.path.exists(metadata_file):
             metadata = torch.load(metadata_file, map_location="cpu", weights_only=False)
             k = metadata['k']
             actual_k = metadata['actual_k']
+            n_snps = metadata.get('n_snps', 0)  # Include SNP count for filtering
         else:
-            # Fallback for old format - assume all dimensions are used
-            if hasattr(loadings, 'size') and callable(loadings.size):
-                k = loadings.size(1)
-            elif hasattr(loadings, 'shape'):
-                k = loadings.shape[1]
-            else:
-                raise ValueError(f"Unsupported loadings type: {type(loadings)}")
-            actual_k = k
-            logger.warning(f"No metadata found for {block_base}, assuming actual_k = k = {k}")
-        
-        # Convert to PyTorch tensors and ensure float32
-        if not isinstance(loadings, torch.Tensor):
-            loadings = torch.from_numpy(loadings).float().cuda()
-        else:
-            loadings = loadings.float()
+            # Fallback: load from corresponding loading file using exact prefix
+            load_file = os.path.join(load_dir, f"{prefix}_pca_loadings.pt")
             
-        if not isinstance(means, torch.Tensor):
-            means = torch.from_numpy(means).float().cuda()
-        else:
-            means = means.float()
+            if os.path.exists(load_file):
+                loadings = torch.load(load_file, map_location="cpu", weights_only=False)
+                if hasattr(loadings, 'size') and callable(loadings.size):
+                    k = loadings.size(1)
+                elif hasattr(loadings, 'shape'):
+                    k = loadings.shape[1] 
+                else:
+                    raise ValueError(f"Unsupported loadings type: {type(loadings)}")
+                actual_k = k
+                n_snps = 0  # Unknown - will not be filtered
+                logger.warning(f"No metadata found for {prefix}, assuming actual_k = k = {k}, n_snps unknown")
+            else:
+                raise FileNotFoundError(f"No PCA files found for prefix: {prefix}")
         
-        pca_block = PCA_Block(k=k)
-        pca_block.actual_k = actual_k
-        pca_block.components_ = loadings.T if hasattr(loadings, 'T') else loadings.transpose()  # (actual_k, n_snps)
-        pca_block.means = means
-        pca_blocks.append(pca_block)
+        pca_metadata.append({'k': k, 'actual_k': actual_k, 'n_snps': n_snps})
     
-    logger.info(f"PCA blocks loaded. Found {len(pca_blocks)} blocks.")
-    
-    # Log dimension statistics
-    total_blocks = len(pca_blocks)
-    padded_blocks = sum(1 for pca in pca_blocks if pca.actual_k < pca.k)
-    if padded_blocks > 0:
-        logger.info(f"Dimension padding: {padded_blocks}/{total_blocks} blocks have actual_k < k")
-        for i, pca in enumerate(pca_blocks):
-            if pca.actual_k < pca.k:
-                logger.info(f"  Block {i}: k={pca.k}, actual_k={pca.actual_k} ({pca.k - pca.actual_k} padded dims)")
-    
-    return pca_blocks
+    logger.info(f"Loaded metadata for {len(pca_metadata)} PCA blocks in spans file order")
+    return pca_metadata
 
-def unscale_embeddings(embeddings, pc_means, pc_scales):
-    """Reverse the PC scaling applied during training.
-    
-    Args:
-        embeddings: (batch_size, n_blocks, k) - scaled embeddings
-        pc_means: (k,) - means used for scaling  
-        pc_scales: (k,) - standard deviations used for scaling
-    
-    Returns:
-        unscaled_embeddings: (batch_size, n_blocks, k) - original scale embeddings
-    """
-    if pc_means is None or pc_scales is None:
-        return embeddings  # No scaling was applied
-    
-    # Ensure scaling factors are on the same device as embeddings
-    device = embeddings.device
-    pc_means = pc_means.to(device)
-    pc_scales = pc_scales.to(device)
-    
-    # Reverse standardization: x_orig = x_scaled * std + mean
-    return embeddings * pc_scales.unsqueeze(0).unsqueeze(0) + pc_means.unsqueeze(0).unsqueeze(0)
-
-def create_embedding_masks(pca_blocks, max_dim, device="cuda"):
-    """Create masks for valid (non-padded) dimensions in block embeddings."""
+def create_embedding_masks_from_metadata(pca_metadata, max_dim, device="cuda"):
+    """Create masks for valid (non-padded) dimensions using metadata only."""
     masks = []
-    for pca_block in pca_blocks:
+    for meta in pca_metadata:
         mask = torch.zeros(max_dim, device=device)
-        mask[:pca_block.actual_k] = 1.0  # Mark valid dimensions as 1
+        mask[:meta['actual_k']] = 1.0  # Mark valid dimensions as 1
         masks.append(mask)
     return torch.stack(masks, dim=0)  # (n_blocks, max_dim)
 
@@ -267,7 +105,82 @@ def masked_mse_loss(pred, target, mask, reduction='mean'):
     else:
         return masked_diff
 
+def evaluate_model(model, dataset, batch_size, pca_metadata, eval_blocks=128):
+    """Memory-efficient evaluation of model on SNP reconstruction."""
+    model.eval()
+    total_mse = 0.0
+    total_acc = 0.0
+    total_samples = 0
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Create evaluation SNP loader with more blocks for comprehensive evaluation
+    eval_snp_loader = MemoryEfficientSNPLoader(dataset, eval_blocks, pca_metadata=pca_metadata)
+    
+    eval_loader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=1,
+        pin_memory=True
+    )
+    
+    with torch.no_grad():
+        for emb, spans, sample_indices in tqdm(eval_loader, desc="Evaluating"):
+            emb = emb.float().to(device)
+            spans = spans.float().to(device)
+            
+            # Forward pass
+            recon_emb, _ = model(emb, spans)
+            
+            # Unscale embeddings before PCA decoding if scaling was applied
+            recon_emb_unscaled = unscale_embeddings(recon_emb, dataset.pc_means, dataset.pc_scales)
+            
+            # Load SNPs for evaluation blocks
+            block_indices, true_snps = eval_snp_loader.load_snps_for_batch(sample_indices, device)
+            
+            # Decode predictions for evaluation blocks (now uses on-demand PCA loading)
+            pred_snps = eval_snp_loader.decode_predictions(recon_emb_unscaled, block_indices, device)
+            
+            # Compute metrics
+            mse_values = []
+            acc_values = []
+            for i, (pred, true) in enumerate(zip(pred_snps, true_snps)):
+                block_idx = block_indices[i] if i < len(block_indices) else i
+                try:
+                    mse = F.mse_loss(pred, true)
+                    acc = (pred.round() == true).float().mean()
+                    mse_values.append(mse)
+                    acc_values.append(acc)
+                except RuntimeError as e:
+                    logger.error(f"Evaluation SNP shape mismatch at block {block_idx}:")
+                    logger.error(f"  Predicted SNPs shape: {pred.shape}")
+                    logger.error(f"  True SNPs shape: {true.shape}")
+                    logger.error(f"  Error: {e}")
+                    raise
+            
+            batch_mse = sum(mse_values) / len(mse_values)
+            batch_acc = sum(acc_values) / len(acc_values)
+            
+            bs = emb.size(0)
+            total_mse += batch_mse.item() * bs
+            total_acc += batch_acc.item() * bs
+            total_samples += bs
+    
+    model.train()  # Return to training mode
+    return {
+        'mse': total_mse / total_samples,
+        'accuracy': total_acc / total_samples
+    }
+
 def train(args):
+    """
+    Train VAE on block embeddings using memory-efficient approach.
+    1. PC embeddings are stored in HDF5 format for efficient access
+    2. SNPs are loaded on-demand during training (never all in memory)
+    3. PCA blocks are loaded on-demand with LRU caching
+    4. Random block sampling for SNP reconstruction (--snp-blocks-per-batch)
+    5. Warmup phase with PC-only loss (--warmup-epochs)
+    """
     setup_logging()
     
     # Initialize epoch variable to avoid UnboundLocalError when resuming from completed training
@@ -277,35 +190,62 @@ def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
     
-    # Create two datasets: one without SNPs (faster), one with SNPs (for SNP loss phases)
     scale_pc = getattr(args, 'scale_pc_embeddings', False)
-    ds_no_snps = SNPBlocksDataset(args.spans_file, args.recoded_dir, load_snps=False, scale_pc_embeddings=scale_pc)
-    ds_with_snps = SNPBlocksDataset(args.spans_file, args.recoded_dir, load_snps=True, scale_pc_embeddings=scale_pc)
-    # For evaluation, always use dataset with SNPs
-    ds_eval = ds_with_snps
     
-    # Get the actual embedding dimension from the dataset
-    actual_block_dim = ds_no_snps.block_embs.shape[-1]
-    logger.info(f"Using actual block embedding dimension: {actual_block_dim}")
+    # Generate HDF5 path automatically based on spans file
+    spans_basename = os.path.splitext(os.path.basename(args.spans_file))[0]
+    h5_dir = os.path.join(os.path.dirname(args.spans_file), "h5_cache")
+    os.makedirs(h5_dir, exist_ok=True)
+    emb_h5_path = os.path.join(h5_dir, f"{spans_basename}_embeddings.h5")
+    
+    logger.info("Using memory-efficient HDF5-based training")
+    
+    # Create HDF5 file if it doesn't exist
+    if not os.path.exists(emb_h5_path):
+        logger.info(f"Creating HDF5 embeddings file: {emb_h5_path}")
+        # Need to determine n_train from one of the embedding files
+        df_temp = pd.read_csv(args.spans_file)
+        first_emb = torch.load(df_temp.iloc[0].block_file, weights_only=False)
+        if not isinstance(first_emb, torch.Tensor):
+            first_emb = torch.tensor(first_emb, dtype=torch.float32)
+        n_train = first_emb.shape[0]
+        
+        precompute_embeddings(args.spans_file, emb_h5_path, n_train)
+    
+    # Create single memory-efficient dataset (always includes PC embeddings)
+    dataset = BlockPCDataset(
+        emb_h5_path=emb_h5_path,
+        spans_file=args.spans_file,
+        recoded_dir=args.recoded_dir,
+        embeddings_dir=args.embeddings_dir,
+        scale_pc_embeddings=scale_pc
+    )
+    
+    # Get actual block dimension from HDF5 metadata
+    actual_block_dim = dataset.pc_dim
+    logger.info(f"Using actual block embedding dimension from HDF5: {actual_block_dim}")
     
     # Override args.block_dim if it doesn't match the actual embeddings
     if args.block_dim != actual_block_dim:
         logger.warning(f"Config block_dim ({args.block_dim}) != actual embeddings ({actual_block_dim}). Using actual dimension.")
         args.block_dim = actual_block_dim
-    
+
+    # Load PCA metadata for embedding masks (much more memory efficient)
+    pca_metadata = load_pca_metadata_only(args.embeddings_dir, args.spans_file)
+    n_blocks = len(pca_metadata)
+    logger.info(f"Total number of blocks: {n_blocks}")
+
     # model
     model = SNPVAE(
+        n_blocks        = n_blocks,
         grid_size       = (args.grid_h, args.grid_w),
         block_emb_dim   = args.block_dim,
         pos_emb_dim     = args.pos_dim,
         latent_channels = args.latent_channels
     ).to(device)
-
-    # Load PCA blocks for SNP reconstruction
-    pca_blocks = load_pca_blocks(args.embeddings_dir)
     
     # Create embedding dimension masks for padded dimensions
-    embedding_mask = create_embedding_masks(pca_blocks, args.block_dim, device=device)
+    embedding_mask = create_embedding_masks_from_metadata(pca_metadata, args.block_dim, device=device)
     
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     
@@ -328,20 +268,28 @@ def train(args):
         if hasattr(args, 'checkpoint_path') and args.checkpoint_path and args.checkpoint_path.strip():
             logger.warning(f"Checkpoint path specified but file not found: {args.checkpoint_path}")
         logger.info("Starting training from scratch")
-    mse_loss  = nn.MSELoss(reduction='mean')
     
     # Training parameters
     kld_weight = args.kld_weight
     lambda_mse = args.decoded_mse_weight
+    warmup_epochs = getattr(args, 'snp_start_epoch', 0)
+    snp_blocks_per_batch = getattr(args, 'snp_blocks_per_batch', 512)
+    
+    # Create SNP loader only when needed (lazy initialization)
+    snp_loader = None
 
     for epoch in range(start_epoch, args.epochs + 1):
         # Determine whether to use SNP loss for this epoch
-        use_snp_loss = args.reconstruct_snps and (epoch > args.snp_start_epoch)
+        use_snp_loss = args.reconstruct_snps and (epoch > warmup_epochs)
         
-        # Create loader based on whether we need SNP data
-        current_ds = ds_with_snps if use_snp_loss else ds_no_snps
+        # Create SNP loader on-demand when first needed
+        if use_snp_loss and snp_loader is None:
+            logger.info(f"Creating SNP loader for on-demand SNP loading (blocks per batch: {snp_blocks_per_batch})")
+            snp_loader = MemoryEfficientSNPLoader(dataset, snp_blocks_per_batch, pca_metadata=pca_metadata)
+        
+        # Create data loader (always uses same dataset)
         loader = DataLoader(
-            current_ds, 
+            dataset, 
             batch_size=args.batch_size, 
             shuffle=True,
             num_workers=1,
@@ -356,11 +304,7 @@ def train(args):
         total_samples = 0
 
         for batch_data in tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}"):
-            if use_snp_loss:
-                emb, spans, raw_snps = batch_data
-            else:
-                emb, spans, _ = batch_data  # raw_snps will be empty list
-            
+            emb, spans, sample_indices = batch_data
             # Move to GPU and ensure correct types
             emb = emb.float().to(device)
             spans = spans.float().to(device)
@@ -377,24 +321,40 @@ def train(args):
             # Start with basic VAE loss
             loss = recon_loss + kld_weight * kld_loss
             
-            # Add SNP reconstruction loss if in SNP phase - EXACTLY like original train.py
+            # Add SNP reconstruction loss if in SNP phase
             if use_snp_loss:
                 # Unscale embeddings before PCA decoding if scaling was applied
-                recon_emb_unscaled = unscale_embeddings(recon_emb, current_ds.pc_means, current_ds.pc_scales)
+                recon_emb_unscaled = unscale_embeddings(recon_emb, dataset.pc_means, dataset.pc_scales)
                 
-                decoded_snps = [
-                    pca_blocks[idx].decode(recon_emb_unscaled[:, idx, :])
-                    for idx in range(len(pca_blocks))
-                ]
+                # Load SNPs on-demand for random subset of blocks
+                block_indices, true_snps = snp_loader.load_snps_for_batch(sample_indices, device)
                 
-                decoded_mse = sum(
-                    mse_loss(r, raw_snps[i].float().to(r.device))
-                    for i, r in enumerate(decoded_snps)
-                ) / len(decoded_snps)
+                # Decode predictions for selected blocks only (now uses on-demand PCA loading)
+                pred_snps = snp_loader.decode_predictions(recon_emb_unscaled, block_indices, device)
                 
-                # Warm up SNP loss weight over first 50 epochs after snp_start_epoch
-                if epoch <= args.snp_start_epoch + 50:
-                    lambda_snp = lambda_mse * (epoch - args.snp_start_epoch) / 50
+                # Compute SNP loss for selected blocks
+                decoded_mse_values = []
+                for i, (pred, true) in enumerate(zip(pred_snps, true_snps)):
+                    block_idx = block_indices[i]
+                    try:
+                        mse = F.mse_loss(pred, true)
+                        decoded_mse_values.append(mse)
+                    except RuntimeError as e:
+                        logger.error(f"SNP shape mismatch at block {block_idx}:")
+                        logger.error(f"  Predicted SNPs shape: {pred.shape}")
+                        logger.error(f"  True SNPs shape: {true.shape}")
+                        logger.error(f"  Error: {e}")
+                        # Get block info for more context
+                        if hasattr(snp_loader, 'block_info') and block_idx < len(snp_loader.block_info):
+                            chr_num, block_num, block_base = snp_loader.block_info[block_idx]
+                            logger.error(f"  Block info: chr{chr_num}_block{block_num} ({block_base})")
+                        raise
+                
+                decoded_mse = sum(decoded_mse_values) / len(decoded_mse_values)
+                
+                # Warm up SNP loss weight over first 50 epochs after warmup
+                if epoch <= warmup_epochs + 50:
+                    lambda_snp = lambda_mse * (epoch - warmup_epochs) / 50
                 else:
                     lambda_snp = lambda_mse
                 
@@ -420,8 +380,8 @@ def train(args):
         phase = "SNP Loss" if use_snp_loss else "PC Only"
         if use_snp_loss:
             avg_snp_mse = total_snp_mse / len(loader)
-            if epoch <= args.snp_start_epoch + 50:
-                lambda_snp = lambda_mse * (epoch - args.snp_start_epoch) / 50
+            if epoch <= warmup_epochs + 50:
+                lambda_snp = lambda_mse * (epoch - warmup_epochs) / 50
             else:
                 lambda_snp = lambda_mse
             logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | SNP_MSE={avg_snp_mse:.4f} | λ_SNP={lambda_snp:.2e} | KLD_weight={kld_weight:.2e} | LR={args.lr:.2e}")
@@ -429,13 +389,18 @@ def train(args):
             logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | KLD_weight={kld_weight:.2e} | LR={args.lr:.2e}")
             
         # Log transition to SNP phase
-        if epoch == args.snp_start_epoch + 1:
+        if epoch == warmup_epochs + 1:
             logger.info(f">>> TRANSITION: Starting SNP loss phase at epoch {epoch} <<<")
         
         # Comprehensive evaluation at specified frequency (or at end)
-        eval_freq = getattr(args, 'eval_frequency', 50)  # Default to 10 if not specified
+        eval_freq = getattr(args, 'eval_frequency', 50)  # Default to 50 if not specified
         if epoch % eval_freq == 0 or epoch == args.epochs:
-            eval_metrics = evaluate_model(model, ds_eval, pca_blocks, args.batch_size)
+            # Create evaluation SNP loader if not exists (for comprehensive evaluation)
+            if snp_loader is None:
+                logger.info("Creating SNP loader for evaluation")
+                snp_loader = MemoryEfficientSNPLoader(dataset, snp_blocks_per_batch, pca_metadata=pca_metadata)
+            
+            eval_metrics = evaluate_model(model, dataset, args.batch_size, pca_metadata, eval_blocks=128)
             logger.info(f">>> Eval @ epoch {epoch}: SNP_MSE={eval_metrics['mse']:.4f} | SNP_Acc={eval_metrics['accuracy']:.4f}")
             
             # Save checkpoint that replaces the previous one (not accumulating)
@@ -468,6 +433,7 @@ def train(args):
     final_model_data = {
         'model_state_dict': model.state_dict(),
         'config': {
+            'n_blocks': n_blocks,
             'grid_h': args.grid_h,
             'grid_w': args.grid_w,
             'block_dim': args.block_dim,
@@ -484,89 +450,49 @@ def train(args):
     }
     
     # Save PC scaling factors if they were used
-    if scale_pc and ds_with_snps.pc_means is not None:
+    if scale_pc and dataset.pc_means is not None:
         final_model_data['pc_scaling'] = {
-            'pc_means': ds_with_snps.pc_means,
-            'pc_scales': ds_with_snps.pc_scales
+            'pc_means': dataset.pc_means,
+            'pc_scales': dataset.pc_scales
         }
         logger.info("Saved PC scaling factors with model")
     torch.save(final_model_data, args.model_save_path)
     logger.info(f"Model with config saved to {args.model_save_path}")
 
-def evaluate_model(model, dataset, pca_blocks, batch_size):
-    """Comprehensive evaluation of model on SNP reconstruction."""
-    model.eval()
-    total_mse = 0.0
-    total_acc = 0.0
-    total_samples = 0
-    
-    eval_loader = DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-        num_workers=1,
-        pin_memory=True
-    )
-    
-    with torch.no_grad():
-        for emb, spans, raw_snps in tqdm(eval_loader, desc="Evaluating"):
-            emb = emb.float().cuda()
-            spans = spans.float().cuda()
-            
-            # Forward pass
-            recon_emb, _ = model(emb, spans)
-            
-            # Unscale embeddings before PCA decoding if scaling was applied
-            recon_emb_unscaled = unscale_embeddings(recon_emb, dataset.pc_means, dataset.pc_scales)
-            
-            # Evaluation following original script exactly
-            decoded = [
-                pca_blocks[idx].decode(recon_emb_unscaled[:, idx, :])
-                for idx in range(len(pca_blocks))
-            ]
-            # MSE
-            batch_mse = sum(
-                F.mse_loss(r, raw_snps[i].float().to(r.device))
-                for i, r in enumerate(decoded)
-            ) / len(decoded)
-            # accuracy = fraction of exact matches
-            batch_acc = sum(
-                (r.round() == raw_snps[i].to(r.device)).float().mean()
-                for i, r in enumerate(decoded)
-            ) / len(decoded)
-            
-            bs = emb.size(0)
-            total_mse += batch_mse.item() * bs
-            total_acc += batch_acc.item() * bs
-            total_samples += bs
-    
-    model.train()  # Return to training mode
-    return {
-        'mse': total_mse / total_samples,
-        'accuracy': total_acc / total_samples
-    }
-
 def main():
     """Main function for VAE training."""
-    parser = argparse.ArgumentParser(description="Train VAE on block embeddings")
+    parser = argparse.ArgumentParser(description="Train VAE on block embeddings using memory-efficient approach")
     parser.add_argument("--spans-file", type=str, required=True)
     parser.add_argument("--recoded-dir", type=str, required=True)
     parser.add_argument("--embeddings-dir", type=str, required=True)
     parser.add_argument("--model-save-path", type=str, required=True)
     parser.add_argument("--checkpoint-path", type=str, default=None, help="Path to checkpoint for resuming training")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=32)
+    
+    # Memory-efficient training options
+    parser.add_argument("--snp-blocks-per-batch", type=int, default=64,
+                       help="Number of blocks to sample for SNP reconstruction per batch")
+    parser.add_argument("--warmup-epochs", type=int, default=200,
+                       help="Number of epochs to train with PC-only loss before starting SNP reconstruction")
+    
+    # Training parameters
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--grid-h", type=int, default=16)
-    parser.add_argument("--grid-w", type=int, default=16)
-    parser.add_argument("--block-dim", type=int, default=3)
+    
+    # Model architecture
+    parser.add_argument("--grid-h", type=int, default=64)
+    parser.add_argument("--grid-w", type=int, default=64)
+    parser.add_argument("--block-dim", type=int, default=4)
     parser.add_argument("--pos-dim", type=int, default=16)
-    parser.add_argument("--latent-channels", type=int, default=32)
-    parser.add_argument("--kld-weight", type=float, default=1e-3)
+    parser.add_argument("--latent-channels", type=int, default=128)
+    
+    # Loss weights
+    parser.add_argument("--kld-weight", type=float, default=1e-5)
     parser.add_argument("--reconstruct-snps", action="store_true")
-    parser.add_argument("--snp-start-epoch", type=int, default=10)
-    parser.add_argument("--decoded-mse-weight", type=float, default=1e-2)
-    parser.add_argument("--eval-frequency", type=int, default=10, help="Evaluation and checkpoint frequency (epochs)")
+    parser.add_argument("--decoded-mse-weight", type=float, default=1.0)
+    
+    # Evaluation and scaling
+    parser.add_argument("--eval-frequency", type=int, default=50, help="Evaluation and checkpoint frequency (epochs)")
     parser.add_argument("--scale-pc-embeddings", action="store_true", help="Standardize PC embeddings across samples/blocks before VAE training")
     
     args = parser.parse_args()

@@ -2,9 +2,9 @@
 
 from .vae import SNPVAE, JointBlockEmbedder, JointBlockDecoder
 from .distribution import DiagonalGaussianDistribution
-from .train import SNPBlocksDataset
+from .memory_efficient_dataset import BlockPCDataset, MemoryEfficientSNPLoader
 
 __all__ = [
     "SNPVAE", "JointBlockEmbedder", "JointBlockDecoder",
-    "DiagonalGaussianDistribution", "SNPBlocksDataset"
+    "DiagonalGaussianDistribution", "BlockPCDataset", "MemoryEfficientSNPLoader"
 ]

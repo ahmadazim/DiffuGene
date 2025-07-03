@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 import torch
 from typing import Dict, List, Tuple, Optional, Union
-from .file_utils import get_logger
+from .logging import get_logger
 
 logger = get_logger(__name__)
 

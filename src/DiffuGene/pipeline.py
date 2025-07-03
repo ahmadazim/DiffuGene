@@ -165,6 +165,16 @@ class DiffuGenePipeline:
         chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
         pca_k = int(self.config['block_embed']['pca_k'])
         
+        # For VAE step, check if it uses the same dataset as PCA
+        # If so, use the PCA spans file instead of creating a separate one
+        if step == 'vae':
+            pca_fam = self.get_dataset_fam_file('pca')
+            vae_fam = self.get_dataset_fam_file('vae')
+            if pca_fam == vae_fam:
+                # VAE uses same dataset as PCA, so use PCA spans file
+                step = 'pca'
+                basename = self.get_dataset_basename('pca')
+        
         # Map step to meaningful suffix
         step_suffix_map = {
             'pca': 'pca_train',
