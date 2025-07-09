@@ -15,9 +15,7 @@ logger = get_logger(__name__)
 def precompute_embeddings(spans_file: str, h5_path: str, n_train: int, pc_dim: int = None):
     """
     Read individual block embedding .pt files and create a single HDF5 file.
-    
     Processes blocks in the exact order specified by spans_file to maintain correct block indexing for multi-chromosome data.
-    
     Args:
         spans_file: CSV file with columns [block_file, chr, start, end]
         h5_path: Output HDF5 file path
@@ -28,7 +26,6 @@ def precompute_embeddings(spans_file: str, h5_path: str, n_train: int, pc_dim: i
     df = pd.read_csv(spans_file)
     N_blocks = len(df)
     
-    # Auto-detect PC dimension from first block if not provided
     if pc_dim is None:
         first_emb = torch.load(df.iloc[0].block_file, weights_only=False)
         if not isinstance(first_emb, torch.Tensor):
@@ -39,12 +36,8 @@ def precompute_embeddings(spans_file: str, h5_path: str, n_train: int, pc_dim: i
     logger.info(f"Creating HDF5 file: {h5_path}")
     logger.info(f"Shape: ({n_train}, {N_blocks}, {pc_dim})")
     
-    # Create output directory if needed
-    os.makedirs(os.path.dirname(h5_path), exist_ok=True)
-    
     # Create HDF5 file with contiguous storage for random access
     with h5py.File(h5_path, "w") as h5f:
-        # No chunking - store contiguously for optimal random sample access
         # Training accesses dataset[random_idx] -> (N_blocks, pc_dim)
         dset = h5f.create_dataset(
             "pc", 
@@ -53,8 +46,6 @@ def precompute_embeddings(spans_file: str, h5_path: str, n_train: int, pc_dim: i
             compression=None,
             shuffle=False
         )
-        
-        # Process each block in spans file order
         logger.info("Loading all block embeddings into memory...")  #TODO: remove this, sort of defeats the purpose of this memory efficient dataset
         all_embeddings = np.zeros((n_train, N_blocks, pc_dim), dtype=np.float32)
         
@@ -69,23 +60,18 @@ def precompute_embeddings(spans_file: str, h5_path: str, n_train: int, pc_dim: i
             # Validate shape
             if emb.shape[0] != n_train:
                 raise ValueError(f"Block {j} (chr{row.chr}_block) has {emb.shape[0]} samples, expected {n_train}")
-            
-            # Handle dimension mismatch
             if emb.shape[-1] < pc_dim:
-                # Pad with zeros
                 pad_size = pc_dim - emb.shape[-1]
-                if emb.dim() == 2:
-                    padding = torch.zeros(emb.shape[0], pad_size, dtype=torch.float32)
-                    emb = torch.cat([emb, padding], dim=1)
+                padding = torch.zeros(emb.shape[0], pad_size, dtype=torch.float32)
+                emb = torch.cat([emb, padding], dim=1)
                 logger.debug(f"Padded chr{row.chr}_block{j} from {emb.shape[-1] - pad_size} to {emb.shape[-1]} dimensions")
             elif emb.shape[-1] > pc_dim:
-                # Truncate (shouldn't happen if auto-detected correctly)
-                emb = emb[:, :pc_dim]
-                logger.warning(f"Truncated chr{row.chr}_block{j} from {emb.shape[-1] + (emb.shape[-1] - pc_dim)} to {emb.shape[-1]} dimensions")
+                # Shouldn't happen 
+                raise ValueError(f"Block {j} (chr{row.chr}_block) has {emb.shape[-1]} dimensions, expected {pc_dim}")
             
             all_embeddings[:, j, :] = emb.numpy()
         
-        # Write all data at once (much faster for contiguous storage)
+        # Write all data at once (much faster for contiguous storage, will change later)
         logger.info("Writing all data to HDF5...")
         dset[:] = all_embeddings
         

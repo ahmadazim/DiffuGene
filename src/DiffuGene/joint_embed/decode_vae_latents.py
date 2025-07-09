@@ -61,7 +61,7 @@ def load_spans_file(spans_file):
         21: 48129895, 22: 51304566,
     }
     
-    # Create chromosome-aware spans: (chr_idx, start_norm, length_norm)
+    # Create chromosome-aware spans: (chr_idx, start_norm, end_norm)
     scaled_spans = []
     for _, row in df.iterrows():
         chr_idx = int(row.chr)  # Keep as integer index (1-22)
@@ -71,12 +71,10 @@ def load_spans_file(spans_file):
             raise ValueError(f"Unknown chromosome: {chr_idx}. Supported: {list(CHROMOSOME_LENGTHS.keys())}")
         chrom_length = CHROMOSOME_LENGTHS[chr_idx]
         
-        # Normalize start position by chromosome length
+        # Normalize start and end positions by chromosome length
         start_norm = row.start / chrom_length
-        
-        # Normalize block length by this chromosome's maximum length
-        block_length = row.end - row.start
-        length_norm = block_length / chrom_length
+        end_norm = row.end / chrom_length
+        length_norm = end_norm - start_norm  # VAE expects length, not end position
         
         scaled_spans.append([chr_idx, start_norm, length_norm])
     
@@ -167,6 +165,10 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
         # Fallback for older model format
         raise ValueError("Model file must contain configuration. Please use a model saved with the current training script.")
     
+    # 3. Prepare block info for on-demand PCA loading
+    block_info = prepare_block_info_for_decoding(spans_file, chromosome=chromosome)
+    n_blocks = len(block_info)
+    
     # Initialize VAE model
     model = SNPVAE(
         n_blocks=n_blocks,
@@ -180,16 +182,12 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     model.eval()
     logger.info(f"VAE model loaded with config: {config}")
     
-    # 3. Prepare block info for on-demand PCA loading
-    block_info = prepare_block_info_for_decoding(spans_file, chromosome=chromosome)
-    
     # 4. Load spans for positioning
     spans = load_spans_file(spans_file)
     spans = spans.to(device)
     
     # Verify dimensions match
     n_samples = latents.shape[0]
-    n_blocks = len(block_info)
     if spans.shape[0] != n_blocks:
         raise ValueError(f"Spans file has {spans.shape[0]} blocks but block info has {n_blocks} blocks")
     

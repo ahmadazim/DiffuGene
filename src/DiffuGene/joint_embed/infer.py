@@ -41,7 +41,7 @@ def inference(args):
             first_emb = torch.tensor(first_emb, dtype=torch.float32)
         n_train = first_emb.shape[0]
         
-        precompute_embeddings(args.spans_file, emb_h5_path, n_train)
+        precompute_embeddings(args.spans_file, emb_h5_path, n_train, args.block_dim)
     
     # Load dataset using memory-efficient approach
     dataset = BlockPCDataset(
