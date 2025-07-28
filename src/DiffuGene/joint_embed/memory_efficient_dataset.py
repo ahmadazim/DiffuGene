@@ -87,7 +87,7 @@ def load_single_pca_block(embeddings_dir: str, block_info: tuple) -> PCA_Block:
 class BlockPCDataset(Dataset):
     """
     Memory-efficient dataset that reads PC embeddings from HDF5.
-    SNPs are loaded separately on-demand via MemoryEfficientSNPLoader.
+    SNPs are loaded separately on-demand via SNPLoader.
     """
     def __init__(self, 
                  emb_h5_path: str, 
@@ -127,7 +127,7 @@ class BlockPCDataset(Dataset):
             self.block_raws.append(raw_path)
             
             # Store block info for on-demand PCA loading
-            block_base = os.path.basename(row.block_file).replace(".pt", "")
+            block_base = os.path.basename(row.block_file).replace("_embeddings.pt", "")
             self.block_info.append((int(row.chr), int(block_no), block_base))
             
             # Build scaled spans
@@ -143,10 +143,11 @@ class BlockPCDataset(Dataset):
         self.spans = torch.tensor(scaled_spans, dtype=torch.float32)
         logger.info(f"Spans shape: {self.spans.shape} (chr_idx, start_norm, length_norm)")
         
-        with h5py.File(emb_h5_path, "r") as h5f:
-            self.N_train = h5f.attrs['n_train']
-            self.pc_dim = h5f.attrs['pc_dim']
-            logger.info(f"Dataset: {self.N_train} samples, {self.N_blocks} blocks, {self.pc_dim} PCs")
+        # Open HDF5 file and keep it open for the lifetime of the dataset
+        self._h5f = h5py.File(emb_h5_path, "r")
+        self.N_train = self._h5f.attrs['n_train']
+        self.pc_dim = self._h5f.attrs['pc_dim']
+        logger.info(f"Dataset: {self.N_train} samples, {self.N_blocks} blocks, {self.pc_dim} PCs")
         
         self.pc_means = None
         self.pc_scales = None
@@ -164,9 +165,8 @@ class BlockPCDataset(Dataset):
         
         # Read min(10000, N_train) individuals to scale
         num_indivs_to_scale = min(10000, self.N_train)
-        with h5py.File(self.emb_h5_path, "r") as h5f:
-            chunk = h5f["pc"][0:num_indivs_to_scale]  # (num_indivs_to_scale, N_blocks, pc_dim)
-            chunk_flat = chunk.reshape(-1, self.pc_dim)  # (num_indivs_to_scale * N_blocks, pc_dim)
+        chunk = self._h5f["pc"][0:num_indivs_to_scale]  # (num_indivs_to_scale, N_blocks, pc_dim)
+        chunk_flat = chunk.reshape(-1, self.pc_dim)  # (num_indivs_to_scale * N_blocks, pc_dim)
         
         approx_means = chunk_flat.mean(axis=0)
         approx_stds = chunk_flat.std(axis=0)
@@ -180,15 +180,25 @@ class BlockPCDataset(Dataset):
         return self.N_train
 
     def __getitem__(self, idx):
-        with h5py.File(self.emb_h5_path, "r") as h5f:
-            emb = torch.from_numpy(h5f["pc"][idx]).float()
+        # Handle multiprocessing: reopen file if needed in worker processes
+        if not hasattr(self, '_h5f') or self._h5f is None:
+            self._h5f = h5py.File(self.emb_h5_path, "r")
+        emb = torch.from_numpy(self._h5f["pc"][idx]).float()
         if self.scale_pc_embeddings:
             emb = (emb - self.pc_means.unsqueeze(0)) / self.pc_scales.unsqueeze(0)
         return emb, self.spans, idx
 
+    def close(self):
+        """(Soft) close the HDF5 file."""
+        if hasattr(self, '_h5f') and self._h5f is not None:
+            try:
+                self._h5f.close()
+                self._h5f = None
+            except:
+                pass
+
     def __del__(self):
-        if hasattr(self, '_h5f'):
-            self._h5f.close()
+        self.close()
 
 
 class SNPLoader:

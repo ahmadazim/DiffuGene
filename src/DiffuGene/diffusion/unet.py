@@ -53,7 +53,7 @@ class LatentUNET2D(nn.Module):
                 "UpBlock2D",       # 16×16 → 32×32, 256→256
                 "UpBlock2D",       # 32×32 → 64×64, 256→256
             ],
-            mid_block_type="UNetMidBlock2DSelfAttn",
+            mid_block_type="UNetMidBlock2DCrossAttn",
             attention_head_dim=64,
             cross_attention_dim=256,
         )
@@ -68,6 +68,7 @@ class LatentUNET2D(nn.Module):
         """
         x = self.input_proj(x)                # (B,256,64,64)
         cond_emb = self.cond_emb(c)           # (B,256)
+        cond_emb = cond_emb.unsqueeze(1)      # (B,1,256) - add sequence dimension for cross-attention
         x = self.unet(x, t, encoder_hidden_states=cond_emb).sample
         x = self.output_proj(x)               # (B,64,64,64)
         return x

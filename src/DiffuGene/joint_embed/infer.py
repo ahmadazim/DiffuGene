@@ -4,6 +4,7 @@ import argparse
 import torch
 import os
 import pandas as pd
+from tqdm import tqdm
 
 from ..utils import setup_logging, get_logger
 from .vae import SNPVAE
@@ -108,24 +109,37 @@ def inference(args):
         pc_scales = None
     model.eval()
     
-    # Encode all data using memory-efficient approach
+    # Encode all data (in batches if needed)
+    batch_size = 50500
+    batch_count = 0
     all_latents = []
     with torch.no_grad():
-        for i in range(len(dataset)):
-            emb, spans, sample_idx = dataset[i]  # Returns (emb, spans, sample_idx)
+        for i in tqdm(range(len(dataset)), desc="Encoding data"):
+            emb, spans, sample_idx = dataset[i]
             emb = emb.unsqueeze(0).cuda()  # Add batch dimension
             spans = spans.unsqueeze(0).cuda()
             
             z, _ = model.encode(emb, spans)
             all_latents.append(z.cpu())
+            
+            if len(all_latents) >= batch_size:
+                # save and clear
+                batch_tensor = torch.cat(all_latents, dim=0)
+                batch_output = args.output_path.replace('.pt', f'_batch{batch_count}.pt')
+                os.makedirs(os.path.dirname(batch_output), exist_ok=True)
+                torch.save(batch_tensor, batch_output)
+                logger.info(f"Saved batch {batch_count} with {batch_tensor.shape[0]} latents to {batch_output}")
+                batch_count += 1
+                all_latents = []
+                torch.cuda.empty_cache()
     
-    # Stack and save
-    all_latents = torch.cat(all_latents, dim=0)
-    logger.info(f"Generated latents shape: {all_latents.shape}")
-    
-    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
-    torch.save(all_latents, args.output_path)
-    logger.info(f"Latents saved to {args.output_path}")
+    # Save any remaining latents
+    if len(all_latents) > 0:
+        batch_tensor = torch.cat(all_latents, dim=0)
+        batch_output = args.output_path.replace('.pt', f'_batch{batch_count}.pt')
+        os.makedirs(os.path.dirname(batch_output), exist_ok=True)
+        torch.save(batch_tensor, batch_output)
+        logger.info(f"Saved final batch {batch_count} with {batch_tensor.shape[0]} latents to {batch_output}")
 
 def main():
     """Main function for VAE inference."""
@@ -146,3 +160,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# wd=/n/home03/ahmadazim/WORKING/genGen/UKB/
+# python -m DiffuGene.joint_embed.infer --model-path ${wd}models/joint_embed/VAE_unrelWhite_allchr_4PC_64z_checkpoint_400.pt --spans-file ${wd}genomic_data/work_encode/encoding_ukb_allchr_unrel_britishWhite_conditional_diffusion_train/ukb_allchr_unrel_britishWhite_conditional_diffusion_train_blocks_4PC_inference.csv --recoded-dir ${wd}genomic_data/work_encode/encoding_ukb_allchr_unrel_britishWhite_conditional_diffusion_train/recoded_blocks/ --embeddings-dir ${wd}genomic_data/work_encode/encoding_ukb_allchr_unrel_britishWhite_conditional_diffusion_train/embeddings/ --output-path ${wd}genomic_data/VAE_embeddings/ukb_allchr_unrel_britishWhite_conditional_diffusion_train_VAE_latents_4PC_64z_checkpoint_400.pt --grid-h 64 --grid-w 64 --block-dim 4 --pos-dim 16 --latent-channels 128

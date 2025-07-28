@@ -17,6 +17,7 @@ import subprocess
 import glob
 from pathlib import Path
 from typing import Dict, Any, List
+import re
 
 # Suppress warnings before importing torch/other libraries
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
@@ -24,6 +25,9 @@ os.environ.setdefault('TF_ENABLE_ONEDNN_OPTS', '0')
 os.environ.setdefault('PYTHONWARNINGS', 'ignore')
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
 import numpy as np
 import warnings
 import pandas as pd
@@ -32,7 +36,37 @@ warnings.filterwarnings('ignore')
 from .config import load_config, get_default_config_path, expand_variables
 from .utils import setup_logging, get_logger, ensure_dir_exists, load_blocks_for_chr
 
+
 logger = get_logger(__name__)
+
+def check_for_batch_files(base_path: str) -> bool:
+    if os.path.exists(base_path):
+        return True
+    
+    base_dir = os.path.dirname(base_path)
+    base_name = os.path.splitext(os.path.basename(base_path))[0]
+    
+    batch_pattern = os.path.join(base_dir, f"{base_name}_batch*.pt")
+    batch_files = glob.glob(batch_pattern)
+    
+    return len(batch_files) > 0
+
+def get_batch_files(base_path: str) -> List[str]:
+    if os.path.exists(base_path):
+        return [base_path]
+    
+    base_dir = os.path.dirname(base_path)
+    base_name = os.path.splitext(os.path.basename(base_path))[0]
+    
+    batch_pattern = os.path.join(base_dir, f"{base_name}_batch*.pt")
+    batch_files = glob.glob(batch_pattern)
+    
+    def extract_batch_num(path):
+        match = re.search(r'_batch(\d+)\.pt$', path)
+        return int(match.group(1)) if match else 0
+    
+    batch_files.sort(key=extract_batch_num)
+    return batch_files
 
 def get_chromosome_list(chromosome_spec):
     """Get list of chromosomes to process based on chromosome specification.
@@ -616,7 +650,7 @@ class DiffuGenePipeline:
         elif step_name == 'joint_embed':
             model_path = self.config['joint_embed']['model_save_path']
             latents_path = self.config['joint_embed']['latents_output_path']
-            return os.path.exists(model_path) and os.path.exists(latents_path)
+            return os.path.exists(model_path) and check_for_batch_files(latents_path)
             
         elif step_name == 'diffusion':
             model_path = self.config['diffusion']['model_output_path']
@@ -627,23 +661,23 @@ class DiffuGenePipeline:
                 return True  # Skip if not needed
             test_latents_path = self.config['joint_embed']['evaluation']['test_latents_path']
             test_reconstructions_path = self.config['joint_embed']['evaluation']['test_reconstructions_path']
-            return os.path.exists(test_latents_path) and os.path.exists(test_reconstructions_path)
+            return check_for_batch_files(test_latents_path) and check_for_batch_files(test_reconstructions_path)
             
         elif step_name == 'diffusion_encoding':
             if not self.should_run_evaluation_step('diffusion_encoding'):
                 return True  # Skip if not needed
             diffusion_train_latents_path = self.config['diffusion']['encoding']['diffusion_train_latents_path']
-            return os.path.exists(diffusion_train_latents_path)
+            return check_for_batch_files(diffusion_train_latents_path)
             
         elif step_name == 'diffusion_val_encoding':
             if not self.should_run_evaluation_step('diffusion_val_encoding'):
                 return True  # Skip if not needed
             diffusion_val_latents_path = self.config['diffusion']['encoding']['diffusion_val_latents_path']
-            return os.path.exists(diffusion_val_latents_path)
+            return check_for_batch_files(diffusion_val_latents_path)
             
         elif step_name == 'generation':
             output_path = self.config['generation']['output_path']
-            latents_exist = os.path.exists(output_path)
+            latents_exist = check_for_batch_files(output_path)
             
             # If decoding is enabled, also check for decoded samples
             gen_config = self.config['generation']
@@ -1229,13 +1263,7 @@ class DiffuGenePipeline:
         if is_conditional:
             logger.info("Training conditional diffusion model")
             
-            # Determine which fam file to use for covariates
-            if self.should_run_evaluation_step('diffusion_encoding'):
-                # Use diffusion training fam file
-                covariate_fam_file = self.get_dataset_fam_file('diffusion')
-            else:
-                # Use VAE training fam file
-                covariate_fam_file = self.get_dataset_fam_file('vae')
+            covariate_fam_file = self.get_dataset_fam_file('diffusion')
             
             train_args.update({
                 'conditional': True,
@@ -1395,9 +1423,18 @@ class DiffuGenePipeline:
             expanded_config = expand_variables(temp_config)
             expanded_gen_config = expanded_config['generation']
             
-            # Load existing latents
-            latents = torch.load(latents_path, map_location='cpu')
-            logger.info(f"Loaded latents: {latents.shape}")
+            # Load existing latents (handle batch files)
+            batch_files = get_batch_files(latents_path)
+            logger.info(f"Found {len(batch_files)} batch files to decode")
+            
+            all_latents = []
+            for batch_file in batch_files:
+                batch_data = torch.load(batch_file, map_location='cpu')
+                all_latents.append(batch_data)
+                logger.info(f"Loaded batch from {batch_file}: {batch_data.shape}")
+            
+            latents = torch.cat(all_latents, dim=0)
+            logger.info(f"Combined latents: {latents.shape}")
             
             # Load VAE model with expanded path
             vae_model_path = expanded_gen_config['vae_model_path']
@@ -1476,7 +1513,6 @@ class DiffuGenePipeline:
         logger.info("\n" + "=" * 60)
         logger.info("PIPELINE COMPLETED SUCCESSFULLY!")
         logger.info("=" * 60)
-
 
 def main():
     """Main entry point for the pipeline."""

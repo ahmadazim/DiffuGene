@@ -33,7 +33,9 @@ def load_covariate_file(covariate_path: str) -> pd.DataFrame:
         raise FileNotFoundError(f"Covariate file not found: {covariate_path}")
     
     logger.info(f"Loading covariate file: {covariate_path}")
-    df = pd.read_csv(covariate_path)
+    # Specify common missing value representations
+    na_values = ['NA', 'N/A', 'NULL', 'null', 'NaN', 'nan', '', ' ', '.', 'missing', 'Missing', 'MISSING']
+    df = pd.read_csv(covariate_path, na_values=na_values, keep_default_na=True)
     
     # Validate required columns
     required_cols = ['fid', 'iid']
@@ -42,6 +44,22 @@ def load_covariate_file(covariate_path: str) -> pd.DataFrame:
         raise ValueError(f"Missing required columns in covariate file: {missing_cols}")
     
     logger.info(f"Loaded covariates: {df.shape[0]} individuals, {df.shape[1]-2} covariates")
+    
+    # Log missing value statistics
+    covariate_cols = [col for col in df.columns if col not in ['fid', 'iid']]
+    missing_stats = df[covariate_cols].isnull().sum()
+    n_cols_with_missing = (missing_stats > 0).sum()
+    
+    if n_cols_with_missing > 0:
+        logger.info(f"Missing value statistics: {n_cols_with_missing}/{len(covariate_cols)} columns have missing values")
+        # Log the top 10 columns with most missing values
+        top_missing = missing_stats[missing_stats > 0].sort_values(ascending=False).head(10)
+        for col, count in top_missing.items():
+            pct = count / len(df) * 100
+            logger.info(f"  {col}: {count} missing ({pct:.1f}%)")
+    else:
+        logger.info("No missing values detected in covariate file")
+    
     return df
 
 def load_fam_file(fam_path: str) -> pd.DataFrame:
@@ -135,47 +153,64 @@ def match_covariates_to_fam(covariate_df: pd.DataFrame,
     # Extract covariate matrix
     covariate_matrix = merged[covariate_cols].values.astype(float)
     
-    # Handle missing values by variable type
-    if n_missing > 0:
-        logger.info("Filling missing values by variable type...")
+    # Always check for and handle missing values in each column
+    logger.info("Checking and filling missing values by variable type...")
+    
+    for i, col in enumerate(covariate_cols):
+        col_data = covariate_matrix[:, i]
+        missing_mask = np.isnan(col_data)
+        n_missing_col = missing_mask.sum()
         
-        for i, col in enumerate(covariate_cols):
-            col_data = covariate_matrix[:, i]
-            missing_mask = np.isnan(col_data)
-            n_missing_col = missing_mask.sum()
+        if n_missing_col == 0:
+            logger.info(f"  '{col}': no missing values")
+            continue
+        
+        logger.info(f"  '{col}': found {n_missing_col} missing values ({n_missing_col/len(col_data)*100:.1f}%)")
             
-            if n_missing_col == 0:
-                continue
-                
-            if col in binary_cols:
-                # Binary variables: fill with 0
-                covariate_matrix[missing_mask, i] = 0.0
-                logger.info(f"  Binary '{col}': filled {n_missing_col} missing values with 0")
-                
-            elif col in categorical_cols:
-                # Categorical variables: fill with mode
-                if missing_mask.sum() < len(col_data):  # If not all missing
-                    mode_val = pd.Series(col_data[~missing_mask]).mode()
-                    if len(mode_val) > 0:
-                        fill_val = mode_val.iloc[0]
-                    else:
-                        fill_val = 0.0  # Fallback if mode calculation fails
+        if col in binary_cols:
+            # Binary variables: fill with 0
+            covariate_matrix[missing_mask, i] = 0.0
+            logger.info(f"    Binary '{col}': filled {n_missing_col} missing values with 0")
+            
+        elif col in categorical_cols:
+            # Categorical variables: fill with mode
+            if missing_mask.sum() < len(col_data):  # If not all missing
+                mode_val = pd.Series(col_data[~missing_mask]).mode()
+                if len(mode_val) > 0:
+                    fill_val = mode_val.iloc[0]
                 else:
-                    fill_val = 0.0  # If all missing, use 0
-                covariate_matrix[missing_mask, i] = fill_val
-                logger.info(f"  Categorical '{col}': filled {n_missing_col} missing values with mode {fill_val}")
-                
+                    fill_val = 0.0  # Fallback if mode calculation fails
             else:
-                # Quantitative variables: fill with mean
-                if missing_mask.sum() < len(col_data):  # If not all missing
-                    mean_val = np.nanmean(col_data)
-                else:
-                    mean_val = 0.0  # If all missing, use 0
-                covariate_matrix[missing_mask, i] = mean_val
-                logger.info(f"  Quantitative '{col}': filled {n_missing_col} missing values with mean {mean_val:.3f}")
+                fill_val = 0.0  # If all missing, use 0
+            covariate_matrix[missing_mask, i] = fill_val
+            logger.info(f"    Categorical '{col}': filled {n_missing_col} missing values with mode {fill_val}")
+            
+        else:
+            # Quantitative variables: fill with mean
+            if missing_mask.sum() < len(col_data):  # If not all missing
+                mean_val = np.nanmean(col_data)
+                if np.isnan(mean_val):  # Double-check if mean calculation failed
+                    mean_val = 0.0
+                    logger.warning(f"    Mean calculation failed for '{col}', using 0.0")
+            else:
+                mean_val = 0.0  # If all missing, use 0
+            covariate_matrix[missing_mask, i] = mean_val
+            logger.info(f"    Quantitative '{col}': filled {n_missing_col} missing values with mean {mean_val:.3f}")
     
     # Convert to float32 for model compatibility
     covariate_matrix = covariate_matrix.astype(np.float32)
+    
+    # Verify no NaN values remain after imputation
+    final_nan_count = np.isnan(covariate_matrix).sum()
+    if final_nan_count > 0:
+        logger.error(f"ERROR: {final_nan_count} NaN values remain after imputation!")
+        # Log which columns still have NaN values
+        for i, col in enumerate(covariate_cols):
+            col_nans = np.isnan(covariate_matrix[:, i]).sum()
+            if col_nans > 0:
+                logger.error(f"  Column '{col}': {col_nans} NaN values remaining")
+    else:
+        logger.info("Imputation successful: no NaN values remain in covariate matrix")
     
     logger.info(f"Final covariate matrix shape: {covariate_matrix.shape}")
     logger.info(f"Covariate names: {covariate_cols}")

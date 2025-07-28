@@ -1,58 +1,98 @@
 #!/bin/bash
+#SBATCH -p gpu_test,gpu,gpu_requeue
+#SBATCH --gres=gpu:1
+#SBATCH --mem=200G
+#SBATCH -t 01:00:00
+#SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_UKB_encode_%j.out
+#SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_UKB_encode_%j.err
 
-# Set paths
-BASENAME="all_hm3_45k"
-PLINK_DIR="/n/home03/ahmadazim/WORKING/pilotMME/genomic_data/indiv45k/"
-CHR=22
+conda init
+eval "$(conda shell.bash hook)"
+conda activate boltz1
+module load cuda/12.4.1-fasrc01
+module load cudnn/9.5.1.17_cuda12-fasrc01
+module load R gcc cmake
+nvidia-smi
 
-# Set paths to pre-trained models
-diffdir="/n/home03/ahmadazim/WORKING/genGen/DiffuGene/"
-BLOCK_FILE="${diffdir}data/haploblocks/all_hm3_15k_chr22_blocks.blocks.det"
-PCA_LOADINGS_DIR="${diffdir}data/haploblocks_embeddings_4PC/loadings/"
-VAE_MODEL="${diffdir}models/joint_embed/vae_model_4PCscale.pt"
+# # Set paths
+# PLINK_DIR="/n/home03/ahmadazim/WORKING/genGen/UKB/genomic_data/geneticBinary/"
+# BED_BASENAME="ukb_allchr_unrel_britishWhite"
+# FAM_BASENAME="ukb_allchr_unrel_britishWhite_conditional_diffusion_train"
+# CHROMOSOMES="all"
 
-# Output path
-OUTPUT_DIR="${diffdir}data/VAE_embeddings/"
-OUTPUT_FILE="${OUTPUT_DIR}${BASENAME}_chr${CHR}_VAE_latents_4PCscale.pt"
-WORK_DIR="${diffdir}data/work_encode/"
+# # Set paths to pre-trained models
+# diffdir="/n/home03/ahmadazim/WORKING/genGen/DiffuGene/"
 
-# Model parameters
-PCA_K=4
-GRID_H=16
-GRID_W=16
-BLOCK_DIM=4
-POS_DIM=16
-LATENT_CHANNELS=32
+# # PCA embeddings directory (contains loadings/, means/, metadata/ subdirs)
+# PCA_EMBEDDINGS_DIR="${diffdir}../UKB/genomic_data/haploblocks_embeddings/"
 
-echo "Encoding genetic data: ${BASENAME}"
-echo "Chromosome: ${CHR}"
-echo "Output: ${OUTPUT_FILE}"
-echo "Starting encoding at $(date)"
+# # Trained VAE model 
+# VAE_MODEL="${diffdir}../UKB/models/joint_embed/VAE_unrelWhite_allchr_4PC_64z_checkpoint_400.pt"
 
-python ${diffdir}scripts/encode_genetic_data.py \
-    --basename ${BASENAME} \
-    --genetic-binary-folder ${PLINK_DIR} \
-    --chromosome ${CHR} \
-    --block-file ${BLOCK_FILE} \
-    --pca-loadings-dir ${PCA_LOADINGS_DIR} \
-    --vae-model-path ${VAE_MODEL} \
-    --output-path ${OUTPUT_FILE} \
-    --work-dir ${WORK_DIR} \
-    --pca-k ${PCA_K} \
-    --grid-h ${GRID_H} \
-    --grid-w ${GRID_W} \
-    --block-dim ${BLOCK_DIM} \
-    --pos-dim ${POS_DIM} \
-    --latent-channels ${LATENT_CHANNELS} 
+# # Output path
+# OUTPUT_DIR="${diffdir}../UKB/genomic_data/VAE_embeddings/"
+# OUTPUT_FILE="${OUTPUT_DIR}${FAM_BASENAME}_VAE_latents_4PC_64z_checkpoint_200.pt"
+# WORK_DIR="${diffdir}../UKB/genomic_data/work_encode/"
 
-echo "Script completed at $(date)"
+# # Model parameters (matching trained model)
+# PCA_K=4
+# GRID_H=64
+# GRID_W=64
+# POS_DIM=16
+# LATENT_CHANNELS=128
 
-# Optionally decode latents to get back to original space
-python ${diffdir}src/DiffuGene/joint_embed/decode_vae_latents.py \
-    --latents-file ${OUTPUT_FILE} \
-    --model-file ${VAE_MODEL} \
-    --embeddings-dir ${diffdir}data/haploblocks_embeddings_4PC/ \
-    --spans-file ${WORK_DIR}encoding_${BASENAME}_chr${CHR}/${BASENAME}_chr${CHR}_blocks_4PC_inference.csv \
-    --output-file ${OUTPUT_DIR}${BASENAME}_chr${CHR}_VAE_decoded_4PCscale.pt \
-    --batch-size 256 \
-    --chromosome ${CHR}
+# echo "Encoding genetic data: ${FAM_BASENAME}"
+# echo "Chromosomes: ${CHROMOSOMES} (auto-discovery mode)"
+# echo "Output: ${OUTPUT_FILE}"
+# echo "Starting encoding at $(date)"
+
+# # Create output directory
+# mkdir -p ${OUTPUT_DIR}
+
+# python ${diffdir}scripts/encode_genetic_data.py \
+#     --global-bfile ${PLINK_DIR}/${BED_BASENAME} \
+#     --keep-fam-file ${PLINK_DIR}/${FAM_BASENAME}.fam \
+#     --chromosomes ${CHROMOSOMES} \
+#     --pca-embeddings-dir ${PCA_EMBEDDINGS_DIR} \
+#     --vae-model-path ${VAE_MODEL} \
+#     --output-path ${OUTPUT_FILE} \
+#     --work-dir ${WORK_DIR} \
+#     --pca-k ${PCA_K} \
+#     --grid-h ${GRID_H} \
+#     --grid-w ${GRID_W} \
+#     --pos-dim ${POS_DIM} \
+#     --latent-channels ${LATENT_CHANNELS}
+
+# echo "Script completed at $(date)"
+
+# # Optional: Decode latents to get back to original space (if needed for validation)
+# if [ "$1" = "--decode" ]; then
+#     echo "Decoding latents back to SNP space..."
+    
+#     python ${diffdir}src/DiffuGene/joint_embed/decode_vae_latents.py \
+#         --latents-file ${OUTPUT_FILE} \
+#         --model-file ${VAE_MODEL} \
+#         --embeddings-dir ${PCA_EMBEDDINGS_DIR} \
+#         --spans-file ${WORK_DIR}encoding_${BASENAME}/${BASENAME}_blocks_4PC_inference.csv \
+#         --output-file ${OUTPUT_DIR}${BASENAME}_all_chr_VAE_decoded_4PCscale.pt \
+#         --batch-size 256
+        
+#     echo "Decoding completed at $(date)"
+# fi
+
+# echo "All operations completed successfully!"
+
+wd=/n/home03/ahmadazim/WORKING/genGen/UKB/
+cd ${wd}../DiffuGene/src/
+
+python -m DiffuGene.joint_embed.infer \
+    --model-path ${wd}models/joint_embed/VAE_unrelWhite_allchr_4PC_64z.pt \
+    --spans-file ${wd}genomic_data/work_encode/encoding_ukb_allchr_unrel_britishWhite_conditional_diffusion_train/ukb_allchr_unrel_britishWhite_conditional_diffusion_train_blocks_4PC_inference.csv \
+    --recoded-dir ${wd}genomic_data/work_encode/encoding_ukb_allchr_unrel_britishWhite_conditional_diffusion_train/recoded_blocks/ \
+    --embeddings-dir ${wd}genomic_data/work_encode/encoding_ukb_allchr_unrel_britishWhite_conditional_diffusion_train/embeddings/ \
+    --output-path ${wd}genomic_data/VAE_embeddings/ukb_allchr_unrel_britishWhite_conditional_diffusion_train_VAE_latents_4PC_64z.pt \
+    --grid-h 64 \
+    --grid-w 64 \
+    --block-dim 4 \
+    --pos-dim 16 \
+    --latent-channels 128

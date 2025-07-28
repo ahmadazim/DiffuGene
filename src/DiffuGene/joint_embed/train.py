@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import pandas as pd
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from ..utils import setup_logging, get_logger
 from ..block_embed import PCA_Block, load_pca_blocks
@@ -90,8 +91,9 @@ def evaluate_model(model, dataset, batch_size, snp_loader):
         dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=1,
-        pin_memory=True
+        num_workers=16,
+        pin_memory=True,
+        prefetch_factor=2
     )
     
     with torch.no_grad():
@@ -194,9 +196,11 @@ def train(args):
         pos_emb_dim     = args.pos_dim,
         latent_channels = args.latent_channels
     ).to(device)
-    
+
     embedding_mask = create_embedding_masks_from_metadata(pca_metadata, args.block_dim, device=device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
+    scaler = torch.GradScaler('cuda')
     
     # Load initial checkpoint if specified
     start_epoch = 1
@@ -222,7 +226,7 @@ def train(args):
     kld_weight = args.kld_weight
     lambda_mse = args.decoded_mse_weight
     warmup_epochs = getattr(args, 'snp_start_epoch', 0)
-    snp_blocks_per_batch = getattr(args, 'snp_blocks_per_batch', 512)
+    snp_blocks_per_batch = getattr(args, 'snp_blocks_per_batch', 64)
     snp_loader = None
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -235,9 +239,13 @@ def train(args):
             dataset, 
             batch_size=args.batch_size, 
             shuffle=True,
-            num_workers=1,
-            pin_memory=True
+            num_workers=16,
+            pin_memory=True, 
+            prefetch_factor=2
         )
+        
+        eval_freq = getattr(args, 'eval_frequency', 50)
+        flush_every = 100 # flush cache every 100 batches
         
         model.train()
         total_recon = 0.0
@@ -245,50 +253,65 @@ def train(args):
         if use_snp_loss:
             total_snp_mse = 0.0
         total_samples = 0
+        batch_idx = 0
 
         for batch_data in tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}"):
             emb, spans, sample_indices = batch_data
             emb = emb.float().to(device)
             spans = spans.float().to(device)
             
-            # Forward pass
-            recon_emb, dist = model(emb, spans)
+            # # Forward pass
+            # recon_emb, dist = model(emb, spans)
             
-            # Losses
-            recon_loss = masked_mse_loss(recon_emb, emb, embedding_mask)
-            kld_loss = dist.kl().mean()
-            loss = recon_loss + kld_weight * kld_loss
+            # # Losses
+            # recon_loss = masked_mse_loss(recon_emb, emb, embedding_mask)
+            # kld_loss = dist.kl().mean()
+            # loss = recon_loss + kld_weight * kld_loss
             
-            if use_snp_loss:
-                recon_emb_unscaled = unscale_embeddings(recon_emb, dataset.pc_means, dataset.pc_scales)
-                block_indices, true_snps = snp_loader.load_snps_for_batch(sample_indices, device)
-                pred_snps = snp_loader.decode_predictions(recon_emb_unscaled, block_indices, device)
-                decoded_mse_values = []
-                for i, (pred, true) in enumerate(zip(pred_snps, true_snps)):
-                    block_idx = block_indices[i]
-                    try:
-                        mse = F.mse_loss(pred, true)
-                        decoded_mse_values.append(mse)
-                    except RuntimeError as e:
-                        logger.error(f"SNP shape mismatch at block {block_idx}:")
-                        logger.error(f"  Predicted SNPs shape: {pred.shape}")
-                        logger.error(f"  True SNPs shape: {true.shape}")
-                        logger.error(f"  Error: {e}")
-                        if hasattr(snp_loader, 'block_info') and block_idx < len(snp_loader.block_info):
-                            chr_num, block_num, block_base = snp_loader.block_info[block_idx]
-                            logger.error(f"  Block info: chr{chr_num}_block{block_num} ({block_base})")
-                        raise
-                decoded_mse = sum(decoded_mse_values) / len(decoded_mse_values)
-                lambda_snp = lambda_mse
-                if epoch <= warmup_epochs + 50:
-                    lambda_snp *= (epoch - warmup_epochs) / 50
-                loss += lambda_snp * decoded_mse
-                total_snp_mse += decoded_mse.item()
+            # FORWARD & LOSS IN AUTOCAST
+            with torch.autocast('cuda'):
+                recon_emb, dist = model(emb, spans)
+                recon_loss = masked_mse_loss(recon_emb, emb, embedding_mask)
+                kld_loss = dist.kl().mean()
+                loss = recon_loss + kld_weight * kld_loss
+            
+                if use_snp_loss:
+                    recon_emb_unscaled = unscale_embeddings(recon_emb, dataset.pc_means, dataset.pc_scales)
+                    block_indices, true_snps = snp_loader.load_snps_for_batch(sample_indices, device)
+                    pred_snps = snp_loader.decode_predictions(recon_emb_unscaled, block_indices, device)
+                    decoded_mse_values = []
+                    for i, (pred, true) in enumerate(zip(pred_snps, true_snps)):
+                        block_idx = block_indices[i]
+                        try:
+                            mse = F.mse_loss(pred, true)
+                            decoded_mse_values.append(mse)
+                        except RuntimeError as e:
+                            logger.error(f"SNP shape mismatch at block {block_idx}:")
+                            logger.error(f"  Predicted SNPs shape: {pred.shape}")
+                            logger.error(f"  True SNPs shape: {true.shape}")
+                            logger.error(f"  Error: {e}")
+                            if hasattr(snp_loader, 'block_info') and block_idx < len(snp_loader.block_info):
+                                chr_num, block_num, block_base = snp_loader.block_info[block_idx]
+                                logger.error(f"  Block info: chr{chr_num}_block{block_num} ({block_base})")
+                            raise
+                    decoded_mse = sum(decoded_mse_values) / len(decoded_mse_values)
+                    lambda_snp = lambda_mse
+                    if epoch <= warmup_epochs + 50:
+                        lambda_snp *= (epoch - warmup_epochs) / 50
+                    loss += lambda_snp * decoded_mse
+                    total_snp_mse += decoded_mse.item()
             
             # Backward pass
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # loss.backward()
+            # optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            if batch_idx % flush_every == 0:
+                torch.cuda.empty_cache()
+            batch_idx += 1
             
             # Accumulate metrics
             bs = emb.size(0)
@@ -305,15 +328,18 @@ def train(args):
         if use_snp_loss:
             avg_snp_mse = total_snp_mse / len(loader)
             lambda_snp = lambda_mse * (epoch - warmup_epochs) / 50 if epoch <= warmup_epochs + 50 else lambda_mse
-            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | SNP_MSE={avg_snp_mse:.4f} | λ_SNP={lambda_snp:.2e} | KLD_weight={kld_weight:.2e} | LR={args.lr:.2e}")
+            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | SNP_MSE={avg_snp_mse:.4f} | λ_SNP={lambda_snp:.2e} | KLD_weight={kld_weight:.2e} | LR={scheduler.get_last_lr()[0]:.2e}")
         else:
-            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | KLD_weight={kld_weight:.2e} | LR={args.lr:.2e}")
+            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | KLD_weight={kld_weight:.2e} | LR={scheduler.get_last_lr()[0]:.2e}")
             
         if epoch == warmup_epochs + 1:
             logger.info(f">>> TRANSITION: Starting SNP loss phase at epoch {epoch} <<<")
         
-        eval_freq = getattr(args, 'eval_frequency', 50)
-        if epoch % eval_freq == 0 or epoch == args.epochs:
+        torch.cuda.empty_cache()
+        scheduler.step()
+
+        # Evaluate and save checkpoint
+        if (epoch % eval_freq == 0 or epoch == args.epochs):
             if snp_loader is None:
                 logger.info("Creating SNP loader for evaluation")
                 snp_loader = SNPLoader(dataset, snp_blocks_per_batch, pca_metadata=pca_metadata)
@@ -323,10 +349,10 @@ def train(args):
             # Save checkpoint that replaces the previous one (not accumulating)
             model_dir = os.path.dirname(args.model_save_path)
             model_name = os.path.splitext(os.path.basename(args.model_save_path))[0]
-            checkpoint_path = os.path.join(model_dir, f"{model_name}_checkpoint.pt")
-            if os.path.exists(checkpoint_path):
-                os.remove(checkpoint_path)
-                logger.info(f"Replaced previous checkpoint")
+            checkpoint_path = os.path.join(model_dir, f"{model_name}_checkpoint_{epoch}.pt")
+            # if os.path.exists(checkpoint_path):
+            #     os.remove(checkpoint_path)
+            #     logger.info(f"Replaced previous checkpoint")
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -336,7 +362,7 @@ def train(args):
             }
             os.makedirs(model_dir, exist_ok=True)
             torch.save(checkpoint, checkpoint_path)
-            logger.info(f"Checkpoint saved: {checkpoint_path} (epoch {epoch})")
+            logger.info(f"Checkpoint saved: {checkpoint_path} at epoch {epoch}")
 
     # Save final model with config
     os.makedirs(os.path.dirname(args.model_save_path), exist_ok=True)
@@ -404,6 +430,7 @@ def main():
     parser.add_argument("--scale-pc-embeddings", action="store_true", help="Standardize PC embeddings across samples/blocks before VAE training")
     
     args = parser.parse_args()
+    
     train(args)
 
 if __name__ == "__main__":
