@@ -578,6 +578,8 @@ def generate(args):
         )
         covariates = covariates.cuda()
     
+    guidance_scale = args.guidance_scale
+
     # Generate samples
     logger.info(f"Generating {args.num_samples} samples...")
     all_samples = []
@@ -597,8 +599,26 @@ def generate(args):
         with torch.no_grad():
             for t in tqdm(scheduler.timesteps, desc=f"Denoising batch {i//args.batch_size + 1}"):
                 # Model prediction - conditional or unconditional
+                # if is_conditional:
+                #     noise_pred = model(latents, t.expand(batch_size), batch_covariates)
+                # else:
+                #     noise_pred = model(latents, t.expand(batch_size))
                 if is_conditional:
-                    noise_pred = model(latents, t.expand(batch_size), batch_covariates)
+                    B = latents.size(0)
+                    e_cond = model.cond_emb(batch_covariates).unsqueeze(1)  # (B,1,256)
+                    e_null = model.null_cond_emb.unsqueeze(0).expand(B,1,256)
+
+                    # double batch
+                    x_in   = torch.cat([latents,      latents],      dim=0)
+                    t_in   = torch.cat([t.expand(B),  t.expand(B)],  dim=0)
+                    emb_in = torch.cat([e_null,       e_cond],        dim=0)
+
+                    h_all    = model.input_proj(x_in)
+                    eps_all  = model.unet(h_all, t_in, encoder_hidden_states=emb_in).sample
+                    eps0, eps1 = eps_all.chunk(2, dim=0)
+
+                    # CFG mix
+                    noise_pred = eps0 + guidance_scale * (eps1 - eps0)
                 else:
                     noise_pred = model(latents, t.expand(batch_size))
                 
@@ -685,6 +705,7 @@ def main():
     parser.add_argument("--covariate-file", type=str, help="Path to covariate CSV file (for conditional models)")
     parser.add_argument("--fam-file", type=str, help="Path to training fam file (for conditional models)")
     parser.add_argument("--random-seed", type=int, help="Random seed for reproducible sampling")
+    parser.add_argument("--guidance-scale", type=float, default=5, help="CFG scale (how strongly to apply covariates)")
     
     # Decoding arguments
     parser.add_argument("--decode-samples", action="store_true", help="Decode generated samples to SNP space")

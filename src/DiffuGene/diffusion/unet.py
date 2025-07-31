@@ -29,6 +29,9 @@ class LatentUNET2D(nn.Module):
             nn.SiLU(),
             nn.Linear(256, 256),
         )
+        
+        # Learnable null condition embedding for classifier-free guidance
+        self.null_cond_emb = nn.Parameter(torch.randn(1, 256))
 
         self.unet = UNet2DConditionModel(
             sample_size=(64, 64),

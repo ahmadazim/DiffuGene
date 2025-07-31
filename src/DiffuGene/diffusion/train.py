@@ -321,7 +321,8 @@ def train(
     fam_file: str = None,
     cond_dim: int = 10,
     binary_cols: List[str] = None,
-    categorical_cols: List[str] = None
+    categorical_cols: List[str] = None, 
+    cfg_drop_prob: float = 0.1
 ):
     setup_logging()
     set_seed(random.randint(0, 2**32-1)) if seed == -1 else set_seed(seed)
@@ -531,6 +532,9 @@ def train(
             logger.warning(f"Checkpoint path specified but file not found: {checkpoint_path}")
         logger.info("Starting training from scratch")
 
+    # classifier‐free guidance drop rate
+    p_uncond = cfg_drop_prob if conditional else 0.0
+    
     for i in range(num_epochs):
         total_loss = 0
         for bidx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {i+1}/{num_epochs}")):
@@ -558,11 +562,35 @@ def train(
             # Forward pass with mixed precision
             with amp.autocast():
                 if conditional:
-                    output = model(x, t, covariates)
+                    # CFG Training: drop + double-batch approach
+                    B = x.size(0)
+                    
+                    # 1) Embed covariates
+                    e_cond = model.cond_emb(covariates).unsqueeze(1)        # (B,1,256)
+                    e_null = model.null_cond_emb.unsqueeze(0).expand(B,1,256)  # (B,1,256)
+                    
+                    # 2) Randomly drop some examples
+                    mask = (torch.rand(B, device=x.device) < p_uncond)   # (B,)
+                    e_drop = e_cond.clone()
+                    e_drop[mask] = e_null[mask]               # replace those with null
+                    
+                    # 3) Build double-batch
+                    x_in = torch.cat([x, x], dim=0)
+                    t_in = torch.cat([t, t], dim=0)
+                    emb_in = torch.cat([e_drop, e_cond], dim=0)
+                    
+                    # 4) Forward through UNet directly
+                    h = model.input_proj(x_in)  
+                    out = model.unet(h, t_in, encoder_hidden_states=emb_in).sample
+                    out = model.output_proj(out)              # (2B,64,64,64)
+                    
+                    # 5) Split & compute loss
+                    out_uncond, out_cond = out.chunk(2, dim=0)
+                    loss = noise_pred_loss(out_uncond, noise, t, scheduler, simplified_loss=True)
+                    loss += noise_pred_loss(out_cond, noise, t, scheduler, simplified_loss=True)
                 else:
                     output = model(x, t)
-                
-                loss = noise_pred_loss(output, noise, t, scheduler, simplified_loss=True)
+                    loss = noise_pred_loss(output, noise, t, scheduler, simplified_loss=True)
             
             total_loss += loss.item()
             
@@ -633,7 +661,8 @@ def main():
     parser.add_argument("--cond-dim", type=int, default=10, help="Covariate dimension (auto-detected if conditional)")
     parser.add_argument("--binary-cols", type=str, nargs='+', help="List of binary variable column names")
     parser.add_argument("--categorical-cols", type=str, nargs='+', help="List of categorical variable column names")
-    
+    parser.add_argument("--cfg-drop-prob", type=float, default=0.1, help="Drop probability for classifier-free guidance (unconditional branch)")
+
     args = parser.parse_args()
 
     train(
@@ -651,7 +680,8 @@ def main():
         fam_file=args.fam_file,
         cond_dim=args.cond_dim,
         binary_cols=args.binary_cols,
-        categorical_cols=args.categorical_cols
+        categorical_cols=args.categorical_cols, 
+        cfg_drop_prob=args.cfg_drop_prob
     )
 
 if __name__ == "__main__":

@@ -1350,6 +1350,7 @@ class DiffuGenePipeline:
         args.batch_size = int(gen_config['batch_size'])
         args.num_time_steps = int(gen_config['num_time_steps'])
         args.num_inference_steps = int(gen_config['num_inference_steps'])
+        args.guidance_scale = float(gen_config['guidance_scale']) if 'guidance_scale' in gen_config else 5.0
         
         # Add conditional generation settings
         diffusion_conditional_config = self.config['diffusion'].get('conditional', {})
@@ -1564,6 +1565,13 @@ Examples:
         help='Only decode existing latent samples (skips generation if latents exist)'
     )
     
+    parser.add_argument(
+        '--guidance-scale',
+        type=float,
+        default=None,
+        help='CFG guidance scale for generation (default: 5)'
+    )
+
     parser.add_argument(
         '--list-steps',
         action='store_true',
