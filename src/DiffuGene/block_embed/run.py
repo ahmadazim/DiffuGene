@@ -10,7 +10,7 @@ import subprocess
 
 from ..utils import (
     setup_logging, get_logger, load_blocks_for_chr, 
-    create_snplist_files, ensure_dir_exists
+    create_snplist_files, ensure_dir_exists, assign_missing_snps_to_blocks
 )
 
 def calculate_allele_frequencies(args, logger):
@@ -119,6 +119,109 @@ def run_plink_ld_blocks(args, logger):
     
     return block_file
 
+def assign_missing_snps_to_blocks(args, LD_blocks, logger):
+    """Assign SNPs missing from LD blocks to the nearest block based on position.
+    
+    Args:
+        args: Command line arguments
+        LD_blocks: List of Block namedtuples
+        logger: Logger instance
+    
+    Returns:
+        int: Number of missing SNPs that were assigned
+    """
+    logger.info("Checking for SNPs missing from LD blocks...")
+    
+    # Read BIM file to get all SNPs with positions
+    global_bfile = getattr(args, 'global_bfile', f"{args.genetic_binary_folder}/{args.basename}")
+    bim_file = f"{global_bfile}.bim"
+    
+    if not os.path.exists(bim_file):
+        logger.warning(f"BIM file not found: {bim_file}. Skipping missing SNP assignment.")
+        return 0
+    
+    # Read BIM file
+    bim_df = pd.read_csv(bim_file, sep='\t', header=None, 
+                         names=['chr', 'snp', 'cm', 'pos', 'a1', 'a2'])
+    
+    # Filter for current chromosome
+    chr_bim = bim_df[bim_df['chr'] == args.chrNo].copy()
+    logger.info(f"Found {len(chr_bim)} SNPs in chromosome {args.chrNo}")
+    
+    # Collect all SNPs already in blocks
+    snps_in_blocks = set()
+    for block in LD_blocks:
+        snps_in_blocks.update(block.snps)
+    
+    # Find missing SNPs
+    all_snps = set(chr_bim['snp'])
+    missing_snps = all_snps - snps_in_blocks
+    
+    if not missing_snps:
+        logger.info("All SNPs are already assigned to blocks.")
+        return 0
+    
+    logger.info(f"Found {len(missing_snps)} SNPs not assigned to any block")
+    
+    # For each missing SNP, find the nearest block
+    missing_df = chr_bim[chr_bim['snp'].isin(missing_snps)].copy()
+    
+    # Create a mapping of missing SNPs to their nearest blocks
+    snp_to_block = {}
+    
+    for _, snp_row in missing_df.iterrows():
+        snp_pos = snp_row['pos']
+        snp_name = snp_row['snp']
+        
+        # Find the nearest block
+        min_distance = float('inf')
+        nearest_block_idx = 0
+        
+        for idx, block in enumerate(LD_blocks):
+            # Calculate distance to block boundaries
+            if snp_pos < block.bp1:
+                distance = block.bp1 - snp_pos
+            elif snp_pos > block.bp2:
+                distance = snp_pos - block.bp2
+            else:
+                # SNP is within block boundaries but not included
+                distance = 0
+            
+            if distance < min_distance:
+                min_distance = distance
+                nearest_block_idx = idx
+        
+        snp_to_block[snp_name] = nearest_block_idx
+    
+    # Update snplist files
+    blocks_updated = set()
+    for snp, block_idx in snp_to_block.items():
+        blocks_updated.add(block_idx)
+        
+        # Append SNP to the appropriate snplist file
+        snplist_file = os.path.join(
+            args.snplist_folder,
+            f"{args.basename}_chr{args.chrNo}_block{block_idx + 1}.snplist"
+        )
+        
+        with open(snplist_file, 'a') as f:
+            f.write(f"{snp}\n")
+    
+    logger.info(f"Assigned {len(missing_snps)} missing SNPs to {len(blocks_updated)} blocks")
+    
+    # Log some statistics about the assignments
+    if blocks_updated:
+        block_counts = {}
+        for block_idx in snp_to_block.values():
+            block_counts[block_idx] = block_counts.get(block_idx, 0) + 1
+        
+        max_added = max(block_counts.values())
+        avg_added = sum(block_counts.values()) / len(block_counts)
+        logger.info(f"Average SNPs added per updated block: {avg_added:.1f}, Maximum: {max_added}")
+    
+    return len(missing_snps)
+
+
 def recode_blocks(args, snpfiles, logger):
     """Recode individual blocks using PLINK."""
     ensure_dir_exists(args.recoded_block_folder)
@@ -175,6 +278,9 @@ def main(args):
     
     ensure_dir_exists(args.snplist_folder)
     create_snplist_files(LD_blocks, args.snplist_folder, args.basename, args.chrNo)
+    
+    # Step 2.5: Assign missing SNPs to nearest LD blocks
+    missing_count = assign_missing_snps_to_blocks(args, LD_blocks, logger)
     
     # Step 3: Recode individual blocks
     pattern = f"{args.snplist_folder}/{args.basename}_chr{args.chrNo}_block*.snplist"
