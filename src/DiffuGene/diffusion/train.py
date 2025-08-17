@@ -568,6 +568,9 @@ def train(
                     # 1) Embed covariates
                     e_cond = model.cond_emb(covariates).unsqueeze(1)        # (B,1,256)
                     e_null = model.null_cond_emb.unsqueeze(0).expand(B,1,256)  # (B,1,256)
+                    # Ensure dtype match for masked assignment under AMP
+                    if e_null.dtype != e_cond.dtype:
+                        e_null = e_null.to(dtype=e_cond.dtype)
                     
                     # 2) Randomly drop some examples
                     mask = (torch.rand(B, device=x.device) < p_uncond)   # (B,)
@@ -602,9 +605,10 @@ def train(
             ema.update(model)
             
             # Clean up
-            del x, x_clean, noise, output, loss, t
             if conditional:
-                del covariates
+                del x, x_clean, noise, out, loss, t, covariates
+            else:
+                del x, x_clean, noise, output, loss, t
             
         dataset_size = len(train_loader.dataset)
         current_lr = optimizer.param_groups[0]['lr']

@@ -37,7 +37,8 @@ from DiffuGene.joint_embed.precompute_embeddings import precompute_embeddings
 logger = get_logger(__name__)
 
 def run_plink_recode_blocks(plink_basename, genetic_binary_folder, chromosomes, 
-                           block_files, output_dir, snplist_folder, keep_fam_file=None, global_bfile=None):
+                           block_files, output_dir, snplist_folder, keep_fam_file=None, global_bfile=None,
+                           training_snplist_dir=None, training_basename=None, training_bim_file=None):
     """Recode genetic blocks using PLINK with EXACT same approach as training."""
     logger.info(f"Recoding blocks for chromosomes {chromosomes} using exact same SNPs as training data...")
     
@@ -68,8 +69,17 @@ def run_plink_recode_blocks(plink_basename, genetic_binary_folder, chromosomes,
             continue
             
         # Load existing LD blocks (includes SNP IDs)
-        LD_blocks = load_blocks_for_chr(block_file, chromosome)
-        logger.info(f"Chr{chromosome}: Loaded {len(LD_blocks)} LD blocks from {block_file}")
+        # Use training snplist files if available for exact SNP matching
+        if training_snplist_dir and training_basename:
+            logger.info(f"Chr{chromosome}: Using training snplist files from {training_snplist_dir} with basename {training_basename}")
+        else:
+            logger.info(f"Chr{chromosome}: Using original block file {block_file}")
+            
+        LD_blocks = load_blocks_for_chr(block_file, chromosome, training_snplist_dir, training_basename, training_bim_file)
+        
+        # Log SNP counts per block to verify we're getting the right data
+        total_snps = sum(len(block.snps) for block in LD_blocks)
+        logger.info(f"Chr{chromosome}: Loaded {len(LD_blocks)} LD blocks with {total_snps} total SNPs")
         
         # Create SNP list files using the EXACT same function as training
         chr_snplist_folder = os.path.join(snplist_folder, f"chr{chromosome}")
@@ -373,7 +383,10 @@ def encode_genetic_data(args):
         output_dir=recoded_dir,
         snplist_folder=snplist_dir,
         keep_fam_file=getattr(args, 'keep_fam_file', None),
-        global_bfile=getattr(args, 'global_bfile', None)
+        global_bfile=getattr(args, 'global_bfile', None),
+        training_snplist_dir=getattr(args, 'training_snplist_dir', None),
+        training_basename=getattr(args, 'training_basename', None),
+        training_bim_file=getattr(args, 'training_bim_file', None)
     )
     
     if not recoded_files:
@@ -513,11 +526,13 @@ Examples:
     --vae-model-path /path/to/trained_vae.pt \\
     --output-path /path/to/output_latents.pt
     
-  # All available chromosomes (auto-discovery)
+  # All available chromosomes (auto-discovery) with training SNP lists
   python encode_genetic_data.py \\
     --basename mydata \\
     --genetic-binary-folder /path/to/plink/files \\
     --chromosomes "all" \\
+    --training-snplist-dir /path/to/haploblocks_snps \\
+    --training-basename training_basename \\
     --pca-embeddings-dir /path/to/pca_embeddings \\
     --vae-model-path /path/to/trained_vae.pt \\
     --output-path /path/to/output_latents.pt
@@ -531,12 +546,14 @@ Examples:
     --vae-model-path /path/to/trained_vae.pt \\
     --output-path /path/to/output_latents.pt
     
-  # Multi-dataset mode with explicit basename
+  # Multi-dataset mode with explicit basename and training SNP lists
   python encode_genetic_data.py \\
     --basename custom_name \\
     --global-bfile /path/to/full/dataset \\
     --keep-fam-file /path/to/subset.fam \\
     --chromosomes "all" \\
+    --training-snplist-dir /path/to/haploblocks_snps \\
+    --training-basename training_basename \\
     --pca-embeddings-dir /path/to/pca_embeddings \\
     --vae-model-path /path/to/trained_vae.pt \\
     --output-path /path/to/output_latents.pt
@@ -558,6 +575,12 @@ Examples:
     # Pre-trained model arguments
     parser.add_argument("--block-files", type=str, required=False, default='auto',
                        help="Comma-separated list of LD block definition files (.blocks.det) from training, one per chromosome. Use 'auto' to auto-discover (default when chromosomes='all')")
+    parser.add_argument("--training-snplist-dir", type=str, required=False,
+                       help="Directory containing training snplist files (e.g., haploblocks_snps) to use exact SNPs from training. If not provided, uses original block files.")
+    parser.add_argument("--training-basename", type=str, required=False,
+                       help="Basename used during training for snplist files (required if --training-snplist-dir is used)")
+    parser.add_argument("--training-bim-file", type=str, required=False,
+                       help="BIM file to use for SNP position lookup when using training snplist files. If not provided, will try to auto-discover.")
     parser.add_argument("--pca-embeddings-dir", type=str, required=True,
                        help="Directory containing pre-trained PCA embeddings (with loadings/, means/, metadata/ subdirs)")
     parser.add_argument("--vae-model-path", type=str, required=True,
@@ -630,6 +653,14 @@ Examples:
     if args.keep_fam_file:
         if not os.path.exists(args.keep_fam_file):
             parser.error(f"Keep fam file not found: {args.keep_fam_file}")
+    
+    # Validate training snplist arguments
+    if args.training_snplist_dir and not args.training_basename:
+        parser.error("--training-basename is required when --training-snplist-dir is provided")
+    if args.training_snplist_dir and not os.path.exists(args.training_snplist_dir):
+        parser.error(f"Training snplist directory not found: {args.training_snplist_dir}")
+    if args.training_bim_file and not os.path.exists(args.training_bim_file):
+        parser.error(f"Training BIM file not found: {args.training_bim_file}")
     
     if not os.path.exists(args.pca_embeddings_dir):
         parser.error(f"PCA embeddings directory not found: {args.pca_embeddings_dir}")

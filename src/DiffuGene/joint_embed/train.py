@@ -214,6 +214,7 @@ def train(args):
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
+            last_checkpoint_path = args.checkpoint_path  # Set for NaN recovery
             logger.info(f"Resumed training from epoch {start_epoch}")
         except Exception as e:
             logger.warning(f"Failed to load checkpoint: {e}. Starting from scratch.")
@@ -221,6 +222,7 @@ def train(args):
         if hasattr(args, 'checkpoint_path') and args.checkpoint_path and args.checkpoint_path.strip():
             logger.warning(f"Checkpoint path specified but file not found: {args.checkpoint_path}")
         logger.info("Starting training from scratch")
+        last_checkpoint_path = None
     
     # Training parameters
     kld_weight = args.kld_weight
@@ -274,6 +276,21 @@ def train(args):
                 recon_loss = masked_mse_loss(recon_emb, emb, embedding_mask)
                 kld_loss = dist.kl().mean()
                 loss = recon_loss + kld_weight * kld_loss
+                
+                # Check for NaN in reconstruction loss and revert to last checkpoint if found
+                if torch.isnan(recon_loss):
+                    logger.warning(f"NaN detected in reconstruction loss at epoch {epoch}, batch {batch_idx}")
+                    if last_checkpoint_path and os.path.exists(last_checkpoint_path):
+                        logger.info(f"Reverting to last checkpoint: {last_checkpoint_path}")
+                        checkpoint = torch.load(last_checkpoint_path, map_location=device)
+                        model.load_state_dict(checkpoint['model_state_dict'])
+                        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                        logger.info("Model and optimizer restored from checkpoint")
+                        torch.cuda.empty_cache()
+                        continue  # Skip this batch and continue with next
+                    else:
+                        logger.error("No checkpoint available for recovery. Stopping training.")
+                        raise RuntimeError("NaN detected in loss but no checkpoint available for recovery")
             
                 if use_snp_loss:
                     recon_emb_unscaled = unscale_embeddings(recon_emb, dataset.pc_means, dataset.pc_scales)
@@ -346,7 +363,7 @@ def train(args):
             eval_metrics = evaluate_model(model, dataset, args.batch_size, snp_loader)
             logger.info(f">>> Eval @ epoch {epoch}: SNP_MSE={eval_metrics['mse']:.4f} | SNP_Acc={eval_metrics['accuracy']:.4f}")
             
-            # Save checkpoint that replaces the previous one (not accumulating)
+            # Save checkpoint 
             model_dir = os.path.dirname(args.model_save_path)
             model_name = os.path.splitext(os.path.basename(args.model_save_path))[0]
             checkpoint_path = os.path.join(model_dir, f"{model_name}_checkpoint_{epoch}.pt")
@@ -362,6 +379,7 @@ def train(args):
             }
             os.makedirs(model_dir, exist_ok=True)
             torch.save(checkpoint, checkpoint_path)
+            last_checkpoint_path = checkpoint_path  # Update for NaN recovery
             logger.info(f"Checkpoint saved: {checkpoint_path} at epoch {epoch}")
 
     # Save final model with config

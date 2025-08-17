@@ -220,8 +220,60 @@ class DiffuGenePipeline:
         
         step_suffix = step_suffix_map.get(step, step)
         spans_filename = f"{basename}_{step_suffix}_chr{chr_suffix}_blocks_{pca_k}PC.csv"
+        spans_filepath = os.path.join(self.config['data_prep']['block_folder'], spans_filename)
         
-        return os.path.join(self.config['data_prep']['block_folder'], spans_filename)
+        # If multiple chromosomes and the combined file doesn't exist, check for individual files
+        if len(chromosomes) > 1 and not os.path.exists(spans_filepath):
+            # Check if individual chromosome spans files exist
+            individual_files = []
+            for chr_num in chromosomes:
+                chr_spans_filename = f"{basename}_{step_suffix}_chr{chr_num}_blocks_{pca_k}PC.csv"
+                chr_spans_filepath = os.path.join(self.config['data_prep']['block_folder'], chr_spans_filename)
+                if os.path.exists(chr_spans_filepath):
+                    individual_files.append(chr_spans_filepath)
+            
+            # If we have individual files for all chromosomes, combine them
+            if len(individual_files) == len(chromosomes):
+                logger.info(f"Found {len(individual_files)} individual chromosome spans files, combining into {spans_filename}")
+                self._combine_chromosome_spans_files(individual_files, spans_filepath)
+                
+        return spans_filepath
+    
+    def _combine_chromosome_spans_files(self, individual_files: List[str], output_path: str):
+        """Combine individual chromosome spans files into a single file.
+        
+        Args:
+            individual_files: List of paths to individual chromosome spans files
+            output_path: Path where the combined file should be saved
+        """
+        logger.info(f"Combining {len(individual_files)} chromosome spans files...")
+        
+        all_spans = []
+        for file_path in individual_files:
+            try:
+                df = pd.read_csv(file_path)
+                all_spans.append(df)
+                logger.debug(f"Added {len(df)} blocks from {file_path}")
+            except Exception as e:
+                logger.error(f"Failed to read spans file {file_path}: {e}")
+                raise
+        
+        if all_spans:
+            # Combine all dataframes
+            combined_df = pd.concat(all_spans, ignore_index=True)
+            
+            # Sort by chromosome and start position for consistency
+            if 'chr' in combined_df.columns and 'start' in combined_df.columns:
+                combined_df = combined_df.sort_values(['chr', 'start']).reset_index(drop=True)
+            
+            # Create output directory if it doesn't exist
+            ensure_dir_exists(os.path.dirname(output_path))
+            
+            # Save combined file
+            combined_df.to_csv(output_path, index=False)
+            logger.info(f"Combined spans file created with {len(combined_df)} total blocks: {output_path}")
+        else:
+            raise RuntimeError("No spans data found in any of the individual files")
     
     def get_dataset_fam_file(self, step: str) -> str:
         """Get the appropriate fam file for a given pipeline step.

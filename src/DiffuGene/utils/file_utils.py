@@ -59,28 +59,98 @@ def extract_block_number(filepath: str) -> int:
     return int(match.group(1))
 
 
-def load_blocks_for_chr(fn: str, chr_no: int) -> List[Block]:
+def load_blocks_for_chr(fn: str, chr_no: int, snplist_dir: Optional[str] = None, basename: Optional[str] = None, bim_file: Optional[str] = None) -> List[Block]:
     """Parse PLINK .blocks.det for one chromosome into a list of Block objects.
+    
+    If snplist_dir and basename are provided, reads SNPs from the actual snplist files
+    used during training (which include assigned SNPs). Otherwise falls back to 
+    reading from the original .blocks.det file.
     
     Args:
         fn: Path to .blocks.det file
         chr_no: Chromosome number
+        snplist_dir: Optional directory containing snplist files with actual SNPs used
+        basename: Optional basename for snplist files
+        bim_file: Optional path to BIM file for SNP position lookup
         
     Returns:
         List of Block namedtuples
     """
-    if not os.path.exists(fn):
-        raise FileNotFoundError(f"Block definition file not found: {fn}")
+    if snplist_dir and basename and os.path.exists(snplist_dir):
+        # Read from actual snplist files used during training
+        return load_blocks_from_snplists(snplist_dir, basename, chr_no, fn, bim_file)
+    else:
+        # Fall back to original .blocks.det file reading
+        if not os.path.exists(fn):
+            raise FileNotFoundError(f"Block definition file not found: {fn}")
+        
+        blocks = []
+        with open(fn) as f:
+            next(f)  # skip header
+            for line in f:
+                parts = line.strip().split()
+                bp1 = int(parts[1])
+                bp2 = int(parts[2])
+                snplist = parts[5].split("|")
+                blocks.append(Block(chr_no, bp1, bp2, snplist))
+        return blocks
+
+
+def load_blocks_from_snplists(snplist_dir: str, basename: str, chr_no: int, blocks_det_file: str, bim_file: Optional[str] = None) -> List[Block]:
+    """Load blocks by reading SNPs from snplist files and positions from BIM file.
+    
+    Args:
+        snplist_dir: Directory containing snplist files
+        basename: Basename for snplist files
+        chr_no: Chromosome number
+        blocks_det_file: Unused (kept for compatibility)
+        bim_file: Path to BIM file for SNP position lookup
+        
+    Returns:
+        List of Block namedtuples with SNPs from snplist files and positions from BIM
+    """
+    # Find all snplist files for this chromosome
+    pattern = os.path.join(snplist_dir, f"{basename}_chr{chr_no}_block*.snplist")
+    snplist_files = sorted(glob.glob(pattern), key=extract_block_number)
+    
+    if not snplist_files:
+        raise FileNotFoundError(f"No snplist files found with pattern: {pattern}")
+    
+    # Read SNP positions from BIM file
+    if not bim_file:
+        raise ValueError("BIM file is required for position lookup")
+    
+    if not os.path.exists(bim_file):
+        raise FileNotFoundError(f"BIM file not found: {bim_file}")
+    
+    bim_df = read_bim_file(bim_file, chr_no)
+    snp_positions = dict(zip(bim_df['SNP'], bim_df['BP']))
     
     blocks = []
-    with open(fn) as f:
-        next(f)  # skip header
-        for line in f:
-            parts = line.strip().split()
-            bp1 = int(parts[1])
-            bp2 = int(parts[2])
-            snplist = parts[5].split("|")
-            blocks.append(Block(chr_no, bp1, bp2, snplist))
+    for snplist_file in snplist_files:
+        # Read SNPs from snplist file
+        snps = []
+        with open(snplist_file, 'r') as f:
+            for line in f:
+                snp = line.strip()
+                if snp:
+                    snps.append(snp)
+        
+        if not snps:
+            continue
+        
+        # Get positions for all SNPs in this block
+        snp_positions_in_block = [snp_positions[snp] for snp in snps if snp in snp_positions]
+        
+        if snp_positions_in_block:
+            bp1 = min(snp_positions_in_block)
+            bp2 = max(snp_positions_in_block)
+        else:
+            # If no SNPs found in BIM, skip this block
+            continue
+        
+        blocks.append(Block(chr_no, bp1, bp2, snps))
+    
     return blocks
 
 

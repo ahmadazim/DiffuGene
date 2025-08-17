@@ -82,7 +82,7 @@ def load_spans_file(spans_file):
     logger.info(f"Loaded spans for {len(scaled_spans)} blocks (chr_idx, start_norm, length_norm)")
     return spans_tensor
 
-def prepare_block_info_for_decoding(spans_file, chromosome=None):
+def prepare_block_info_for_decoding(spans_file, embeddings_dir, chromosome=None):
     """Prepare block information for on-demand PCA loading during decoding."""
     logger.info(f"Preparing block info from spans file: {spans_file}")
     df = pd.read_csv(spans_file)
@@ -93,16 +93,39 @@ def prepare_block_info_for_decoding(spans_file, chromosome=None):
         logger.info(f"Filtered to chromosome {chromosome}: {len(df)} blocks")
     
     block_info = []
+    block_base_changed = False
     for _, row in df.iterrows():
-        # Extract block information
         filename = os.path.basename(row.block_file)
         block_match = re.search(r'block(\d+)', filename)
         if not block_match:
             raise ValueError(f"Could not extract block number from {filename}")
         block_no = int(block_match.group(1))
         chr_num = int(row.chr)
-        block_base = os.path.basename(row.block_file).replace(".pt", "")
         
+        if not block_base_changed:
+            block_base = os.path.basename(row.block_file).replace(".pt", "")
+            
+            # check if block_base is the right base in loadings
+            load_dir = os.path.join(embeddings_dir, "loadings")
+            load_file = os.path.join(load_dir, f"{block_base}_pca_loadings.pt")
+            if not os.path.exists(load_file):
+                try:
+                    load_dir = os.path.join(embeddings_dir, "loadings")
+                    search_load_file = glob.glob(os.path.join(load_dir, f"*chr{chr_num}_block{block_no}_pca_loadings.pt"))
+                    if len(search_load_file) == 0:
+                        raise ValueError(f"Could not find load file for chr{chr_num}_block{block_no}")
+                    elif len(search_load_file) == 1:
+                        block_base = os.path.basename(search_load_file[0]).replace("_pca_loadings.pt", "")
+                        block_base_changed = True
+                        general_base = block_base.replace(f"chr{chr_num}_block{block_no}", "")
+                        logger.info(f"Block base changed to {general_base}")
+                    else:
+                        raise ValueError(f"Multiple load files found for chr{chr_num}_block{block_no}: {search_load_file}. Please specify chromosome.")
+                except:
+                    raise ValueError(f"Could not extract block basename from {load_dir}")
+        else:
+            block_base = general_base + f"chr{chr_num}_block{block_no}"
+
         block_info.append((chr_num, block_no, block_base))
     
     logger.info(f"Prepared block info for {len(block_info)} blocks")
@@ -126,9 +149,9 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
     
-    # 1. Load VAE latents
+    # 1. Load VAE latents (keep on CPU to save GPU memory)
     logger.info(f"Loading VAE latents from: {latents_file}")
-    latents = torch.load(latents_file, map_location=device)
+    latents = torch.load(latents_file, map_location='cpu')
     
     if isinstance(latents, dict):
         if 'latents' in latents:
@@ -137,10 +160,10 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
             raise ValueError(f"VAE latents file format not recognized. Keys: {list(latents.keys())}")
     
     if not isinstance(latents, torch.Tensor):
-        latents = torch.tensor(latents, dtype=torch.float32, device=device)
+        latents = torch.tensor(latents, dtype=torch.float32)
     
-    latents = latents.float().to(device)
-    logger.info(f"Loaded latents with shape: {latents.shape}")
+    latents = latents.float()
+    logger.info(f"Loaded latents with shape: {latents.shape} (kept on CPU)")
     
     # 2. Load VAE model
     logger.info(f"Loading VAE model from: {model_file}")
@@ -166,7 +189,7 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
         raise ValueError("Model file must contain configuration. Please use a model saved with the current training script.")
     
     # 3. Prepare block info for on-demand PCA loading
-    block_info = prepare_block_info_for_decoding(spans_file, chromosome=chromosome)
+    block_info = prepare_block_info_for_decoding(spans_file, embeddings_dir, chromosome=chromosome)
     n_blocks = len(block_info)
     
     # Initialize VAE model
@@ -214,7 +237,7 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     with torch.no_grad():
         for start_idx in tqdm(range(0, n_samples, batch_size), desc="Decoding batches"):
             end_idx = min(start_idx + batch_size, n_samples)
-            batch_latents = latents[start_idx:end_idx]  # (batch_size, latent_channels, H, W)
+            batch_latents = latents[start_idx:end_idx].to(device)  # Move batch to GPU
             batch_size_actual = batch_latents.shape[0]
             
             # Expand spans to batch size: (batch_size, n_blocks, 3)
@@ -236,10 +259,14 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
                 pca_block = get_pca_block(block_idx)
                 
                 # Decode using PCA block
-                reconstructed_snps = pca_block.decode(block_pc_embeddings)  # (batch_size, n_snps_in_block)
+                reconstructed_snps = pca_block.decode(block_pc_embeddings).cpu()  # (batch_size, n_snps_in_block)
                 batch_reconstructed_snps.append(reconstructed_snps)
             
             all_reconstructed_snps.append(batch_reconstructed_snps)
+            
+            # Clean up GPU memory after each batch
+            del batch_latents, decoded_pc_embeddings
+            torch.cuda.empty_cache()
     
     # 7. Concatenate all batches
     logger.info("Concatenating results from all batches...")
@@ -280,10 +307,10 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     logger.info(f"  SNPs per block range: {min(snps.shape[1] for snps in final_reconstructed_snps)} - {max(snps.shape[1] for snps in final_reconstructed_snps)}")
     logger.info(f"  PCA blocks loaded on-demand: {len(pca_cache)}")
     
-    # Compute some basic statistics
-    all_values = torch.cat([snps.flatten() for snps in final_reconstructed_snps])
-    logger.info(f"  Reconstructed values range: [{all_values.min():.3f}, {all_values.max():.3f}]")
-    logger.info(f"  Reconstructed values mean: {all_values.mean():.3f} ± {all_values.std():.3f}")
+    # # Compute some basic statistics
+    # all_values = torch.cat([snps.flatten() for snps in final_reconstructed_snps])
+    # logger.info(f"  Reconstructed values range: [{all_values.min():.3f}, {all_values.max():.3f}]")
+    # logger.info(f"  Reconstructed values mean: {all_values.mean():.3f} ± {all_values.std():.3f}")
     
     return output_data
 
