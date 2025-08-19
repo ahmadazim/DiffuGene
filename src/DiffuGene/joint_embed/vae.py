@@ -5,6 +5,59 @@ import math
 
 from .distribution import DiagonalGaussianDistribution
 
+def _gn_groups(ch: int) -> int:
+    return min(32, max(1, ch // 8))
+
+class DownResBlock1D(nn.Module):
+    """
+    Residual downsampling block:
+      main: Conv1d(k=3, s=2) → GN → Act → Conv1d(k=3, s=1) → GN
+      skip: Conv1d(k=1, s=2)
+    Output: Act(main + skip)
+    """
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv_ds = nn.Conv1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False)
+        self.gn1     = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
+        self.act     = nn.SiLU(inplace=True)
+        self.conv    = nn.Conv1d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+        self.gn2     = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
+        self.skip    = nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=2, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.conv_ds(x)
+        y = self.gn1(y)
+        y = self.act(y)
+        y = self.conv(y)
+        y = self.gn2(y)
+        s = self.skip(x)
+        return self.act(y + s)
+
+class UpResBlock1D(nn.Module):
+    """
+    Residual upsampling block:
+      main: ConvT1d(k=3, s=2, p=1, out_pad=1) → GN → Act → Conv1d(k=3, s=1) → GN
+      skip: ConvT1d(k=1, s=2, out_pad=1)
+    Output: Act(main + skip)
+    """
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.deconv   = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False)
+        self.gn1      = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
+        self.act      = nn.SiLU(inplace=True)
+        self.conv     = nn.Conv1d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+        self.gn2      = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
+        # k=1, s=2, out_pad=1 to exactly double length on skip
+        self.skip_up  = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=1, stride=2, padding=0, output_padding=1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.deconv(x)
+        y = self.gn1(y)
+        y = self.act(y)
+        y = self.conv(y)
+        y = self.gn2(y)
+        s = self.skip_up(x)
+        return self.act(y + s)
 
 class JointBlockEmbedder(nn.Module):
     """
@@ -45,9 +98,12 @@ class JointBlockEmbedder(nn.Module):
         # 3) content MLP: D → E
         self.content_mlp = nn.Sequential(
             nn.Linear(block_emb_dim, pos_emb_dim),
-            nn.LeakyReLU(0.2, inplace=True),
+            # nn.LeakyReLU(0.2, inplace=True),
+            nn.SiLU(inplace=True),
+            nn.Dropout(p=0.05),
             nn.Linear(pos_emb_dim, E),
         )
+        self.content_skip = nn.Linear(block_emb_dim, E)
         
         # 4) Chromosome embedding (1-22)
         self.chr_embedding = nn.Embedding(num_embeddings=23, embedding_dim=chr_emb_dim)  # 0-22 (0 unused, 1-22)
@@ -57,19 +113,19 @@ class JointBlockEmbedder(nn.Module):
         self.film_mlp = nn.Sequential(
             nn.Linear(in_dim, pos_emb_dim),
             nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(p=0.05),
             nn.Linear(pos_emb_dim, 2 * E),
         )
+        # zero-init FiLM layer (start near identity)
+        nn.init.zeros_(self.film_mlp[-1].weight)
+        nn.init.zeros_(self.film_mlp[-1].bias)
 
-        # 6) strided Conv1d blocks: E→...→C, build k Conv1d blocks that gradually double channels
+        # 6) residual downsample blocks: E→...→C, k+2 stages (each doubles channels, stride=2)
         convs = []
         in_ch = E
         for _ in range(num_downsamples):
             out_ch = in_ch * 2
-            convs.append(nn.Sequential(
-                nn.Conv1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm1d(out_ch),
-                nn.LeakyReLU(0.2, inplace=True),
-            ))
+            convs.append(DownResBlock1D(in_ch, out_ch))
             in_ch = out_ch
         assert in_ch == latent_channels, f"Expected final channels {latent_channels}, got {in_ch}"
         self.convs = nn.ModuleList(convs)
@@ -86,7 +142,7 @@ class JointBlockEmbedder(nn.Module):
         pad_len = base * (2**self.k)
 
         # 1) content → (B,N,E)
-        c = self.content_mlp(block_embs)
+        c = self.content_mlp(block_embs) + self.content_skip(block_embs)
 
         # 2) Split spans: (chr_idx, start_norm, length_norm)
         chr_idx, start_norm, length_norm = spans.chunk(3, dim=-1)  # each (B, N, 1)
@@ -99,9 +155,12 @@ class JointBlockEmbedder(nn.Module):
         film_input = torch.cat([chr_emb, pos_cont], dim=-1)          # (B, N, chr_emb_dim+2)
         
         # 5) FiLM: compute (γ,β) from film_input → apply
-        gam_bias = self.film_mlp(film_input)      # (B, N, 2E)
-        gamma, beta = gam_bias.chunk(2, dim=-1)   # each (B, N, E)
-        x = gamma * c + beta                      # (B, N, E)
+        # gam_bias = self.film_mlp(film_input)      # (B, N, 2E)
+        # gamma, beta = gam_bias.chunk(2, dim=-1)   # each (B, N, E)
+        # x = gamma * c + beta                      # (B, N, E)
+        delt = self.film_mlp(film_input)           # (B, N, 2E)
+        delta_gamma, beta = delt.chunk(2, dim=-1)  # each (B, N, E)
+        x = (1.0 + delta_gamma) * c + beta         # near-identity at init
 
         # 6) pad/truncate sequence-length to pad_len
         if N < pad_len:
@@ -160,11 +219,7 @@ class JointBlockDecoder(nn.Module):
                 out_ch = in_ch // 2
             else:
                 out_ch = in_ch
-            deconvs.append(nn.Sequential(
-                nn.ConvTranspose1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False),
-                nn.BatchNorm1d(out_ch),
-                nn.LeakyReLU(0.2, inplace=True),
-            ))
+            deconvs.append(UpResBlock1D(in_ch, out_ch))
             in_ch = out_ch
         assert in_ch == E
         

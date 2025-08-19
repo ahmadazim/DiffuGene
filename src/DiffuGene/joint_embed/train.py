@@ -4,6 +4,7 @@ import os
 import glob
 import argparse
 import re
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 import pandas as pd
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from ..utils import setup_logging, get_logger
 from ..block_embed import PCA_Block, load_pca_blocks
@@ -198,8 +199,18 @@ def train(args):
     ).to(device)
 
     embedding_mask = create_embedding_masks_from_metadata(pca_metadata, args.block_dim, device=device)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=1e-4,
+    )
+    # LR schedule: warmup + cosine to 1e-5 by the end
+    lr_warmup_epochs = 10
+    warmup = LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=lr_warmup_epochs)
+    cosine = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs - lr_warmup_epochs), eta_min=1e-5)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[lr_warmup_epochs])
     scaler = torch.GradScaler('cuda')
     
     # Load initial checkpoint if specified
@@ -225,13 +236,29 @@ def train(args):
         last_checkpoint_path = None
     
     # Training parameters
-    kld_weight = args.kld_weight
     lambda_mse = args.decoded_mse_weight
     warmup_epochs = getattr(args, 'snp_start_epoch', 0)
     snp_blocks_per_batch = getattr(args, 'snp_blocks_per_batch', 64)
     snp_loader = None
 
+    # KL schedule configuration
+    kld_warmup_epochs = 15
+    kld_cycle_period = 75
+    kld_min_beta = 1e-7
+
+    def compute_kld_beta(current_epoch: int) -> float:
+        if current_epoch <= kld_warmup_epochs:
+            return args.kld_weight * (current_epoch / float(kld_warmup_epochs))
+        t = (current_epoch - kld_warmup_epochs - 1) % kld_cycle_period
+        phase = 0.5 * (1.0 + math.cos(2.0 * math.pi * (t / float(kld_cycle_period))))
+        beta = kld_min_beta + (args.kld_weight - kld_min_beta) * phase
+        if current_epoch == args.epochs:
+            beta = 2e-7
+        return float(beta)
+
     for epoch in range(start_epoch, args.epochs + 1):
+        # Step LR scheduler at start so warmup applies immediately to this epoch
+        scheduler.step()
         use_snp_loss = args.reconstruct_snps and (epoch > warmup_epochs)
         if use_snp_loss and snp_loader is None:
             logger.info(f"Creating SNP loader for on-demand SNP loading (blocks per batch: {snp_blocks_per_batch})")
@@ -274,8 +301,12 @@ def train(args):
             with torch.autocast('cuda'):
                 recon_emb, dist = model(emb, spans)
                 recon_loss = masked_mse_loss(recon_emb, emb, embedding_mask)
-                kld_loss = dist.kl().mean()
-                loss = recon_loss + kld_weight * kld_loss
+                # Free-bits: clamp per-latent-element KL before reduction
+                kld_map = dist.kl()
+                free_nats = 0.5
+                kld_loss = torch.clamp(kld_map, min=free_nats).mean()
+                beta_kld = compute_kld_beta(epoch)
+                loss = recon_loss + beta_kld * kld_loss
                 
                 # Check for NaN in reconstruction loss and revert to last checkpoint if found
                 if torch.isnan(recon_loss):
@@ -345,15 +376,14 @@ def train(args):
         if use_snp_loss:
             avg_snp_mse = total_snp_mse / len(loader)
             lambda_snp = lambda_mse * (epoch - warmup_epochs) / 50 if epoch <= warmup_epochs + 50 else lambda_mse
-            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | SNP_MSE={avg_snp_mse:.4f} | λ_SNP={lambda_snp:.2e} | KLD_weight={kld_weight:.2e} | LR={scheduler.get_last_lr()[0]:.2e}")
+            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | SNP_MSE={avg_snp_mse:.4f} | λ_SNP={lambda_snp:.2e} | KLD_beta={compute_kld_beta(epoch):.2e} | LR={scheduler.get_last_lr()[0]:.2e}")
         else:
-            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | KLD_weight={kld_weight:.2e} | LR={scheduler.get_last_lr()[0]:.2e}")
+            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | KLD_beta={compute_kld_beta(epoch):.2e} | LR={scheduler.get_last_lr()[0]:.2e}")
             
         if epoch == warmup_epochs + 1:
             logger.info(f">>> TRANSITION: Starting SNP loss phase at epoch {epoch} <<<")
         
         torch.cuda.empty_cache()
-        scheduler.step()
 
         # Evaluate and save checkpoint
         if (epoch % eval_freq == 0 or epoch == args.epochs):
