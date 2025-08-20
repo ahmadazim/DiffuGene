@@ -252,8 +252,6 @@ def train(args):
         t = (current_epoch - kld_warmup_epochs - 1) % kld_cycle_period
         phase = 0.5 * (1.0 + math.cos(2.0 * math.pi * (t / float(kld_cycle_period))))
         beta = kld_min_beta + (args.kld_weight - kld_min_beta) * phase
-        if current_epoch == args.epochs:
-            beta = 2e-7
         return float(beta)
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -283,6 +281,9 @@ def train(args):
             total_snp_mse = 0.0
         total_samples = 0
         batch_idx = 0
+        # Accumulate per-PC reconstruction error across the epoch
+        per_pc_num = torch.zeros(args.block_dim, device=device)
+        per_pc_den = torch.zeros(args.block_dim, device=device)
 
         for batch_data in tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}"):
             emb, spans, sample_indices = batch_data
@@ -366,6 +367,13 @@ def train(args):
             total_recon += recon_loss.item() * bs
             total_kld += kld_loss.item() * bs
             total_samples += bs
+            # Accumulate per-PC reconstruction MSE with masking
+            with torch.no_grad():
+                err = (recon_emb.float() - emb.float()) ** 2  # (B,N,D)
+                mask = embedding_mask.unsqueeze(0)           # (1,N,D)
+                masked_err = err * mask
+                per_pc_num += masked_err.sum(dim=(0,1))
+                per_pc_den += mask.sum(dim=(0,1))
         
         # Compute averages
         avg_recon = total_recon / total_samples
@@ -376,9 +384,13 @@ def train(args):
         if use_snp_loss:
             avg_snp_mse = total_snp_mse / len(loader)
             lambda_snp = lambda_mse * (epoch - warmup_epochs) / 50 if epoch <= warmup_epochs + 50 else lambda_mse
-            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | SNP_MSE={avg_snp_mse:.4f} | λ_SNP={lambda_snp:.2e} | KLD_beta={compute_kld_beta(epoch):.2e} | LR={scheduler.get_last_lr()[0]:.2e}")
+            # logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | SNP_MSE={avg_snp_mse:.4f} | λ_SNP={lambda_snp:.2e} | KLD_beta={compute_kld_beta(epoch):.2e} | LR={scheduler.get_last_lr()[0]:.2e}")
+            per_pc = (per_pc_num / per_pc_den.clamp_min(1)).detach().cpu().tolist()
+            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | SNP_MSE={avg_snp_mse:.4f} | λ_SNP={lambda_snp:.2e} | KLD_beta={compute_kld_beta(epoch):.2e} | LR={scheduler.get_last_lr()[0]:.2e} | PerPC={[f'{v:.6e}' for v in per_pc]}")
         else:
-            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | KLD_beta={compute_kld_beta(epoch):.2e} | LR={scheduler.get_last_lr()[0]:.2e}")
+            # logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | KLD_beta={compute_kld_beta(epoch):.2e} | LR={scheduler.get_last_lr()[0]:.2e}")
+            per_pc = (per_pc_num / per_pc_den.clamp_min(1)).detach().cpu().tolist()
+            logger.info(f"Epoch {epoch} ({phase}): Recon={avg_recon:.4f} | KLD={avg_kld:.4f} | KLD_beta={compute_kld_beta(epoch):.2e} | LR={scheduler.get_last_lr()[0]:.2e} | PerPC={[f'{v:.6e}' for v in per_pc]}")
             
         if epoch == warmup_epochs + 1:
             logger.info(f">>> TRANSITION: Starting SNP loss phase at epoch {epoch} <<<")

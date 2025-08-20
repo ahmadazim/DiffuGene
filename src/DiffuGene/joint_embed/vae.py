@@ -8,56 +8,179 @@ from .distribution import DiagonalGaussianDistribution
 def _gn_groups(ch: int) -> int:
     return min(32, max(1, ch // 8))
 
-class DownResBlock1D(nn.Module):
-    """
-    Residual downsampling block:
-      main: Conv1d(k=3, s=2) → GN → Act → Conv1d(k=3, s=1) → GN
-      skip: Conv1d(k=1, s=2)
-    Output: Act(main + skip)
-    """
-    def __init__(self, in_ch: int, out_ch: int):
+# class DownResBlock1D(nn.Module):
+#     """
+#     Residual downsampling block:
+#       main: Conv1d(k=3, s=2) → GN → Act → Conv1d(k=3, s=1) → GN
+#       skip: Conv1d(k=1, s=2)
+#     Output: Act(main + skip)
+#     """
+#     def __init__(self, in_ch: int, out_ch: int):
+#         super().__init__()
+#         self.conv_ds = nn.Conv1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False)
+#         self.gn1     = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
+#         self.act     = nn.SiLU(inplace=True)
+#         self.conv    = nn.Conv1d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+#         self.gn2     = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
+#         self.skip    = nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=2, bias=False)
+#         nn.init.zeros_(self.gn2.weight)
+#         nn.init.zeros_(self.gn2.bias)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         y = self.conv_ds(x)
+#         y = self.gn1(y)
+#         y = self.act(y)
+#         y = self.conv(y)
+#         y = self.gn2(y)
+#         s = self.skip(x)
+#         return self.act(y + s)
+
+class SE1D(nn.Module):
+    def __init__(self, ch: int, r: int = 8):
         super().__init__()
-        self.conv_ds = nn.Conv1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False)
-        self.gn1     = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
-        self.act     = nn.SiLU(inplace=True)
-        self.conv    = nn.Conv1d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
-        self.gn2     = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
-        self.skip    = nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=2, bias=False)
+        hidden = max(1, ch // r)
+        self.net = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(ch, hidden, 1), 
+            nn.SiLU(inplace=True),
+            nn.Conv1d(hidden, ch, 1), 
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return x * self.net(x)
+
+class DownMBResBlock1D(nn.Module):
+    """
+    Inverted-bottleneck residual downsampling:
+      main: PW expand → GN → SiLU → Depthwise Conv(s=2) → GN → SiLU → PW project → GN(=0) → SE → + skip(1x1,s=2) → SiLU
+      skip: Conv1d(k=1, s=2)
+    Keeps output channels = out_ch, but large inner width
+    """
+    def __init__(self, in_ch: int, out_ch: int, expand_ratio: int = 4):
+        super().__init__()
+        mid = max(out_ch, in_ch) * expand_ratio
+        self.pw_expand = nn.Conv1d(in_ch, mid, kernel_size=1, bias=False)
+        self.gn0 = nn.GroupNorm(_gn_groups(mid), mid)
+        self.dw = nn.Conv1d(mid, mid, kernel_size=3, stride=2, padding=1, groups=mid, bias=False)
+        self.gn1 = nn.GroupNorm(_gn_groups(mid), mid)
+        self.act = nn.SiLU(inplace=True)
+        self.pw_proj = nn.Conv1d(mid, out_ch, kernel_size=1, bias=False)
+        self.gn2 = nn.GroupNorm(_gn_groups(out_ch), out_ch)
+        self.se = SE1D(out_ch)
+        self.skip = nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=2, bias=False)
+        # identity init on the last norm
+        nn.init.zeros_(self.gn2.weight)
+        nn.init.zeros_(self.gn2.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.conv_ds(x)
-        y = self.gn1(y)
-        y = self.act(y)
-        y = self.conv(y)
-        y = self.gn2(y)
+        y = self.pw_expand(x)
+        y = self.act(self.gn0(y))
+        y = self.act(self.gn1(self.dw(y)))
+        y = self.gn2(self.pw_proj(y))
+        y = self.se(y)
         s = self.skip(x)
         return self.act(y + s)
 
-class UpResBlock1D(nn.Module):
+# class UpResBlock1D(nn.Module):
+#     """
+#     Residual upsampling block:
+#       main: ConvT1d(k=3, s=2, p=1, out_pad=1) → GN → Act → Conv1d(k=3, s=1) → GN
+#       skip: ConvT1d(k=1, s=2, out_pad=1)
+#     Output: Act(main + skip)
+#     """
+#     def __init__(self, in_ch: int, out_ch: int):
+#         super().__init__()
+#         self.deconv   = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False)
+#         self.gn1      = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
+#         self.act      = nn.SiLU(inplace=True)
+#         self.conv     = nn.Conv1d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
+#         self.gn2      = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
+#         # k=1, s=2, out_pad=1 to exactly double length on skip
+#         self.skip_up  = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=1, stride=2, padding=0, output_padding=1, bias=False)
+#         nn.init.zeros_(self.gn2.weight)
+#         nn.init.zeros_(self.gn2.bias)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         y = self.deconv(x)
+#         y = self.gn1(y)
+#         y = self.act(y)
+#         y = self.conv(y)
+#         y = self.gn2(y)
+#         s = self.skip_up(x)
+#         return self.act(y + s)
+
+class UpMBResBlock1D(nn.Module):
     """
-    Residual upsampling block:
-      main: ConvT1d(k=3, s=2, p=1, out_pad=1) → GN → Act → Conv1d(k=3, s=1) → GN
-      skip: ConvT1d(k=1, s=2, out_pad=1)
-    Output: Act(main + skip)
+    Inverted-bottleneck residual upsampling:
+      main: PW expand → GN → SiLU → Depthwise ConvT(s=2) → GN → SiLU → PW project → GN(=0) → SE → + skip(ConvT1d 1x1,s=2) → SiLU
     """
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, expand_ratio: int = 4):
         super().__init__()
-        self.deconv   = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False)
-        self.gn1      = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
-        self.act      = nn.SiLU(inplace=True)
-        self.conv     = nn.Conv1d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
-        self.gn2      = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
-        # k=1, s=2, out_pad=1 to exactly double length on skip
-        self.skip_up  = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=1, stride=2, padding=0, output_padding=1, bias=False)
+        mid = max(out_ch, in_ch) * expand_ratio
+        self.pw_expand = nn.Conv1d(in_ch, mid, kernel_size=1, bias=False)
+        self.gn0 = nn.GroupNorm(_gn_groups(mid), mid)
+        self.dw_t = nn.ConvTranspose1d(mid, mid, kernel_size=3, stride=2, padding=1, output_padding=1, groups=mid, bias=False)
+        self.gn1 = nn.GroupNorm(_gn_groups(mid), mid)
+        self.act = nn.SiLU(inplace=True)
+        self.pw_proj = nn.Conv1d(mid, out_ch, kernel_size=1, bias=False)
+        self.gn2 = nn.GroupNorm(_gn_groups(out_ch), out_ch)
+        self.se = SE1D(out_ch)
+        self.skip_up = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=1, stride=2, padding=0, output_padding=1, bias=False)
+        nn.init.zeros_(self.gn2.weight)
+        nn.init.zeros_(self.gn2.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.deconv(x)
-        y = self.gn1(y)
-        y = self.act(y)
-        y = self.conv(y)
-        y = self.gn2(y)
+        y = self.pw_expand(x)
+        y = self.act(self.gn0(y))
+        y = self.act(self.gn1(self.dw_t(y)))
+        y = self.gn2(self.pw_proj(y))
+        y = self.se(y)
         s = self.skip_up(x)
         return self.act(y + s)
+
+class BottleneckMHSA1D(nn.Module):
+    """Single MHSA layer that runs at the bottleneck length L=H*W (after all downsamples)."""
+    def __init__(self, ch: int, num_heads: int = 8):
+        super().__init__()
+        self.ln   = nn.LayerNorm(ch)
+        self.mha  = nn.MultiheadAttention(embed_dim=ch, num_heads=num_heads, batch_first=True)
+        self.ffn  = nn.Sequential(
+            nn.Linear(ch, 4*ch), 
+            nn.SiLU(inplace=True),
+            nn.Linear(4*ch, ch)
+        )
+        nn.init.zeros_(self.ffn[-1].weight)
+        nn.init.zeros_(self.ffn[-1].bias)
+        
+    def forward(self, x_bcl: torch.Tensor) -> torch.Tensor:
+        B, C, L = x_bcl.shape
+        x = x_bcl.transpose(1, 2)      # (B, L, C)
+        h = self.mha(self.ln(x), self.ln(x), self.ln(x), need_weights=False)[0]
+        x = x + h
+        x = x + self.ffn(self.ln(x))
+        return x.transpose(1, 2)        # (B, C, L)
+
+class FourierPos(nn.Module):
+    """
+    Fourier features for continuous positions:
+      inputs: start_norm, length_norm ∈ [0,1], shapes (B,N,1)
+      outputs: concat([sin,cos] for start & length) with n_freq bands → (B,N,4*n_freq)
+    """
+    def __init__(self, n_freq: int = 8):
+        super().__init__()
+        freqs = 2.0 ** torch.arange(n_freq, dtype=torch.float32)
+        self.register_buffer("freqs", freqs, persistent=False)
+    
+    def forward(self, start_norm: torch.Tensor, length_norm: torch.Tensor) -> torch.Tensor:
+        s = start_norm * self.freqs  # (B,N,n_freq)
+        l = length_norm * self.freqs
+        feat = torch.cat([
+            torch.sin(2 * math.pi * s), 
+            torch.cos(2 * math.pi * s),
+            torch.sin(2 * math.pi * l), 
+            torch.cos(2 * math.pi * l)
+        ], dim=-1)                    # (B,N,4*n_freq)
+        return feat
 
 class JointBlockEmbedder(nn.Module):
     """
@@ -100,7 +223,7 @@ class JointBlockEmbedder(nn.Module):
             nn.Linear(block_emb_dim, pos_emb_dim),
             # nn.LeakyReLU(0.2, inplace=True),
             nn.SiLU(inplace=True),
-            nn.Dropout(p=0.05),
+            # nn.Dropout(p=0.05),
             nn.Linear(pos_emb_dim, E),
         )
         self.content_skip = nn.Linear(block_emb_dim, E)
@@ -108,12 +231,18 @@ class JointBlockEmbedder(nn.Module):
         # 4) Chromosome embedding (1-22)
         self.chr_embedding = nn.Embedding(num_embeddings=23, embedding_dim=chr_emb_dim)  # 0-22 (0 unused, 1-22)
         
-        # 5) FiLM MLP: chr_emb + continuous positions → 2*E (γ,β)
-        in_dim = chr_emb_dim + 2  # chr_embed + start_norm + length_norm
+        # # 5) FiLM MLP: chr_emb + continuous positions → 2*E (γ,β)
+        # in_dim = chr_emb_dim + 2  # chr_embed + start_norm + length_norm
+        
+        # 5) FiLM MLP: chr_emb + Fourier features(start_norm, length_norm) → 2*E (γ,β)
+        self.fourier_pos = FourierPos(n_freq=8)
+        n_fourier = 4 * self.fourier_pos.freqs.numel()  # 4*n_freq
+        in_dim = chr_emb_dim + n_fourier
+
         self.film_mlp = nn.Sequential(
             nn.Linear(in_dim, pos_emb_dim),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout(p=0.05),
+            # nn.Dropout(p=0.05),
             nn.Linear(pos_emb_dim, 2 * E),
         )
         # zero-init FiLM layer (start near identity)
@@ -125,10 +254,14 @@ class JointBlockEmbedder(nn.Module):
         in_ch = E
         for _ in range(num_downsamples):
             out_ch = in_ch * 2
-            convs.append(DownResBlock1D(in_ch, out_ch))
+            # convs.append(DownResBlock1D(in_ch, out_ch))
+            convs.append(DownMBResBlock1D(in_ch, out_ch, expand_ratio=4))
             in_ch = out_ch
         assert in_ch == latent_channels, f"Expected final channels {latent_channels}, got {in_ch}"
         self.convs = nn.ModuleList(convs)
+        
+        # MHSA at the bottleneck
+        self.bottleneck_attn = BottleneckMHSA1D(ch=latent_channels, num_heads=8)
 
     def forward(self, block_embs: torch.Tensor, spans: torch.Tensor) -> torch.Tensor:
         """
@@ -150,17 +283,22 @@ class JointBlockEmbedder(nn.Module):
         # 3) Get chromosome embedding
         chr_emb = self.chr_embedding(chr_idx.long().squeeze(-1))     # (B, N, chr_emb_dim)
         
-        # 4) Concatenate chromosome embedding with continuous positions
-        pos_cont = torch.cat([start_norm, length_norm], dim=-1)      # (B, N, 2)
-        film_input = torch.cat([chr_emb, pos_cont], dim=-1)          # (B, N, chr_emb_dim+2)
+        # # 4) Concatenate chromosome embedding with continuous positions
+        # pos_cont = torch.cat([start_norm, length_norm], dim=-1)      # (B, N, 2)
+        # film_input = torch.cat([chr_emb, pos_cont], dim=-1)          # (B, N, chr_emb_dim+2)
         
-        # 5) FiLM: compute (γ,β) from film_input → apply
+        # 4) Concatenate chromosome embedding with Fourier features of continuous positions
+        pos_enc = self.fourier_pos(start_norm, length_norm)          # (B, N, 4*n_freq)
+        film_input = torch.cat([chr_emb, pos_enc], dim=-1)           # (B, N, chr_emb_dim+4*n_freq)
+        
+        # 5) FiLM: compute (γ,β) from film_input 
         # gam_bias = self.film_mlp(film_input)      # (B, N, 2E)
         # gamma, beta = gam_bias.chunk(2, dim=-1)   # each (B, N, E)
         # x = gamma * c + beta                      # (B, N, E)
-        delt = self.film_mlp(film_input)           # (B, N, 2E)
-        delta_gamma, beta = delt.chunk(2, dim=-1)  # each (B, N, E)
-        x = (1.0 + delta_gamma) * c + beta         # near-identity at init
+        delt = self.film_mlp(film_input) 
+        delta_gamma, beta = delt.chunk(2, dim=-1)
+        delta_gamma = 0.5 * torch.tanh(delta_gamma)
+        x = (1.0 + delta_gamma) * c + beta
 
         # 6) pad/truncate sequence-length to pad_len
         if N < pad_len:
@@ -175,7 +313,10 @@ class JointBlockEmbedder(nn.Module):
         for conv in self.convs:
             x = conv(x)
 
-        # 9) reshape to 2D grid
+        # 9) MHSA at the bottleneck: global mixing
+        x = self.bottleneck_attn(x)
+
+        # 10) reshape to 2D grid
         return x.view(B, -1, H, W)                # (B, C, H, W)
 
 
@@ -219,7 +360,8 @@ class JointBlockDecoder(nn.Module):
                 out_ch = in_ch // 2
             else:
                 out_ch = in_ch
-            deconvs.append(UpResBlock1D(in_ch, out_ch))
+            # deconvs.append(UpResBlock1D(in_ch, out_ch))
+            deconvs.append(UpMBResBlock1D(in_ch, out_ch, expand_ratio=4))
             in_ch = out_ch
         assert in_ch == E
         
