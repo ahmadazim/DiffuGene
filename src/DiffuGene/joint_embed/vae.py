@@ -8,157 +8,18 @@ from .distribution import DiagonalGaussianDistribution
 def _gn_groups(ch: int) -> int:
     return min(32, max(1, ch // 8))
 
-# class DownResBlock1D(nn.Module):
-#     """
-#     Residual downsampling block:
-#       main: Conv1d(k=3, s=2) → GN → Act → Conv1d(k=3, s=1) → GN
-#       skip: Conv1d(k=1, s=2)
-#     Output: Act(main + skip)
-#     """
-#     def __init__(self, in_ch: int, out_ch: int):
-#         super().__init__()
-#         self.conv_ds = nn.Conv1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False)
-#         self.gn1     = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
-#         self.act     = nn.SiLU(inplace=True)
-#         self.conv    = nn.Conv1d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
-#         self.gn2     = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
-#         self.skip    = nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=2, bias=False)
-#         nn.init.zeros_(self.gn2.weight)
-#         nn.init.zeros_(self.gn2.bias)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         y = self.conv_ds(x)
-#         y = self.gn1(y)
-#         y = self.act(y)
-#         y = self.conv(y)
-#         y = self.gn2(y)
-#         s = self.skip(x)
-#         return self.act(y + s)
-
-class SE1D(nn.Module):
-    def __init__(self, ch: int, r: int = 8):
-        super().__init__()
-        hidden = max(1, ch // r)
-        self.net = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Conv1d(ch, hidden, 1), 
-            nn.SiLU(inplace=True),
-            nn.Conv1d(hidden, ch, 1), 
-            nn.Sigmoid()
-        )
-    def forward(self, x):
-        return x * self.net(x)
-
-class DownMBResBlock1D(nn.Module):
+def morton_index_to_xy(index: int, n: int) -> tuple[int, int]:
     """
-    Inverted-bottleneck residual downsampling:
-      main: PW expand → GN → SiLU → Depthwise Conv(s=2) → GN → SiLU → PW project → GN(=0) → SE → + skip(1x1,s=2) → SiLU
-      skip: Conv1d(k=1, s=2)
-    Keeps output channels = out_ch, but large inner width
+    Convert a Morton (Z-order) index into (x,y) on a 2^n x 2^n grid.
+    This is used to generate a deterministic space-filling ordering.
     """
-    def __init__(self, in_ch: int, out_ch: int, expand_ratio: int = 4):
-        super().__init__()
-        mid = max(out_ch, in_ch) * expand_ratio
-        self.pw_expand = nn.Conv1d(in_ch, mid, kernel_size=1, bias=False)
-        self.gn0 = nn.GroupNorm(_gn_groups(mid), mid)
-        self.dw = nn.Conv1d(mid, mid, kernel_size=3, stride=2, padding=1, groups=mid, bias=False)
-        self.gn1 = nn.GroupNorm(_gn_groups(mid), mid)
-        self.act = nn.SiLU(inplace=True)
-        self.pw_proj = nn.Conv1d(mid, out_ch, kernel_size=1, bias=False)
-        self.gn2 = nn.GroupNorm(_gn_groups(out_ch), out_ch)
-        self.se = SE1D(out_ch)
-        self.skip = nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=2, bias=False)
-        # identity init on the last norm
-        nn.init.zeros_(self.gn2.weight)
-        nn.init.zeros_(self.gn2.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.pw_expand(x)
-        y = self.act(self.gn0(y))
-        y = self.act(self.gn1(self.dw(y)))
-        y = self.gn2(self.pw_proj(y))
-        y = self.se(y)
-        s = self.skip(x)
-        return self.act(y + s)
-
-# class UpResBlock1D(nn.Module):
-#     """
-#     Residual upsampling block:
-#       main: ConvT1d(k=3, s=2, p=1, out_pad=1) → GN → Act → Conv1d(k=3, s=1) → GN
-#       skip: ConvT1d(k=1, s=2, out_pad=1)
-#     Output: Act(main + skip)
-#     """
-#     def __init__(self, in_ch: int, out_ch: int):
-#         super().__init__()
-#         self.deconv   = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, output_padding=1, bias=False)
-#         self.gn1      = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
-#         self.act      = nn.SiLU(inplace=True)
-#         self.conv     = nn.Conv1d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False)
-#         self.gn2      = nn.GroupNorm(num_groups=_gn_groups(out_ch), num_channels=out_ch)
-#         # k=1, s=2, out_pad=1 to exactly double length on skip
-#         self.skip_up  = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=1, stride=2, padding=0, output_padding=1, bias=False)
-#         nn.init.zeros_(self.gn2.weight)
-#         nn.init.zeros_(self.gn2.bias)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         y = self.deconv(x)
-#         y = self.gn1(y)
-#         y = self.act(y)
-#         y = self.conv(y)
-#         y = self.gn2(y)
-#         s = self.skip_up(x)
-#         return self.act(y + s)
-
-class UpMBResBlock1D(nn.Module):
-    """
-    Inverted-bottleneck residual upsampling:
-      main: PW expand → GN → SiLU → Depthwise ConvT(s=2) → GN → SiLU → PW project → GN(=0) → SE → + skip(ConvT1d 1x1,s=2) → SiLU
-    """
-    def __init__(self, in_ch: int, out_ch: int, expand_ratio: int = 4):
-        super().__init__()
-        mid = max(out_ch, in_ch) * expand_ratio
-        self.pw_expand = nn.Conv1d(in_ch, mid, kernel_size=1, bias=False)
-        self.gn0 = nn.GroupNorm(_gn_groups(mid), mid)
-        self.dw_t = nn.ConvTranspose1d(mid, mid, kernel_size=3, stride=2, padding=1, output_padding=1, groups=mid, bias=False)
-        self.gn1 = nn.GroupNorm(_gn_groups(mid), mid)
-        self.act = nn.SiLU(inplace=True)
-        self.pw_proj = nn.Conv1d(mid, out_ch, kernel_size=1, bias=False)
-        self.gn2 = nn.GroupNorm(_gn_groups(out_ch), out_ch)
-        self.se = SE1D(out_ch)
-        self.skip_up = nn.ConvTranspose1d(in_ch, out_ch, kernel_size=1, stride=2, padding=0, output_padding=1, bias=False)
-        nn.init.zeros_(self.gn2.weight)
-        nn.init.zeros_(self.gn2.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.pw_expand(x)
-        y = self.act(self.gn0(y))
-        y = self.act(self.gn1(self.dw_t(y)))
-        y = self.gn2(self.pw_proj(y))
-        y = self.se(y)
-        s = self.skip_up(x)
-        return self.act(y + s)
-
-class BottleneckMHSA1D(nn.Module):
-    """Single MHSA layer that runs at the bottleneck length L=H*W (after all downsamples)."""
-    def __init__(self, ch: int, num_heads: int = 8):
-        super().__init__()
-        self.ln   = nn.LayerNorm(ch)
-        self.mha  = nn.MultiheadAttention(embed_dim=ch, num_heads=num_heads, batch_first=True)
-        self.ffn  = nn.Sequential(
-            nn.Linear(ch, 4*ch), 
-            nn.SiLU(inplace=True),
-            nn.Linear(4*ch, ch)
-        )
-        nn.init.zeros_(self.ffn[-1].weight)
-        nn.init.zeros_(self.ffn[-1].bias)
-        
-    def forward(self, x_bcl: torch.Tensor) -> torch.Tensor:
-        B, C, L = x_bcl.shape
-        x = x_bcl.transpose(1, 2)      # (B, L, C)
-        h = self.mha(self.ln(x), self.ln(x), self.ln(x), need_weights=False)[0]
-        x = x + h
-        x = x + self.ffn(self.ln(x))
-        return x.transpose(1, 2)        # (B, C, L)
+    x = 0
+    y = 0
+    for i in range(n):
+        # pick bits: bit 0 -> x, bit 1 -> y, bit 2 -> x, etc.
+        x |= ((index >> (2 * i)) & 1) << i
+        y |= ((index >> (2 * i + 1)) & 1) << i
+    return x, y
 
 class FourierPos(nn.Module):
     """
@@ -170,284 +31,363 @@ class FourierPos(nn.Module):
         super().__init__()
         freqs = 2.0 ** torch.arange(n_freq, dtype=torch.float32)
         self.register_buffer("freqs", freqs, persistent=False)
-    
+
     def forward(self, start_norm: torch.Tensor, length_norm: torch.Tensor) -> torch.Tensor:
         s = start_norm * self.freqs  # (B,N,n_freq)
         l = length_norm * self.freqs
         feat = torch.cat([
-            torch.sin(2 * math.pi * s), 
+            torch.sin(2 * math.pi * s),
             torch.cos(2 * math.pi * s),
-            torch.sin(2 * math.pi * l), 
+            torch.sin(2 * math.pi * l),
             torch.cos(2 * math.pi * l)
-        ], dim=-1)                    # (B,N,4*n_freq)
+        ], dim=-1)  # (B,N,4*n_freq)
         return feat
 
 class JointBlockEmbedder(nn.Module):
     """
-    1) content MLP: (B,N,D) → (B,N,E)
-    2) FiLM pos‐modulation: (B,N,E) using chromosome embeddings + continuous positions
-    3) pad/truncate seq‐len → 4*H*W
-    4) permute → (B, E, 4*H*W)
-    5) Conv1d(stride=2)  → (B, C/2, 2*H*W)
-    6) Conv1d(stride=2)  → (B, C,   H*W)
-    7) reshape → (B, C, H, W)
+    Encoder with deterministic Z-order curve + learned jitter.
+      1) token MLP: (B,N,D) → (B,N,E) with FiLM (chr/start/length)
+      2) compute deterministic base coords (u0,v0) via Z-order curve
+      3) predict jitters Δ(u,v) via jitter_mlp → (u0+Δu,v0+Δv)
+      4) bilinearly splat token features into grid → (B,E,H,W)
+      5) optional small 2D conv → 1×1 conv → (B,latent_channels,H,W)
+    No huge padding; grid_size is arbitrary.
     """
-    def __init__(self,
-                 n_blocks: int,
-                 block_emb_dim: int = 3,
-                 pos_emb_dim: int   = 16,
-                 grid_size: tuple   = (64,64),
-                 latent_channels: int = 128):
+    def __init__(
+        self,
+        n_blocks: int,
+        block_emb_dim: int = 6,
+        pos_emb_dim: int   = 16,
+        grid_size: tuple   = (64,64),
+        latent_channels: int = 128,
+        stem_channels: int = 64,
+        jitter_mlp: nn.Module | None = None,
+    ):
         super().__init__()
-        H, W = grid_size
-        self.H, self.W = H, W
+        H_target, W_fixed = grid_size
+        self.H_target = H_target
+        self.W_fixed  = W_fixed
         self.n_blocks = n_blocks
+        E = stem_channels
 
-        # 1) compute pad_len and # downsamples
-        base = 4 * H * W
-        ratio = n_blocks / base
-        k = max(0, math.ceil(math.log2(ratio)))   # number of stride-2 steps
-        self.k = k
-        pad_len = base * (2**k)
-
-        # 2) compute total downsamples: k to reach 4HW from padded n_blocks + 2 to reach HW
-        num_downsamples = k + 2
-        E = latent_channels // (2**num_downsamples)
-        assert E * (2**num_downsamples) == latent_channels, "latent_channels must be divisible by 2**(k+2) for a clean conv path"
-        
-        # Chromosome embedding dimension (hardcoded)
-        chr_emb_dim = 8
-
-        # 3) content MLP: D → E
+        # content MLP (D → E); keep PCs mostly intact
         self.content_mlp = nn.Sequential(
             nn.Linear(block_emb_dim, pos_emb_dim),
-            # nn.LeakyReLU(0.2, inplace=True),
             nn.SiLU(inplace=True),
-            # nn.Dropout(p=0.05),
             nn.Linear(pos_emb_dim, E),
         )
         self.content_skip = nn.Linear(block_emb_dim, E)
-        
-        # 4) Chromosome embedding (1-22)
-        self.chr_embedding = nn.Embedding(num_embeddings=23, embedding_dim=chr_emb_dim)  # 0-22 (0 unused, 1-22)
-        
-        # # 5) FiLM MLP: chr_emb + continuous positions → 2*E (γ,β)
-        # in_dim = chr_emb_dim + 2  # chr_embed + start_norm + length_norm
-        
-        # 5) FiLM MLP: chr_emb + Fourier features(start_norm, length_norm) → 2*E (γ,β)
-        self.fourier_pos = FourierPos(n_freq=8)
-        n_fourier = 4 * self.fourier_pos.freqs.numel()  # 4*n_freq
-        in_dim = chr_emb_dim + n_fourier
 
+        # FiLM MLP (chr_emb + Fourier features → 2E)
+        chr_emb_dim = 8
+        self.chr_embedding = nn.Embedding(23, chr_emb_dim)  # indices 1..22 used
+        self.fourier_pos = FourierPos(n_freq=8)
+        n_fourier = 4 * self.fourier_pos.freqs.numel()
+        film_in_dim = chr_emb_dim + n_fourier
         self.film_mlp = nn.Sequential(
-            nn.Linear(in_dim, pos_emb_dim),
+            nn.Linear(film_in_dim, pos_emb_dim),
             nn.LeakyReLU(0.2, inplace=True),
-            # nn.Dropout(p=0.05),
             nn.Linear(pos_emb_dim, 2 * E),
         )
-        # zero-init FiLM layer (start near identity)
         nn.init.zeros_(self.film_mlp[-1].weight)
         nn.init.zeros_(self.film_mlp[-1].bias)
 
-        # 6) residual downsample blocks: E→...→C, k+2 stages (each doubles channels, stride=2)
-        convs = []
-        in_ch = E
-        for _ in range(num_downsamples):
-            out_ch = in_ch * 2
-            # convs.append(DownResBlock1D(in_ch, out_ch))
-            convs.append(DownMBResBlock1D(in_ch, out_ch, expand_ratio=4))
-            in_ch = out_ch
-        assert in_ch == latent_channels, f"Expected final channels {latent_channels}, got {in_ch}"
-        self.convs = nn.ModuleList(convs)
-        
-        # MHSA at the bottleneck
-        self.bottleneck_attn = BottleneckMHSA1D(ch=latent_channels, num_heads=8)
+        # jitter MLP shared with decoder; if none, create one here.
+        if jitter_mlp is None:
+            self.jitter_mlp = nn.Sequential(
+                nn.Linear(film_in_dim, pos_emb_dim),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Linear(pos_emb_dim, 2),
+            )
+            nn.init.zeros_(self.jitter_mlp[-1].weight)
+            nn.init.zeros_(self.jitter_mlp[-1].bias)
+        else:
+            self.jitter_mlp = jitter_mlp
+
+        # # jitter scale: move at most one cell in normalized coords
+        # self.jitter_scale = 1.0 / max(H_target, W_fixed)
+        self.jitter_scale = 1.5 / max(H_target, W_fixed)
+        self.register_buffer("jitter_factor", torch.tensor(1.0), persistent=False)
+
+        # Precompute base coords (u0,v0) for each of the n_blocks tokens
+        # using Z-order curve on a 2^n × 2^n grid with n = ceil(log2(max(H,W))).
+        n = math.ceil(math.log2(max(H_target, W_fixed)))
+        two_n = 1 << n
+        max_idx = (1 << (2 * n)) - 1
+        base = torch.zeros(n_blocks, 2, dtype=torch.float32)
+        for i in range(n_blocks):
+            # linearize index → 0..max_idx
+            p = i / (n_blocks - 1) if n_blocks > 1 else 0.0
+            hil_idx = int(p * max_idx + 0.5)
+            x0, y0 = morton_index_to_xy(hil_idx, n)
+            # normalized coords in [0,1]
+            u0 = x0 / (two_n - 1)
+            v0 = y0 / (two_n - 1)
+            base[i, 0] = u0
+            base[i, 1] = v0
+        self.register_buffer("base_coords", base, persistent=False)
+
+        self.refine = nn.Sequential(
+            nn.Conv2d(2*E + 1, E, kernel_size=3, padding=1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(E, E, kernel_size=3, padding=1, bias=True),
+        )
+        # small 1×1 expand–mix–project before latent head
+        self.pre_latent = nn.Sequential(
+            nn.Conv2d(E, 2*E, kernel_size=1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(2*E, E, kernel_size=1, bias=True),
+        )
+        # 1×1 conv to latent channels
+        self.to_latent = nn.Conv2d(E, latent_channels, kernel_size=1, bias=True)
 
     def forward(self, block_embs: torch.Tensor, spans: torch.Tensor) -> torch.Tensor:
-        """
-        block_embs: (B, N, D)
-        spans:      (B, N, 3) where 3 = (chr_idx, start_norm, length_norm)
-        returns:    (B, C, H, W)
-        """
-        B, N, D = block_embs.shape
-        H, W    = self.H, self.W
-        base = 4 * H * W
-        pad_len = base * (2**self.k)
+        B, N, _ = block_embs.shape
 
-        # 1) content → (B,N,E)
+        # 1) token content: (B,N,E)
         c = self.content_mlp(block_embs) + self.content_skip(block_embs)
 
-        # 2) Split spans: (chr_idx, start_norm, length_norm)
-        chr_idx, start_norm, length_norm = spans.chunk(3, dim=-1)  # each (B, N, 1)
+        # 2) FiLM: compute scale & shift per token
+        chr_idx, start_norm, length_norm = spans.chunk(3, dim=-1)
+        chr_emb = self.chr_embedding(chr_idx.long().squeeze(-1))  # (B,N,chr_emb_dim)
+        pos_enc = self.fourier_pos(start_norm, length_norm)       # (B,N,4*n_freq)
+        film_input = torch.cat([chr_emb, pos_enc], dim=-1)        # (B,N,film_in_dim)
+        delt = self.film_mlp(film_input)                          # (B,N,2E)
+        gamma, beta = delt.chunk(2, dim=-1)
+        gamma = 0.5 * torch.tanh(gamma)  # small scale deviations
+        x = (1.0 + gamma) * c + beta     # (B,N,E)
+
+        # 3) base coords + jitter
+        device = x.device
+        coords = self.base_coords[:N].to(device)                  # (N,2)
+        coords = coords.unsqueeze(0).expand(B, N, 2)              # (B,N,2)
+        delta = self.jitter_mlp(film_input)                       # (B,N,2)
+        delta = torch.tanh(delta) * (self.jitter_scale * self.jitter_factor)
+        uv = coords + delta                                       # (B,N,2)
+        uv = torch.clamp(uv, 0.0, 1.0)
+
+        # 4) bilinear scatter into grid
+        H = self.H_target
+        W = self.W_fixed
+        du = uv[..., 0] * (W - 1)                                 # (B,N)
+        dv = uv[..., 1] * (H - 1)
+        j0 = torch.floor(du).long()
+        i0 = torch.floor(dv).long()
+        j1 = torch.clamp(j0 + 1, max=W - 1)
+        i1 = torch.clamp(i0 + 1, max=H - 1)
+        w00 = (i1.float() - dv) * (j1.float() - du)               # (B,N)
+        w10 = (i1.float() - dv) * (du - j0.float())
+        w01 = (dv - i0.float()) * (j1.float() - du)
+        w11 = (dv - i0.float()) * (du - j0.float())
+
+        f_i = x.permute(0, 2, 1).contiguous()                     # (B,E,N)
+        # Flatten grid for scatter: (H*W)
+        F_flat = torch.zeros(B, f_i.shape[1], H * W, device=device)
+        M_flat = torch.zeros(B, 1, H * W, device=device)
+        # compute linear indices
+        idx00 = (i0 * W + j0)                                     # (B,N)
+        idx10 = (i0 * W + j1)
+        idx01 = (i1 * W + j0)
+        idx11 = (i1 * W + j1)
+        for weight, idx in ((w00, idx00), (w10, idx10), (w01, idx01), (w11, idx11)):
+            w_exp  = weight.unsqueeze(1)                          # (B,1,N)
+            src    = f_i * w_exp                                  # (B,E,N)
+            F_flat.scatter_add_(2, idx.unsqueeze(1).expand_as(src), src)
+            M_flat.scatter_add_(2, idx.unsqueeze(1).expand(B, 1, N), weight.unsqueeze(1))
+        # reshape to (B,E,H,W)
+        F_grid = F_flat.view(B, f_i.shape[1], H, W)
+        M_grid = M_flat.view(B, 1, H, W)
         
-        # 3) Get chromosome embedding
-        chr_emb = self.chr_embedding(chr_idx.long().squeeze(-1))     # (B, N, chr_emb_dim)
+        # build inputs for refiner: mean, sum, and mass
+        mu = F_grid / (M_grid + 1e-8)
+        x_in = torch.cat([mu, F_grid, M_grid], dim=1)             # (B, 2E+1, H, W)
+        x_grid = self.refine(x_in)                                # (B,E,H,W)
         
-        # # 4) Concatenate chromosome embedding with continuous positions
-        # pos_cont = torch.cat([start_norm, length_norm], dim=-1)      # (B, N, 2)
-        # film_input = torch.cat([chr_emb, pos_cont], dim=-1)          # (B, N, chr_emb_dim+2)
-        
-        # 4) Concatenate chromosome embedding with Fourier features of continuous positions
-        pos_enc = self.fourier_pos(start_norm, length_norm)          # (B, N, 4*n_freq)
-        film_input = torch.cat([chr_emb, pos_enc], dim=-1)           # (B, N, chr_emb_dim+4*n_freq)
-        
-        # 5) FiLM: compute (γ,β) from film_input 
-        # gam_bias = self.film_mlp(film_input)      # (B, N, 2E)
-        # gamma, beta = gam_bias.chunk(2, dim=-1)   # each (B, N, E)
-        # x = gamma * c + beta                      # (B, N, E)
-        delt = self.film_mlp(film_input) 
-        delta_gamma, beta = delt.chunk(2, dim=-1)
-        delta_gamma = 0.5 * torch.tanh(delta_gamma)
-        x = (1.0 + delta_gamma) * c + beta
+        # extra 1×1 mixing prior to latent projection
+        x_grid = self.pre_latent(x_grid)
 
-        # 6) pad/truncate sequence-length to pad_len
-        if N < pad_len:
-            pad_sz = pad_len - N
-            pad = x.new_zeros((B, pad_sz, x.size(-1)))
-            x = torch.cat([x, pad], dim=1)
-
-        # 7) → (B, E, pad_len)
-        x = x.permute(0, 2, 1)
-
-        # 8) → (B, C, H*W)
-        for conv in self.convs:
-            x = conv(x)
-
-        # 9) MHSA at the bottleneck: global mixing
-        x = self.bottleneck_attn(x)
-
-        # 10) reshape to 2D grid
-        return x.view(B, -1, H, W)                # (B, C, H, W)
-
-
+        # 5) project to latent channels
+        x_latent = self.to_latent(x_grid)                        # (B,C,H,W)
+        return x_latent
 
 class JointBlockDecoder(nn.Module):
     """
-    Mirror of the embedder, but taking in z of shape (B, C2, H, W), where
-    C2 = latent_channels // 2 == the number of sampled latent channels.
-    
-    Uses the same dynamic scaling logic as the encoder.
+    Decoder using the same Z-order coords and jitter for bilinear readout.
+      1) convert z (B,C2,H,W) → mid channels (E) via 1×1
+      2) compute coords (u0+Δu, v0+Δv)
+      3) bilinearly read from grid → (B,N,E)
+      4) MLP E→block_emb_dim to reconstruct original 6-D block PCs.
     """
-    def __init__(self,
-                 n_blocks: int,
-                 grid_size: tuple   = (64,64),
-                 block_emb_dim: int = 4,
-                 pos_emb_dim: int   = 16,
-                 latent_channels: int = 128):
+    def __init__(
+        self,
+        n_blocks: int,
+        grid_size: tuple   = (64,64),
+        block_emb_dim: int = 6,
+        pos_emb_dim: int   = 16,
+        latent_channels: int = 128,
+        stem_channels: int = 64,
+        jitter_mlp: nn.Module | None = None,
+    ):
         super().__init__()
-        H, W = grid_size
-        self.H, self.W = H, W
+        H_target, W_fixed = grid_size
+        self.H_target = H_target
+        self.W_fixed  = W_fixed
         self.n_blocks = n_blocks
+        E = stem_channels
+        C2 = latent_channels // 2  # sampled latent channels
 
-        # 1) compute pad_len and # downsamples (same as encoder)
-        base = 4 * H * W
-        ratio = n_blocks / base
-        k = max(0, math.ceil(math.log2(ratio)))   # number of stride-2 steps
-        self.k = k
-        self.pad_len = base * (2**k)
+        # 1×1 conv to reduce latent_channels/2 → E
+        self.from_latent = nn.Conv2d(C2, E, kernel_size=1, bias=True)
 
-        # 2) embed‐dims (same as encoder)
-        num_downsamples = k + 2
-        E = latent_channels // (2**num_downsamples)
-        assert E * (2**num_downsamples) == latent_channels, "latent_channels must be divisible by 2**(k+2) for a clean conv path"
-        C2 = latent_channels // 2   # z's channel count (sampled latents)
+        # reuse jitter_mlp or create if none
+        if jitter_mlp is None:
+            # same dimensions as encoder
+            chr_emb_dim = 8
+            n_freq = 8
+            n_fourier = 4 * n_freq
+            film_in_dim = chr_emb_dim + n_fourier
+            self.jitter_mlp = nn.Sequential(
+                nn.Linear(film_in_dim, pos_emb_dim),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Linear(pos_emb_dim, 2),
+            )
+            nn.init.zeros_(self.jitter_mlp[-1].weight)
+            nn.init.zeros_(self.jitter_mlp[-1].bias)
+        else:
+            self.jitter_mlp = jitter_mlp
 
-        # 3) Build transposed conv layers: reverse of encoder
-        deconvs = []
-        in_ch = C2
-        for i in range(num_downsamples):
-            if i < num_downsamples - 1:
-                out_ch = in_ch // 2
-            else:
-                out_ch = in_ch
-            # deconvs.append(UpResBlock1D(in_ch, out_ch))
-            deconvs.append(UpMBResBlock1D(in_ch, out_ch, expand_ratio=4))
-            in_ch = out_ch
-        assert in_ch == E
-        
-        self.deconvs = nn.ModuleList(deconvs)
+        # self.jitter_scale = 1.0 / max(H_target, W_fixed)
+        self.jitter_scale = 1.5 / max(H_target, W_fixed)
+        self.register_buffer("jitter_factor", torch.tensor(1.0), persistent=False)
 
-        # 4) project back to original block‐embedding dim
+        # Precompute base coords as in encoder
+        n = math.ceil(math.log2(max(H_target, W_fixed)))
+        two_n = 1 << n
+        max_idx = (1 << (2 * n)) - 1
+        base = torch.zeros(n_blocks, 2, dtype=torch.float32)
+        for i in range(n_blocks):
+            p = i / (n_blocks - 1) if n_blocks > 1 else 0.0
+            hil_idx = int(p * max_idx + 0.5)
+            x0, y0 = morton_index_to_xy(hil_idx, n)
+            u0 = x0 / (two_n - 1)
+            v0 = y0 / (two_n - 1)
+            base[i, 0] = u0
+            base[i, 1] = v0
+        self.register_buffer("base_coords", base, persistent=False)
+
+        # Reuse Fourier and chr embedding for jitter MLP
+        self.chr_embedding = nn.Embedding(23, 8)  # match encoder
+        self.fourier_pos  = FourierPos(n_freq=8)
+
+        # final linear to original PC dimension
         self.cell_unproj = nn.Linear(E, block_emb_dim)
 
     def forward(self, z: torch.Tensor, spans: torch.Tensor) -> torch.Tensor:
+        """
+        z:     (B, latent_channels//2, H, W)
+        spans: (B, N, 3) with (chr_idx, start_norm, length_norm)
+        returns: (B,N,block_emb_dim)
+        """
         B, C2, H, W = z.shape
         N = spans.size(1)
 
-        # fuse H×W → sequence of length H*W
-        x = z.view(B, C2, H*W)
+        # 1) convert latent z to E channels
+        x = self.from_latent(z)                              # (B,E,H,W)
 
-        # Apply transposed convolutions to reverse the encoder
-        for deconv in self.deconvs:
-            x = deconv(x)
+        # 2) coords + jitter
+        coords = self.base_coords[:N].to(z.device).unsqueeze(0).expand(B, N, 2)
+        chr_idx, start_norm, length_norm = spans.chunk(3, dim=-1)
+        chr_emb = self.chr_embedding(chr_idx.long().squeeze(-1))
+        pos_enc = self.fourier_pos(start_norm, length_norm)
+        film_input = torch.cat([chr_emb, pos_enc], dim=-1)
+        delta = self.jitter_mlp(film_input)
+        delta = torch.tanh(delta) * (self.jitter_scale * self.jitter_factor)
+        uv = coords + delta
+        uv = torch.clamp(uv, 0.0, 1.0)
 
-        # → (B, pad_len, E)
-        x = x.permute(0, 2, 1)
+        du = uv[..., 0] * (self.W_fixed - 1)
+        dv = uv[..., 1] * (self.H_target - 1)
+        j0 = torch.floor(du).long()
+        i0 = torch.floor(dv).long()
+        j1 = torch.clamp(j0 + 1, max=self.W_fixed - 1)
+        i1 = torch.clamp(i0 + 1, max=self.H_target - 1)
+        w00 = (i1.float() - dv) * (j1.float() - du)
+        w10 = (i1.float() - dv) * (du - j0.float())
+        w01 = (dv - i0.float()) * (j1.float() - du)
+        w11 = (dv - i0.float()) * (du - j0.float())
 
-        # pad/truncate back to original N
-        if N < self.pad_len:
-            x = x[:, :N, :]
+        # flatten grid for gather
+        F_flat = x.view(B, x.shape[1], -1)                   # (B,E,H*W)
+        g = torch.zeros(B, x.shape[1], N, device=z.device)   # (B,E,N)
+        # compute linear indices
+        idx00 = (i0 * self.W_fixed + j0)
+        idx10 = (i0 * self.W_fixed + j1)
+        idx01 = (i1 * self.W_fixed + j0)
+        idx11 = (i1 * self.W_fixed + j1)
+        for weight, idx in ((w00, idx00), (w10, idx10), (w01, idx01), (w11, idx11)):
+            w_exp = weight.unsqueeze(1)                     # (B,1,N)
+            gathered = F_flat.gather(2, idx.unsqueeze(1).expand(-1, x.shape[1], -1))
+            g += gathered * w_exp                           # accumulate weighted features
 
-        # project E→block_emb_dim
-        x = self.cell_unproj(x)
+        g = g.permute(0, 2, 1).contiguous()                # (B,N,E)
 
-        return x    # (B, N, block_emb_dim)
-
-
+        # 3) project to original block dimension (6 PCs)
+        recon = self.cell_unproj(g)                         # (B,N,block_emb_dim)
+        return recon
 
 class SNPVAE(nn.Module):
+    """
+    VAE wrapper using Z-order + jitter encoder/decoder.
+    """
     def __init__(
         self,
-        n_blocks,
-        grid_size=(64,64),
-        block_emb_dim=3,
-        pos_emb_dim=16,
-        latent_channels=128
+        n_blocks: int,
+        grid_size: tuple = (64, 64),
+        block_emb_dim: int = 6,
+        pos_emb_dim: int = 16,
+        latent_channels: int = 128,
+        stem_channels: int = 64,
     ):
         super().__init__()
-        self.n_blocks = n_blocks
+        # define a shared jitter MLP for coords
+        chr_emb_dim = 8
+        n_freq = 8
+        n_fourier = 4 * n_freq
+        film_in_dim = chr_emb_dim + n_fourier
+        jitter_mlp = nn.Sequential(
+            nn.Linear(film_in_dim, pos_emb_dim),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(pos_emb_dim, 2),
+        )
+        nn.init.zeros_(jitter_mlp[-1].weight)
+        nn.init.zeros_(jitter_mlp[-1].bias)
 
-        # 1) Embedder: content‐MLP + FiLM + Conv1d↓ → (B, latent_channels, H, W)
         self.joint_embedder = JointBlockEmbedder(
             n_blocks        = n_blocks,
             block_emb_dim   = block_emb_dim,
             pos_emb_dim     = pos_emb_dim,
             grid_size       = grid_size,
             latent_channels = latent_channels,
+            stem_channels   = stem_channels,
+            jitter_mlp      = jitter_mlp,
         )
-
-        # 2) VAE head: DiagonalGaussianDistribution expects a latent_channels-channel map
-        #    and splits it internally into two (latent_channels//2)-ch tensors for mean/logvar.
-        
-        # 3) Decoder: mirror of embedder
         self.joint_decoder = JointBlockDecoder(
             n_blocks        = n_blocks,
             grid_size       = grid_size,
             block_emb_dim   = block_emb_dim,
             pos_emb_dim     = pos_emb_dim,
             latent_channels = latent_channels,
+            stem_channels   = stem_channels,
+            jitter_mlp      = jitter_mlp,
         )
 
     def encode(self, block_embs, spans):
-        """
-        block_embs: (B, N, D)
-        spans:      (B, N, 3) where 3 = (chr_idx, start_norm, length_norm)
-        returns:
-          z:    (B, latent_channels//2, H, W)
-          dist: DiagonalGaussianDistribution over z
-        """
-        x = self.joint_embedder(block_embs, spans)   # (B, latent_channels, H, W)
-        dist = DiagonalGaussianDistribution(x)       # splits latent_channels → (latent_channels//2) + (latent_channels//2) internally
-        z = dist.sample()                            # (B, latent_channels//2, H, W)
+        x = self.joint_embedder(block_embs, spans)
+        dist = DiagonalGaussianDistribution(x)
+        z = dist.sample()  # (B,C2,H,W)
         return z, dist
 
     def decode(self, z, spans):
-        """
-        z:     (B, latent_channels//2, H, W)
-        spans: (B, N, 3) where 3 = (chr_idx, start_norm, length_norm)
-        returns:
-          recon_emb: (B, N, D)
-        """
         return self.joint_decoder(z, spans)
 
     def forward(self, block_embs, spans):
