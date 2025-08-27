@@ -5,6 +5,7 @@ import glob
 import argparse
 import re
 import torch
+import math
 import torch.nn.functional as F
 import pandas as pd
 import numpy as np
@@ -14,7 +15,17 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 
-from src.DiffuGene.joint_embed.vae import SNPVAE
+from src.DiffuGene.joint_embed.vae_OLD import SNPVAE
+from src.DiffuGene.diffusion.viz_generated_samples import (
+    load_decoded_recon,
+    plot_latent_histograms,
+    pick_blocks_with_min_snps,
+    plot_ld_heatmaps,
+    plot_af_and_variance,
+    plot_af_scatter,
+    build_block_map_from_spans,
+    load_raw_block
+)
 from src.DiffuGene.block_embed import PCA_Block
 from src.DiffuGene.joint_embed.memory_efficient_dataset import load_single_pca_block
 from src.DiffuGene.utils import setup_logging, get_logger
@@ -131,7 +142,14 @@ def prepare_block_info_for_decoding(spans_file, embeddings_dir, chromosome=None)
     logger.info(f"Prepared block info for {len(block_info)} blocks")
     return block_info
 
-def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_file, batch_size=32, chromosome=None):
+def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_file, batch_size=32, chromosome=None,
+                   viz_original_latents: str = None,
+                   viz_decoded_original: str = None,
+                   viz_latent_dims = None,
+                   viz_latent_samples: int = 512,
+                   viz_min_snps: int = 30,
+                   viz_num_blocks: int = 5,
+                   viz_recoded_dir: str = None):
     """
     Decode VAE latents back to original SNP space using on-demand PCA loading.
     
@@ -169,41 +187,44 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     logger.info(f"Loading VAE model from: {model_file}")
     model_data = torch.load(model_file, map_location=device)
     
-    # Extract configuration and scaling info
-    if isinstance(model_data, dict) and 'config' in model_data:
-        config = model_data['config']
-        model_state = model_data['model_state_dict']
-        
-        # Extract PC scaling factors if available
-        pc_means = None
-        pc_scales = None
-        if 'pc_scaling' in model_data:
-            pc_means = model_data['pc_scaling']['pc_means'].to(device)
-            pc_scales = model_data['pc_scaling']['pc_scales'].to(device)
-            logger.info("Found PC scaling factors in model file")
-            
-        # Get n_blocks from saved config if available
-        saved_n_blocks = config.get('n_blocks', None)
-    else:
-        # Fallback for older model format
-        raise ValueError("Model file must contain configuration. Please use a model saved with the current training script.")
+    # Extract configuration and scaling info (authoritative from training)
+    if not (isinstance(model_data, dict) and 'model_state_dict' in model_data and 'config' in model_data):
+        raise ValueError("Model file must contain 'model_state_dict' and 'config' saved by train.py.")
     
-    # 3. Prepare block info for on-demand PCA loading
+    config = model_data['config']
+    model_state = model_data['model_state_dict']
+    
+    # Extract PC scaling factors if available
+    pc_means = None
+    pc_scales = None
+    if 'pc_scaling' in model_data:
+        pc_means = model_data['pc_scaling']['pc_means'].to(device)
+        pc_scales = model_data['pc_scaling']['pc_scales'].to(device)
+        logger.info("Found PC scaling factors in model file")
+    
+    saved_n_blocks = int(config['n_blocks'])
+    
+    # 3. Prepare block info for on-demand PCA loading (spans length N is used only for interpolation)
     block_info = prepare_block_info_for_decoding(spans_file, embeddings_dir, chromosome=chromosome)
-    n_blocks = len(block_info)
+    n_blocks_current = len(block_info)
     
-    # Initialize VAE model
+    # Build SNPVAE exactly as in training using saved config
+    grid_h = int(config['grid_h'])
+    grid_w = int(config['grid_w'])
+    block_dim = int(config['block_dim'])
+    pos_dim = int(config['pos_dim'])
+    latent_channels = int(config['latent_channels'])
+    
     model = SNPVAE(
-        n_blocks=n_blocks,
-        grid_size=(config['grid_h'], config['grid_w']),
-        block_emb_dim=config['block_dim'],
-        pos_emb_dim=config['pos_dim'],
-        latent_channels=config['latent_channels']
+        n_blocks=saved_n_blocks,
+        grid_size=(grid_h, grid_w),
+        block_emb_dim=block_dim,
+        pos_emb_dim=pos_dim,
+        latent_channels=latent_channels
     ).to(device)
-    
-    model.load_state_dict(model_state)
+    model.load_state_dict(model_state, strict=True)
     model.eval()
-    logger.info(f"VAE model loaded with config: {config}")
+    logger.info(f"VAE model loaded strictly with saved config: n_blocks={saved_n_blocks}, block_dim={block_dim}, pos_dim={pos_dim}, latent_channels={latent_channels}")
     
     # 4. Load spans for positioning
     spans = load_spans_file(spans_file)
@@ -211,16 +232,16 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     
     # Verify dimensions match
     n_samples = latents.shape[0]
-    if spans.shape[0] != n_blocks:
-        raise ValueError(f"Spans file has {spans.shape[0]} blocks but block info has {n_blocks} blocks")
+    if spans.shape[0] != n_blocks_current:
+        raise ValueError(f"Spans file has {spans.shape[0]} blocks but block info has {n_blocks_current} blocks")
     
     # Validate against saved config if available
-    if saved_n_blocks is not None and saved_n_blocks != n_blocks:
-        logger.warning(f"Saved model n_blocks ({saved_n_blocks}) != current spans file n_blocks ({n_blocks}). Using current spans file.")
-    elif saved_n_blocks is not None:
-        logger.info(f"n_blocks matches saved model config: {n_blocks}")
+    if saved_n_blocks is not None and saved_n_blocks != n_blocks_current:
+        logger.warning(f"Saved model n_blocks ({saved_n_blocks}) != current spans file n_blocks ({n_blocks_current}). Proceeding (decoder interpolates).")
+    else:
+        logger.info(f"n_blocks matches: {n_blocks_current}")
     
-    logger.info(f"Decoding {n_samples} samples across {n_blocks} blocks")
+    logger.info(f"Decoding {n_samples} samples across {n_blocks_current} blocks")
     
     # 5. Create PCA block cache for on-demand loading
     pca_cache = {}
@@ -251,7 +272,7 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
             
             # PCA decode: PC embeddings → SNPs for each block (on-demand PCA loading)
             batch_reconstructed_snps = []
-            for block_idx in range(n_blocks):
+            for block_idx in range(n_blocks_current):
                 # Get PC embeddings for this block: (batch_size, block_dim)
                 block_pc_embeddings = decoded_pc_embeddings[:, block_idx, :]
                 
@@ -272,7 +293,7 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     logger.info("Concatenating results from all batches...")
     final_reconstructed_snps = []
     
-    for block_idx in range(n_blocks):
+    for block_idx in range(n_blocks_current):
         # Collect this block's reconstructions from all batches
         block_reconstructions = [batch_snps[block_idx] for batch_snps in all_reconstructed_snps]
         # Concatenate along batch dimension
@@ -286,7 +307,7 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     output_data = {
         'reconstructed_snps': final_reconstructed_snps,  # List of tensors, one per block
         'n_samples': n_samples,
-        'n_blocks': n_blocks,
+        'n_blocks': n_blocks_current,
         'block_snp_counts': [snps.shape[1] for snps in final_reconstructed_snps],
         'model_config': config,
         'latents_file': latents_file,
@@ -302,10 +323,84 @@ def decode_latents(latents_file, model_file, embeddings_dir, spans_file, output_
     total_snps = sum(snps.shape[1] for snps in final_reconstructed_snps)
     logger.info(f"Reconstruction complete!")
     logger.info(f"  Total samples: {n_samples}")
-    logger.info(f"  Total blocks: {n_blocks}")
+    logger.info(f"  Total blocks: {n_blocks_current}")
     logger.info(f"  Total SNPs: {total_snps}")
     logger.info(f"  SNPs per block range: {min(snps.shape[1] for snps in final_reconstructed_snps)} - {max(snps.shape[1] for snps in final_reconstructed_snps)}")
     logger.info(f"  PCA blocks loaded on-demand: {len(pca_cache)}")
+    
+    # Visualizations (always attempt; fall back to generated-only if references missing)
+    try:
+        out_dir = os.path.dirname(output_file)
+        # Latent histogram: use provided original latents if present, else fallback to generated latents
+        logger.info("Creating latent histogram visualization...")
+        orig_latents = None
+        if viz_original_latents and os.path.exists(viz_original_latents):
+            try:
+                orig_data = torch.load(viz_original_latents, map_location='cpu')
+                if isinstance(orig_data, dict) and 'latents' in orig_data:
+                    orig_latents = orig_data['latents']
+                elif isinstance(orig_data, torch.Tensor):
+                    orig_latents = orig_data
+                else:
+                    orig_latents = torch.tensor(orig_data, dtype=torch.float32)
+            except Exception as _:
+                orig_latents = None
+        if orig_latents is None:
+            logger.info("Original latents not available; using generated latents for histogram overlay fallback.")
+            orig_latents = latents
+        dims = viz_latent_dims if viz_latent_dims else [0,1,2,3,4,5,6]
+        plot_latent_histograms(
+            gen_latents=latents,
+            orig_latents=orig_latents,
+            dims=dims,
+            num_samples=int(viz_latent_samples),
+            output_path=os.path.join(out_dir, 'latent_histograms.png')
+        )
+        logger.info("Saved latent_histograms.png")
+
+        # Decoded visualizations using true original raw blocks (require recoded_dir)
+        if viz_recoded_dir is None or not os.path.exists(viz_recoded_dir):
+            raise ValueError("Visualization requires viz_recoded_dir (haploblocks_recoded). Provide a valid path.")
+        logger.info("Creating decoded visualizations (LD, AF/variance, AF scatter) using raw originals...")
+        gen_blocks = load_decoded_recon(output_file)
+        block_map = build_block_map_from_spans(spans_file)
+        n_vis_total = min(len(gen_blocks), len(block_map))
+        gen_blocks = gen_blocks[:n_vis_total]
+        blocks = pick_blocks_with_min_snps(gen_blocks, min_snps=int(viz_min_snps), max_blocks=int(viz_num_blocks))
+        if not blocks and n_vis_total > 0:
+            blocks = list(range(min(int(viz_num_blocks), n_vis_total)))
+        orig_sel = []
+        gen_sel = []
+        for bi in blocks:
+            chr_num, block_no, base = block_map[bi]
+            orig_tensor = load_raw_block(viz_recoded_dir, chr_num, block_no, base, max_samples=5000)
+            gen_block = gen_blocks[bi]
+            n = min(orig_tensor.shape[0], gen_block.shape[0])
+            orig_sel.append(orig_tensor[:n])
+            gen_sel.append(gen_block[:n])
+        plot_ld_heatmaps(
+            orig_blocks=orig_sel,
+            gen_blocks=gen_sel,
+            block_indices=list(range(len(orig_sel))),
+            output_path=os.path.join(out_dir, 'ld_heatmaps.png')
+        )
+        plot_af_and_variance(
+            orig_blocks=orig_sel,
+            gen_blocks=gen_sel,
+            block_indices=list(range(len(orig_sel))),
+            output_path=os.path.join(out_dir, 'af_and_variance.png')
+        )
+        if len(orig_sel) == 0:
+            raise ValueError("No eligible blocks loaded from recoded_dir for visualization.")
+        plot_af_scatter(
+            orig_blocks=orig_sel,
+            gen_blocks=gen_sel,
+            block_indices=list(range(len(orig_sel))),
+            output_path=os.path.join(out_dir, 'af_scatter.png')
+        )
+        logger.info("Saved decoded visualizations: ld_heatmaps.png, af_and_variance.png, af_scatter.png")
+    except Exception as viz_e:
+        logger.warning(f"Visualization step failed: {viz_e}")
     
     # # Compute some basic statistics
     # all_values = torch.cat([snps.flatten() for snps in final_reconstructed_snps])

@@ -1346,38 +1346,50 @@ class DiffuGenePipeline:
         logger.info("=" * 60)
         
         gen_config = self.config['generation']
-        output_path = gen_config['output_path']
+
+        # Expand templated variables in generation section (ensure file paths are concrete)
+        temp_config = {
+            'global': self.config['global'],
+            'joint_embed': self.config['joint_embed'],
+            'block_embed': self.config['block_embed'],
+            'data_prep': self.config['data_prep'],
+            'diffusion': self.config['diffusion'],
+            'generation': gen_config
+        }
+        expanded_config = expand_variables(temp_config)
+        expanded_gen_config = expanded_config['generation']
+
+        output_path = expanded_gen_config['output_path']
         latents_exist = os.path.exists(output_path)
         
         # Check if decoding is needed and if decoded samples exist
-        decode_enabled = gen_config.get('decode_samples', False)
+        decode_enabled = expanded_gen_config.get('decode_samples', False)
         decoded_samples_exist = False
         
         if decode_enabled:
-            # Ensure the decoded output directory path is properly expanded for checking
-            temp_config = {
-                'global': self.config['global'],
-                'joint_embed': self.config['joint_embed'],
-                'block_embed': self.config['block_embed'],
-                'data_prep': self.config['data_prep'],
-                'generation': gen_config
-            }
-            expanded_config = expand_variables(temp_config)
-            decoded_dir = expanded_config['generation']['decoded_output_dir']
+            decoded_dir = expanded_gen_config['decoded_output_dir']
             
             if os.path.exists(decoded_dir):
-                # Check for decoded samples across all chromosomes
-                chromosomes = get_chromosome_list(self.config['global']['chromosome'])
-                decoded_samples_exist = True
-                for chr_num in chromosomes:
-                    pattern = os.path.join(decoded_dir, f"*chr{chr_num}_block_*_decoded.pt")
-                    if len(glob.glob(pattern)) == 0:
-                        decoded_samples_exist = False
-                        break
+                # First, check for consolidated decoded file
+                consolidated_path = os.path.join(decoded_dir, f"{self.config['global']['basename']}_decoded.pt")
+                if os.path.exists(consolidated_path):
+                    decoded_samples_exist = True
+                    logger.info(f"Detected existing consolidated decoded file: {consolidated_path}")
+                else:
+                    # Fallback: check for per-block decoded files across chromosomes
+                    chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+                    decoded_samples_exist = True
+                    for chr_num in chromosomes:
+                        pattern = os.path.join(decoded_dir, f"*chr{chr_num}_block_*_decoded.pt")
+                        if len(glob.glob(pattern)) == 0:
+                            decoded_samples_exist = False
+                            break
         
         # Determine what needs to be done
         if latents_exist and (not decode_enabled or decoded_samples_exist):
-            logger.info("All required outputs found, skipping generation step...") 
+            logger.info("All required outputs found. Ensuring visualizations exist...")
+            self._ensure_generation_visualizations(output_path, expanded_config)
+            logger.info("Skipping generation/decoding.")
             return
         elif latents_exist and decode_enabled and not decoded_samples_exist:
             logger.info("Latents exist but decoded samples missing - running decode-only...")
@@ -1396,7 +1408,7 @@ class DiffuGenePipeline:
         
         # Prepare arguments (ensure proper types)
         args = SimpleNamespace()
-        args.model_path = gen_config['model_path']
+        args.model_path = expanded_gen_config['model_path']
         args.output_path = output_path
         args.num_samples = int(gen_config['num_samples'])
         args.batch_size = int(gen_config['batch_size'])
@@ -1425,17 +1437,6 @@ class DiffuGenePipeline:
         
         # Add decoding parameters if enabled
         if decode_enabled:
-            # Ensure paths are properly expanded
-            temp_config = {
-                'global': self.config['global'],
-                'joint_embed': self.config['joint_embed'],
-                'block_embed': self.config['block_embed'],
-                'data_prep': self.config['data_prep'],
-                'generation': gen_config
-            }
-            expanded_config = expand_variables(temp_config)
-            expanded_gen_config = expanded_config['generation']
-            
             args.decode_samples = True
             args.vae_model_path = expanded_gen_config['vae_model_path']
             args.pca_loadings_dir = expanded_gen_config['pca_loadings_dir']
@@ -1444,6 +1445,20 @@ class DiffuGenePipeline:
             args.decoded_output_dir = expanded_gen_config['decoded_output_dir']
             args.basename = self.config['global']['basename']
             args.chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+            
+            # Visualization defaults for generate() so decode visualizations are automatic
+            try:
+                original_latents_path = self.config['joint_embed']['latents_output_path']
+                if os.path.exists(original_latents_path):
+                    args.original_latents = original_latents_path
+            except Exception:
+                pass
+            try:
+                decoded_orig_path = self.config.get('joint_embed', {}).get('evaluation', {}).get('test_reconstructions_path')
+                if decoded_orig_path and os.path.exists(decoded_orig_path):
+                    args.decoded_original_file = decoded_orig_path
+            except Exception:
+                pass
             
             logger.info("Decoding enabled - samples will be decoded to SNP space")
             logger.info(f"VAE model path: {args.vae_model_path}")
@@ -1456,12 +1471,126 @@ class DiffuGenePipeline:
         generate(args)
         logger.info("Sample generation completed successfully")
     
+    def _ensure_generation_visualizations(self, latents_output_path: str, expanded_config: Dict[str, Any]):
+        """Ensure visualization PNGs exist without re-running generation/decoding.
+        - Latent histograms: uses generated latents and original latents if available
+        - Decoded visualizations (LD, AF/variance, AF scatter): uses consolidated decoded file
+        """
+        try:
+            from .diffusion.viz_generated_samples import (
+                ensure_dir_exists as viz_ensure_dir,
+                load_decoded_recon,
+                build_block_map_from_spans,
+                load_raw_block,
+                pick_blocks_with_min_snps,
+                plot_ld_heatmaps,
+                plot_af_and_variance,
+                plot_af_scatter,
+                load_latents,
+                plot_latent_histograms,
+            )
+            import torch
+            import os
+        except Exception as e:
+            logger.warning(f"Visualization module not available: {e}")
+            return
+
+        gen_cfg = expanded_config['generation']
+        out_dir_latents = os.path.dirname(latents_output_path)
+        viz_ensure_dir(out_dir_latents)
+
+        # 1) Latent histogram
+        latent_png = os.path.join(out_dir_latents, 'latent_histograms.png')
+        if not os.path.exists(latent_png):
+            try:
+                orig_latents_path = self.config['joint_embed'].get('latents_output_path')
+                if orig_latents_path and os.path.exists(orig_latents_path) and os.path.exists(latents_output_path):
+                    # Load with helper (CPU)
+                    gen_latents = load_latents(latents_output_path)
+                    orig_latents = load_latents(orig_latents_path)
+                    # Defaults
+                    dims = [0,1,2,3,4,5,6]
+                    num_samples = 512
+                    plot_latent_histograms(gen_latents, orig_latents, dims, num_samples, latent_png)
+                    logger.info(f"Created latent histogram: {latent_png}")
+            except Exception as e:
+                logger.warning(f"Skipping latent histogram due to error: {e}")
+
+        # 2-4) Decoded visualizations using consolidated decoded file
+        decoded_dir = gen_cfg['decoded_output_dir']
+        decoded_pngs = [
+            os.path.join(decoded_dir, 'ld_heatmaps.png'),
+            os.path.join(decoded_dir, 'af_and_variance.png'),
+            os.path.join(decoded_dir, 'af_scatter.png'),
+        ]
+        need_decoded_viz = any(not os.path.exists(p) for p in decoded_pngs)
+        if not need_decoded_viz:
+            return
+
+        try:
+            basename = self.config['global']['basename']
+            decoded_gen_file = os.path.join(decoded_dir, f"{basename}_decoded.pt")
+            if not os.path.exists(decoded_gen_file):
+                logger.info("Consolidated decoded file not found; skipping decoded visualizations.")
+                return
+
+            spans_file = self.get_spans_file_path('vae')
+            recoded_dir = expanded_config['data_prep']['recoded_block_folder']
+            if not os.path.exists(spans_file) or not os.path.exists(recoded_dir):
+                logger.info("Spans or recoded_dir missing; skipping decoded visualizations.")
+                return
+
+            logger.info("Creating decoded visualizations from existing decoded file and raw originals...")
+            gen_blocks = load_decoded_recon(decoded_gen_file)
+            block_map = build_block_map_from_spans(spans_file)
+            n_vis_total = min(len(gen_blocks), len(block_map))
+            if n_vis_total == 0:
+                logger.info("No blocks available for visualization.")
+                return
+            gen_blocks = gen_blocks[:n_vis_total]
+
+            # Selection parameters
+            min_snps = int(gen_cfg.get('viz_min_snps', 50))
+            num_blocks = int(gen_cfg.get('viz_num_blocks', 10))
+
+            blocks = pick_blocks_with_min_snps(gen_blocks, min_snps=min_snps, max_blocks=num_blocks)
+            if not blocks:
+                blocks = list(range(min(num_blocks, n_vis_total)))
+
+            orig_sel = []
+            gen_sel = []
+            for bi in blocks:
+                chr_num, block_no, base = block_map[bi]
+                try:
+                    orig_tensor = load_raw_block(recoded_dir, chr_num, block_no, base, max_samples=5000)
+                    gen_block = gen_blocks[bi]
+                    n = min(orig_tensor.shape[0], gen_block.shape[0])
+                    orig_sel.append(orig_tensor[:n])
+                    gen_sel.append(gen_block[:n])
+                except Exception:
+                    continue
+
+            if orig_sel:
+                if not os.path.exists(decoded_pngs[0]):
+                    plot_ld_heatmaps(orig_sel, gen_sel, list(range(len(orig_sel))), decoded_pngs[0])
+                    logger.info(f"Wrote {decoded_pngs[0]}")
+                if not os.path.exists(decoded_pngs[1]):
+                    plot_af_and_variance(orig_sel, gen_sel, list(range(len(orig_sel))), decoded_pngs[1])
+                    logger.info(f"Wrote {decoded_pngs[1]}")
+                if not os.path.exists(decoded_pngs[2]):
+                    plot_af_scatter(orig_sel, gen_sel, list(range(len(orig_sel))), decoded_pngs[2])
+                    logger.info(f"Wrote {decoded_pngs[2]}")
+            else:
+                logger.info("Could not load any eligible blocks for decoded visualizations.")
+        except Exception as e:
+            logger.warning(f"Failed to create decoded visualizations: {e}")
+
     def _run_decode_only(self, latents_path, gen_config):
         """Run decoding only on existing latent samples."""
         logger.info("Loading existing latent samples for decoding...")
         
-        # Import decoding functions
-        from .diffusion.generate import load_vae_model, load_pca_models, load_spans_data, decode_samples, save_decoded_samples
+        # Use canonical decoding implementation
+        from .joint_embed.decode_vae_latents import decode_latents as decode_latents_fn
         
         try:
             # Ensure all paths are properly expanded using the full config context
@@ -1489,30 +1618,55 @@ class DiffuGenePipeline:
             latents = torch.cat(all_latents, dim=0)
             logger.info(f"Combined latents: {latents.shape}")
             
-            # Load VAE model with expanded path
+            # Prepare canonical decode parameters
             vae_model_path = expanded_gen_config['vae_model_path']
-            logger.info(f"Loading VAE model from {vae_model_path}")
-            vae_model = load_vae_model(vae_model_path, device="cuda")
-            
-            # Load PCA models with expanded path
             pca_loadings_dir = expanded_gen_config['pca_loadings_dir']
-            logger.info(f"Loading PCA models from {pca_loadings_dir}")
-            pca_models, block_info = load_pca_models(pca_loadings_dir, int(self.config['global']['chromosome']))
-            
-            # Load spans data from VAE training data (used for generation)
+            embeddings_dir = os.path.dirname(pca_loadings_dir)
             spans_file = self.get_spans_file_path('vae')
-            logger.info(f"Loading spans data from {spans_file}")
-            spans = load_spans_data(spans_file)
-            
-            # Decode samples
-            decoded_snps = decode_samples(latents, vae_model, spans, pca_models, device="cuda")
-            
-            # Save decoded samples with expanded path
             decoded_output_dir = expanded_gen_config['decoded_output_dir']
-            logger.info(f"Saving decoded samples to {decoded_output_dir}")
-            save_decoded_samples(decoded_snps, decoded_output_dir, self.config['global']['basename'], int(self.config['global']['chromosome']))
-            
-            logger.info("Decode-only operation completed successfully!")
+            os.makedirs(decoded_output_dir, exist_ok=True)
+            output_file = os.path.join(decoded_output_dir, f"{self.config['global']['basename']}_decoded.pt")
+
+            # Skip if consolidated decoded output already exists
+            if os.path.exists(output_file):
+                logger.info(f"Decoded output already exists at {output_file}; skipping decode-only.")
+                return
+
+            logger.info(f"Loading VAE model from {vae_model_path}")
+            logger.info(f"Decoding with spans {spans_file} and embeddings_dir {embeddings_dir}")
+
+            # Run canonical decoder
+            chromosome = None
+            chr_spec = self.config['global']['chromosome']
+            if isinstance(chr_spec, int):
+                chromosome = chr_spec
+            try:
+                # Pass visualization references down to decoder; keep pipeline clean
+                original_latents_path = self.config['joint_embed']['latents_output_path'] if os.path.exists(self.config['joint_embed']['latents_output_path']) else None
+                decoded_orig_path = self.config.get('joint_embed', {}).get('evaluation', {}).get('test_reconstructions_path')
+                if decoded_orig_path and not os.path.exists(decoded_orig_path):
+                    decoded_orig_path = None
+
+                decode_latents_fn(
+                    latents_file=latents_path,
+                    model_file=vae_model_path,
+                    embeddings_dir=embeddings_dir,
+                    spans_file=spans_file,
+                    output_file=output_file,
+                    batch_size=256,
+                    chromosome=chromosome,
+                    viz_original_latents=original_latents_path,
+                    viz_decoded_original=None,
+                    viz_latent_dims=[0,1,2,3,4,5,6],
+                    viz_latent_samples=512,
+                    viz_min_snps=50,
+                    viz_num_blocks=10,
+                    viz_recoded_dir=expanded_config['data_prep']['recoded_block_folder']
+                )
+                logger.info("Decode-only operation completed successfully!")
+            except Exception as e:
+                logger.error(f"Decode-only failed: {e}")
+                raise
             
         except Exception as e:
             logger.error(f"Error during decode-only operation: {e}")
@@ -1563,7 +1717,7 @@ class DiffuGenePipeline:
             logger.error(f"Pipeline failed at step {step_name}: {e}")
             raise
         
-        logger.info("\n" + "=" * 60)
+        logger.info("=" * 60)
         logger.info("PIPELINE COMPLETED SUCCESSFULLY!")
         logger.info("=" * 60)
 

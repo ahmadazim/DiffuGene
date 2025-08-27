@@ -6,6 +6,7 @@ import os
 import glob
 import re
 from diffusers import DDIMScheduler #DDPMScheduler
+from timm.utils import ModelEmaV3
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
@@ -15,6 +16,15 @@ from .unet import LatentUNET2D as ConditionalUNET
 from .unet_unconditional import LatentUNET2D as UnconditionalUNET
 from ..joint_embed.vae import SNPVAE
 from ..block_embed.pca import PCA_Block
+from .viz_generated_samples import (
+    ensure_dir_exists,
+    plot_latent_histograms,
+    load_decoded_recon,
+    pick_blocks_with_min_snps,
+    plot_ld_heatmaps,
+    plot_af_and_variance,
+    plot_af_scatter,
+)
 
 logger = get_logger(__name__)
 
@@ -453,8 +463,8 @@ def save_decoded_samples(decoded_snps, output_dir, basename, chromosomes):
 def generate(args):
     setup_logging()
     
-    # Load checkpoint first to detect model type
-    checkpoint = torch.load(args.model_path, map_location='cuda')
+    # Load checkpoint on CPU to minimize GPU memory usage
+    checkpoint = torch.load(args.model_path, map_location='cpu')
     
     # Detect if model is conditional or unconditional
     is_conditional = checkpoint.get('conditional', False)
@@ -465,73 +475,23 @@ def generate(args):
         if cond_dim is None:
             raise ValueError("Conditional model detected but cond_dim not found in checkpoint")
         logger.info(f"Loading conditional model with {cond_dim} covariate dimensions")
-        model = ConditionalUNET(input_channels=64, output_channels=64, cond_dim=cond_dim).cuda()
+        model = ConditionalUNET(input_channels=64, output_channels=64, cond_dim=cond_dim)
     else:
         logger.info("Loading unconditional model")
-        model = UnconditionalUNET(input_channels=64, output_channels=64).cuda()
+        model = UnconditionalUNET(input_channels=64, output_channels=64)
     
-    if 'ema' in checkpoint:
-        logger.info("Loading EMA weights")
-        try:
-            from timm.utils import ModelEmaV3
-            
-            # Create temporary EMA wrapper to load the saved EMA state
-            ema = ModelEmaV3(model, decay=0.9)
-            ema.load_state_dict(checkpoint['ema'])
-            
-            # Handle different timm versions - try multiple methods to copy EMA weights
-            if hasattr(ema, 'copy_to'):
-                # Older timm versions
-                logger.info("Using ema.copy_to() method")
-                ema.copy_to(model)
-            elif hasattr(ema, 'module'):
-                # Newer timm versions - use the EMA module directly
-                logger.info("Using ema.module.state_dict() method")
-                model.load_state_dict(ema.module.state_dict())
-            else:
-                # Fallback - try alternative approaches
-                logger.info("Trying manual EMA state dict extraction")
-                success = False
-                
-                # Method 1: Try accessing shadow parameters
-                if hasattr(ema, 'shadow'):
-                    try:
-                        model.load_state_dict(ema.shadow)
-                        success = True
-                        logger.info("Loaded EMA weights from shadow")
-                    except:
-                        pass
-                
-                # Method 2: Try getting state dict and removing prefixes
-                if not success:
-                    try:
-                        ema_state = ema.state_dict()
-                        model_state = {}
-                        for k, v in ema_state.items():
-                            # Handle various prefixes that might exist
-                            key = k
-                            for prefix in ['module.', 'shadow.', 'ema.']:
-                                if key.startswith(prefix):
-                                    key = key[len(prefix):]
-                                    break
-                            model_state[key] = v
-                        model.load_state_dict(model_state)
-                        success = True
-                        logger.info("Loaded EMA weights via manual extraction")
-                    except Exception as e:
-                        logger.warning(f"Manual EMA extraction failed: {e}")
-                
-                if not success:
-                    logger.warning("All EMA loading methods failed. Using non-EMA weights.")
-                    model.load_state_dict(checkpoint['weights'])
-                    
-        except Exception as e:
-            logger.warning(f"Failed to load EMA weights: {e}. Using non-EMA weights.")
-            model.load_state_dict(checkpoint['weights'])
-    else:
-        logger.info("No EMA weights found, loading regular model weights")
-        model.load_state_dict(checkpoint['weights'])
+    if 'ema' not in checkpoint:
+        raise KeyError("EMA weights not found in checkpoint. Training saves EMA; generation expects it.")
+    logger.info("Loading EMA weights (standard procedure)")
+    ema = ModelEmaV3(model, decay=0.9)
+    ema.load_state_dict(checkpoint['ema'])
+    model.load_state_dict(ema.module.state_dict())
+    # Free CPU copies of checkpoint/EMA
+    del checkpoint
+    del ema
     
+    # Move model to GPU after loading weights
+    model = model.cuda()
     model.eval()
     
     # Initialize scheduler
@@ -545,13 +505,14 @@ def generate(args):
     )
     scheduler.set_timesteps(args.num_inference_steps, device="cuda")
     
-    # Load normalization stats
+    # Load normalization stats on CPU
     model_dir = os.path.dirname(args.model_path)
     # Extract model name from model path (without extension)
     model_name = os.path.splitext(os.path.basename(args.model_path))[0]
     # channel_means = torch.load(os.path.join(model_dir, f"train_{model_name}_channel_means.pt"), map_location='cuda', weights_only=False)
     # channel_stds = torch.load(os.path.join(model_dir, f"train_{model_name}_channel_stds.pt"), map_location='cuda', weights_only=False)
-    sigma_hat = torch.load(os.path.join(model_dir, f"train_{model_name}_sigma.pt"), map_location='cuda', weights_only=False)
+    sigma_hat = torch.load(os.path.join(model_dir, f"train_{model_name}_sigma.pt"), map_location='cpu', weights_only=False)
+    sigma_hat_value = float(sigma_hat)
     
     # Prepare conditional data if needed
     covariates = None
@@ -576,7 +537,7 @@ def generate(args):
             fam_file=fam_file,
             random_seed=random_seed
         )
-        covariates = covariates.cuda()
+        # Keep covariates on CPU; move per-batch to GPU during generation
     
     guidance_scale = args.guidance_scale
 
@@ -587,8 +548,12 @@ def generate(args):
     for i in tqdm(range(0, args.num_samples, args.batch_size)):
         batch_size = min(args.batch_size, args.num_samples - i)
         
-        # Start from random noise
-        latents = torch.randn(batch_size, 64, 64, 64, device="cuda")
+        # Initialize at T via scheduler
+        x0 = torch.zeros(batch_size, 64, 64, 64, device="cuda", dtype=torch.float32)
+        t_T = scheduler.timesteps[0]
+        t_full = torch.full((batch_size,), t_T, device="cuda", dtype=torch.long)
+        noise = torch.randn_like(x0)
+        latents = scheduler.add_noise(x0, noise, t_full)
         
         # Get batch covariates if conditional
         batch_covariates = None
@@ -605,22 +570,30 @@ def generate(args):
                 #     noise_pred = model(latents, t.expand(batch_size))
                 if is_conditional:
                     B = latents.size(0)
-                    e_cond = model.cond_emb(batch_covariates).unsqueeze(1)  # (B,1,256)
-                    e_null = model.null_cond_emb.unsqueeze(0).expand(B,1,256)
+                    # Move only the current batch of covariates to GPU
+                    batch_covariates_gpu = batch_covariates.to(latents.device, non_blocking=True)
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        e_cond = model.cond_emb(batch_covariates_gpu).unsqueeze(1)  # (B,1,256)
+                        e_null = model.null_cond_emb.unsqueeze(0).expand(B,1,256)
 
-                    # double batch
-                    x_in   = torch.cat([latents,      latents],      dim=0)
-                    t_in   = torch.cat([t.expand(B),  t.expand(B)],  dim=0)
-                    emb_in = torch.cat([e_null,       e_cond],        dim=0)
+                        # Double batch
+                        x_in   = torch.cat([latents,      latents],      dim=0)
+                        t_in   = torch.cat([t.expand(B),  t.expand(B)],  dim=0)
+                        emb_in = torch.cat([e_null,       e_cond],        dim=0)
 
-                    h_all    = model.input_proj(x_in)
-                    eps_all  = model.unet(h_all, t_in, encoder_hidden_states=emb_in).sample
-                    eps0, eps1 = eps_all.chunk(2, dim=0)
+                        h_all   = model.input_proj(x_in)
+                        feats   = model.unet(h_all, t_in, encoder_hidden_states=emb_in).sample
+                        eps_all = model.output_proj(feats)
+                        eps0, eps1 = eps_all.chunk(2, dim=0)
 
-                    # CFG mix
-                    noise_pred = eps0 + guidance_scale * (eps1 - eps0)
+                        # CFG mix
+                        noise_pred = eps0 + guidance_scale * (eps1 - eps0)
+                    # Cast back to match latents dtype for scheduler
+                    noise_pred = noise_pred.to(latents.dtype)
                 else:
-                    noise_pred = model(latents, t.expand(batch_size))
+                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                        noise_pred = model(latents, t.expand(batch_size))
+                    noise_pred = noise_pred.to(latents.dtype)
                 
                 # Scheduler step
                 latents = scheduler.step(
@@ -630,8 +603,8 @@ def generate(args):
                     eta=0.0
                 ).prev_sample
         
-        # Denormalize
-        latents = latents * sigma_hat
+        # Denormalize with CPU scalar to avoid device transfers
+        latents = latents * sigma_hat_value
         all_samples.append(latents.cpu())
     
     # Concatenate all samples
@@ -642,6 +615,34 @@ def generate(args):
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
     torch.save(all_samples, args.output_path)
     logger.info(f"Latent samples saved to {args.output_path}")
+    
+    # Visualization 1: latent histograms (if original latents provided)
+    if hasattr(args, 'original_latents') and args.original_latents:
+        try:
+            logger.info("Creating latent histogram visualization...")
+            out_dir = os.path.dirname(args.output_path)
+            ensure_dir_exists(out_dir)
+            # Load original latents on CPU
+            orig_data = torch.load(args.original_latents, map_location='cpu')
+            if isinstance(orig_data, dict) and 'latents' in orig_data:
+                orig_latents = orig_data['latents']
+            elif isinstance(orig_data, torch.Tensor):
+                orig_latents = orig_data
+            else:
+                orig_latents = torch.tensor(orig_data, dtype=torch.float32)
+            # Use in-memory generated latents (CPU) and loaded original latents
+            dims = args.viz_latent_dims if hasattr(args, 'viz_latent_dims') and args.viz_latent_dims else [0,1,2,3,4,5,6]
+            num_samples = int(getattr(args, 'viz_latent_samples', 512))
+            plot_latent_histograms(
+                gen_latents=all_samples,
+                orig_latents=orig_latents,
+                dims=dims,
+                num_samples=num_samples,
+                output_path=os.path.join(out_dir, 'latent_histograms.png')
+            )
+            logger.info("Saved latent_histograms.png")
+        except Exception as e:
+            logger.warning(f"Latent histogram visualization failed: {e}")
     
     # Save covariate profiles if conditional generation
     if is_conditional and original_covariate_profiles is not None:
@@ -662,31 +663,83 @@ def generate(args):
         logger.info(f"Covariate profiles saved to {covariate_output_path}")
         logger.info(f"Saved {len(covariate_df)} covariate profiles with {len(covariate_names)} features")
     
-    # Decode samples if decoding arguments are provided
+    # Decode samples if decoding arguments are provided (use canonical decoder)
     if hasattr(args, 'decode_samples') and args.decode_samples:
         try:
-            logger.info("Starting sample decoding...")
+            logger.info("Starting sample decoding via decode_vae_latents.py...")
             
-            # Load VAE model
-            vae_model = load_vae_model(args.vae_model_path, device="cuda")
+            # Import decoder
+            from ..joint_embed.decode_vae_latents import decode_latents as decode_latents_fn
             
-            # Handle chromosomes argument (can be list or single chromosome)
-            chromosomes = getattr(args, 'chromosomes', getattr(args, 'chromosome', 22))
+            # Determine embeddings_dir (parent of loadings)
+            embeddings_dir = os.path.dirname(args.pca_loadings_dir)
             
-            # Load PCA models for all chromosomes
-            pca_models, block_info = load_pca_models(args.pca_loadings_dir, chromosomes)
+            # Use already-saved latents file
+            latents_file = args.output_path
             
-            # Load spans data from explicitly specified file
-            spans = load_spans_data(args.spans_file)
+            # Optional chromosome hint
+            chromosome = getattr(args, 'chromosome', None)
+            if isinstance(getattr(args, 'chromosomes', None), list) and len(args.chromosomes) == 1:
+                chromosome = args.chromosomes[0]
             
-            # Decode samples
-            decoded_snps = decode_samples(all_samples, vae_model, spans, pca_models, device="cuda")
+            # Decoded output path (used for both existence check and downstream viz)
+            decoded_gen_file = os.path.join(args.decoded_output_dir, f"{args.basename}_decoded.pt")
             
-            # Save decoded samples
-            save_decoded_samples(decoded_snps, args.decoded_output_dir, args.basename, chromosomes)
+            # Skip decoding if output already exists
+            if os.path.exists(decoded_gen_file):
+                logger.info(f"Decoded file already exists at {decoded_gen_file}; skipping decoding.")
+            else:
+                decode_latents_fn(
+                    latents_file=latents_file,
+                    model_file=args.vae_model_path,
+                    embeddings_dir=embeddings_dir,
+                    spans_file=args.spans_file,
+                    output_file=decoded_gen_file,
+                    batch_size=256,
+                    chromosome=chromosome
+                )
+                logger.info("Sample decoding completed successfully!")
             
-            logger.info("Sample decoding completed successfully!")
-            
+            # Visualizations 2-4 on decoded data if original decoded provided
+            try:
+                if hasattr(args, 'decoded_original_file') and args.decoded_original_file:
+                    decoded_orig_file = args.decoded_original_file
+                    logger.info("Creating decoded visualizations (LD, AF/variance, AF scatter)...")
+                    # Load decoded blocks
+                    gen_blocks = load_decoded_recon(decoded_gen_file)
+                    orig_blocks = load_decoded_recon(decoded_orig_file)
+                    n_blocks_vis = min(len(gen_blocks), len(orig_blocks))
+                    gen_blocks = gen_blocks[:n_blocks_vis]
+                    orig_blocks = orig_blocks[:n_blocks_vis]
+                    # Select blocks
+                    min_snps = int(getattr(args, 'viz_min_snps', 30))
+                    num_blocks = int(getattr(args, 'viz_num_blocks', 5))
+                    blocks = pick_blocks_with_min_snps(orig_blocks, min_snps=min_snps, max_blocks=num_blocks)
+                    # Plots
+                    plot_ld_heatmaps(
+                        orig_blocks=orig_blocks,
+                        gen_blocks=gen_blocks,
+                        block_indices=blocks,
+                        output_path=os.path.join(args.decoded_output_dir, 'ld_heatmaps.png')
+                    )
+                    plot_af_and_variance(
+                        orig_blocks=orig_blocks,
+                        gen_blocks=gen_blocks,
+                        block_indices=blocks,
+                        output_path=os.path.join(args.decoded_output_dir, 'af_and_variance.png')
+                    )
+                    plot_af_scatter(
+                        orig_blocks=orig_blocks,
+                        gen_blocks=gen_blocks,
+                        block_indices=blocks,
+                        output_path=os.path.join(args.decoded_output_dir, 'af_scatter.png')
+                    )
+                    logger.info("Saved decoded visualizations: ld_heatmaps.png, af_and_variance.png, af_scatter.png")
+                else:
+                    logger.info("decoded_original_file not provided; skipping decoded visualizations.")
+            except Exception as e:
+                logger.warning(f"Decoded visualization failed: {e}")
+        
         except Exception as e:
             logger.error(f"Error during sample decoding: {e}")
             logger.info("Continuing without decoding...")
@@ -715,6 +768,14 @@ def main():
     parser.add_argument("--decoded-output-dir", type=str, help="Directory to save decoded SNPs")
     parser.add_argument("--basename", type=str, help="Dataset basename")
     parser.add_argument("--chromosome", type=int, help="Chromosome number")
+    
+    # Visualization arguments (optional)
+    parser.add_argument("--original-latents", type=str, help="Path to original/train latents for histogram comparison")
+    parser.add_argument("--decoded-original-file", type=str, help="Path to decoded original SNPs (.pt) for decoded comparisons")
+    parser.add_argument("--viz-latent-dims", type=int, nargs='+', default=[0,1,2,3,4,5,6], help="Flattened latent dims to visualize")
+    parser.add_argument("--viz-latent-samples", type=int, default=512, help="Number of samples per set for latent histograms")
+    parser.add_argument("--viz-min-snps", type=int, default=30, help="Min SNPs per block to include in decoded visualizations")
+    parser.add_argument("--viz-num-blocks", type=int, default=5, help="Number of blocks to visualize in decoded visualizations")
     
     args = parser.parse_args()
     generate(args)
