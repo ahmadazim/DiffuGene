@@ -395,41 +395,29 @@ class DiffuGenePipeline:
         
         # Determine PLINK strategy for encoding
         if basename != original_basename:
-            # Multi-dataset mode: create temporary files for the encoding process
-            logger.info(f"Setting up encoding for different dataset: {basename}")
+            # Multi-dataset mode: use global bfile with --keep (no temporary dataset)
+            logger.info(f"Setting up encoding for different dataset (keep strategy): {basename}")
             
-            # We'll create a temporary dataset with the proper files
-            temp_work_dir = os.path.join(self.config['global']['data_root'], f"temp_dataset_{basename}")
-            ensure_dir_exists(temp_work_dir)
+            # Determine global bfile (without extension)
+            global_bfile_path = self.config['global'].get(
+                'bed_file', os.path.join(genetic_binary_folder, f"{original_basename}")
+            )
+            if global_bfile_path.endswith('.bed'):
+                global_bfile_path = global_bfile_path[:-4]
             
-            # Copy original bed/bim files to temp location with new basename
-            original_bed = self.config['global'].get('bed_file', 
-                os.path.join(genetic_binary_folder, f"{original_basename}.bed"))
-            original_bim = self.config['global'].get('bim_file',
-                os.path.join(genetic_binary_folder, f"{original_basename}.bim"))
-            
-            temp_bed = os.path.join(temp_work_dir, f"{basename}.bed")
-            temp_bim = os.path.join(temp_work_dir, f"{basename}.bim")
-            temp_fam = os.path.join(temp_work_dir, f"{basename}.fam")
-            
-            # Copy files (we'll clean up later)
-            import shutil
-            if not os.path.exists(temp_bed):
-                shutil.copy2(original_bed, temp_bed)
-            if not os.path.exists(temp_bim):
-                shutil.copy2(original_bim, temp_bim)
-            if not os.path.exists(temp_fam):
-                shutil.copy2(fam_file, temp_fam)
-            
-            # Use temp directory for encoding
-            encoding_genetic_folder = temp_work_dir
+            # Use original PLINK binaries with --keep fam subset
+            encoding_genetic_folder = genetic_binary_folder
             encoding_basename = basename
+            keep_fam_file = fam_file
+            use_global_bfile = global_bfile_path
             
-            logger.info(f"Created temporary dataset files in {temp_work_dir}")
+            logger.info(f"Using global bfile: {global_bfile_path} with --keep {keep_fam_file}")
         else:
             # Single dataset mode: use original files
             encoding_genetic_folder = genetic_binary_folder
             encoding_basename = basename
+            keep_fam_file = None
+            use_global_bfile = None
         
         # Import the encoding script functionality
         import sys
@@ -495,75 +483,89 @@ class DiffuGenePipeline:
                 run_plink_recode_blocks = encode_module.run_plink_recode_blocks
                 apply_pretrained_pca = encode_module.apply_pretrained_pca
             
-            all_spans = []
-            successful_chromosomes = []
-            
-            # Process each chromosome
+            # Build block_files mapping for all available chromosomes
+            block_files = {}
+            available_chromosomes = []
             for chr_num in chromosomes:
-                logger.info(f"Processing chromosome {chr_num}...")
-                
-                # Block file for this chromosome (from PCA training)
                 block_file = f"{self.config['data_prep']['block_folder']}/{pca_basename}_chr{chr_num}_blocks.blocks.det"
-                
-                # Check if block file exists
                 if not os.path.exists(block_file):
                     logger.warning(f"Block file not found for chromosome {chr_num}: {block_file}")
                     continue
-                
+                block_files[chr_num] = block_file
+                available_chromosomes.append(chr_num)
+            
+            if not available_chromosomes:
+                raise RuntimeError("No block files found for any chromosome")
+            
+            # Step 1: Recode genetic blocks for all chromosomes together using correct API
+            # Determine training snplist location (exact SNP lists from training)
+            training_snplist_dir = self.config['data_prep'].get('snplist_folder')
+            training_basename = pca_basename
+            # Determine BIM file for SNP lookup
+            if use_global_bfile:
+                training_bim_file = f"{use_global_bfile}.bim"
+            else:
+                training_bim_file = os.path.join(encoding_genetic_folder, f"{encoding_basename}.bim")
+
+            recoded_files = run_plink_recode_blocks(
+                plink_basename=encoding_basename,
+                genetic_binary_folder=encoding_genetic_folder,
+                chromosomes=available_chromosomes,
+                block_files=block_files,
+                output_dir=unified_recoded_dir,
+                snplist_folder=unified_snplist_dir,
+                keep_fam_file=keep_fam_file,
+                global_bfile=use_global_bfile,
+                training_snplist_dir=training_snplist_dir,
+                training_basename=training_basename,
+                training_bim_file=training_bim_file
+            )
+            
+            if not recoded_files:
+                raise RuntimeError("No blocks were successfully recoded")
+            
+            # Step 2: Apply pre-trained PCA to each block
+            means_dir = os.path.join(os.path.dirname(pca_loadings_dir), "means")
+            if not os.path.exists(means_dir):
+                means_dir = pca_loadings_dir.replace("loadings", "means")
+            metadata_dir = os.path.join(os.path.dirname(pca_loadings_dir), "metadata")
+            if not os.path.exists(metadata_dir):
+                metadata_dir = pca_loadings_dir.replace("loadings", "metadata")
+            
+            all_spans = []
+            successful_chromosomes = set()
+            
+            for raw_file in recoded_files:
                 try:
-                    # Step 1: Recode genetic blocks for this chromosome
-                    recoded_files = run_plink_recode_blocks(
-                        plink_basename=encoding_basename,
-                        genetic_binary_folder=encoding_genetic_folder,
-                        chromosome=chr_num,
-                        block_file=block_file,
-                        output_dir=unified_recoded_dir,
-                        snplist_folder=unified_snplist_dir
+                    embeddings, chr_str, block_no = apply_pretrained_pca(
+                        raw_file=raw_file,
+                        loadings_dir=pca_loadings_dir,
+                        means_dir=means_dir,
+                        metadata_dir=metadata_dir,
+                        basename=encoding_basename,
+                        k=self.config['block_embed']['pca_k']
                     )
+                    chromosome = int(chr_str)
                     
-                    if not recoded_files:
-                        logger.warning(f"No blocks recoded for chromosome {chr_num}")
-                        continue
+                    # Save embeddings
+                    embedding_file = os.path.join(
+                        unified_embeddings_dir,
+                        f"{basename}_chr{chromosome}_block{block_no}_embeddings.pt"
+                    )
+                    torch.save(embeddings, embedding_file)
                     
-                    # Step 2: Apply pre-trained PCA to each block
-                    means_dir = os.path.join(os.path.dirname(pca_loadings_dir), "means")
-                    if not os.path.exists(means_dir):
-                        means_dir = pca_loadings_dir.replace("loadings", "means")
+                    # Add to spans using LD block metadata
+                    per_chr_block_file = block_files.get(chromosome)
+                    if per_chr_block_file and os.path.exists(per_chr_block_file):
+                        LD_blocks = load_blocks_for_chr(per_chr_block_file, chromosome)
+                        block_idx = int(block_no) - 1
+                        if 0 <= block_idx < len(LD_blocks):
+                            block = LD_blocks[block_idx]
+                            all_spans.append([embedding_file, block.chr, block.bp1, block.bp2])
                     
-                    for raw_file in recoded_files:
-                        try:
-                            embeddings, block_no = apply_pretrained_pca(
-                                raw_file=raw_file,
-                                loadings_dir=pca_loadings_dir,
-                                means_dir=means_dir,
-                                basename=encoding_basename,
-                                chromosome=chr_num,
-                                k=self.config['block_embed']['pca_k']
-                            )
-                            
-                            # Save embeddings
-                            embedding_file = os.path.join(
-                                unified_embeddings_dir,
-                                f"{basename}_chr{chr_num}_block{block_no}_embeddings.pt"
-                            )
-                            torch.save(embeddings, embedding_file)
-                            
-                            # Add to spans
-                            LD_blocks = load_blocks_for_chr(block_file, chr_num)
-                            block_idx = int(block_no) - 1  # Convert to 0-based index
-                            if block_idx < len(LD_blocks):
-                                block = LD_blocks[block_idx]
-                                all_spans.append([embedding_file, block.chr, block.bp1, block.bp2])
-                            
-                        except Exception as e:
-                            logger.warning(f"Failed to process {raw_file}: {e}")
-                            continue
-                    
-                    successful_chromosomes.append(chr_num)
-                    logger.info(f"Successfully processed chromosome {chr_num}")
-                    
+                    successful_chromosomes.add(chromosome)
                 except Exception as e:
-                    logger.error(f"Failed to process chromosome {chr_num}: {e}")
+                    logger.warning(f"Failed to process {raw_file}: {e}")
                     continue
             
             if not successful_chromosomes:
@@ -585,9 +587,12 @@ class DiffuGenePipeline:
             vae_args.spans_file = unified_spans_file
             vae_args.recoded_dir = unified_recoded_dir
             vae_args.output_path = final_output_path
+            # Provide embeddings_dir as PCA embeddings base directory (parent of loadings)
+            vae_args.embeddings_dir = os.path.dirname(pca_loadings_dir)
             vae_args.grid_h = int(model_config['grid_h'])
             vae_args.grid_w = int(model_config['grid_w'])
-            vae_args.block_dim = int(model_config['block_dim'])
+            # Ensure block_dim matches PCA k used for block embeddings
+            vae_args.block_dim = int(self.config['block_embed']['pca_k'])
             vae_args.pos_dim = int(model_config['pos_dim'])
             vae_args.latent_channels = int(model_config['latent_channels'])
             
@@ -1223,12 +1228,6 @@ class DiffuGenePipeline:
         
         encoded_path, diffusion_spans_file = encoding_result
         
-        # Copy to expected location if different
-        if encoded_path != diffusion_train_latents_path:
-            import shutil
-            ensure_dir_exists(os.path.dirname(diffusion_train_latents_path))
-            shutil.copy2(encoded_path, diffusion_train_latents_path)
-        
         logger.info(f"Diffusion training data encoding completed: {diffusion_train_latents_path}")
     
     def run_diffusion_val_encoding(self):
@@ -1258,12 +1257,6 @@ class DiffuGenePipeline:
             return
         
         encoded_path, diffusion_val_spans_file = encoding_result
-        
-        # Copy to expected location if different
-        if encoded_path != diffusion_val_latents_path:
-            import shutil
-            ensure_dir_exists(os.path.dirname(diffusion_val_latents_path))
-            shutil.copy2(encoded_path, diffusion_val_latents_path)
         
         logger.info(f"Diffusion validation data encoding completed: {diffusion_val_latents_path}")
     
@@ -1360,7 +1353,8 @@ class DiffuGenePipeline:
         expanded_gen_config = expanded_config['generation']
 
         output_path = expanded_gen_config['output_path']
-        latents_exist = os.path.exists(output_path)
+        # Support single file or batched latent files (base_batch*.pt)
+        latents_exist = check_for_batch_files(output_path)
         
         # Check if decoding is needed and if decoded samples exist
         decode_enabled = expanded_gen_config.get('decode_samples', False)
@@ -1370,20 +1364,38 @@ class DiffuGenePipeline:
             decoded_dir = expanded_gen_config['decoded_output_dir']
             
             if os.path.exists(decoded_dir):
-                # First, check for consolidated decoded file
+                # Check for consolidated decoded file first
                 consolidated_path = os.path.join(decoded_dir, f"{self.config['global']['basename']}_decoded.pt")
                 if os.path.exists(consolidated_path):
                     decoded_samples_exist = True
                     logger.info(f"Detected existing consolidated decoded file: {consolidated_path}")
                 else:
-                    # Fallback: check for per-block decoded files across chromosomes
-                    chromosomes = get_chromosome_list(self.config['global']['chromosome'])
-                    decoded_samples_exist = True
-                    for chr_num in chromosomes:
-                        pattern = os.path.join(decoded_dir, f"*chr{chr_num}_block_*_decoded.pt")
-                        if len(glob.glob(pattern)) == 0:
-                            decoded_samples_exist = False
-                            break
+                    # If latents are batched, ensure a decoded file exists for each latent batch
+                    latent_batches = get_batch_files(output_path)
+                    if len(latent_batches) > 1:
+                        # Collect available decoded batch files
+                        decoded_batch_files = glob.glob(os.path.join(decoded_dir, f"{self.config['global']['basename']}_batch*_decoded.pt"))
+                        def extract_dec_batch_num(path):
+                            m = re.search(r'_batch(\d+)_decoded\.pt$', path)
+                            return int(m.group(1)) if m else None
+                        available_dec_batches = set(filter(lambda x: x is not None, (extract_dec_batch_num(p) for p in decoded_batch_files)))
+                        # Determine expected batch numbers from latent batch filenames
+                        def extract_lat_batch_num(path):
+                            m = re.search(r'_batch(\d+)\.pt$', path)
+                            return int(m.group(1)) if m else None
+                        expected_batches = set(filter(lambda x: x is not None, (extract_lat_batch_num(p) for p in latent_batches)))
+                        decoded_samples_exist = (len(expected_batches) > 0 and expected_batches.issubset(available_dec_batches))
+                        if decoded_samples_exist:
+                            logger.info(f"Detected decoded outputs for all {len(expected_batches)} latent batches")
+                    else:
+                        # Fallback: check older per-block decoded outputs across chromosomes
+                        chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+                        decoded_samples_exist = True
+                        for chr_num in chromosomes:
+                            pattern = os.path.join(decoded_dir, f"*chr{chr_num}_block_*_decoded.pt")
+                            if len(glob.glob(pattern)) == 0:
+                                decoded_samples_exist = False
+                                break
         
         # Determine what needs to be done
         if latents_exist and (not decode_enabled or decoded_samples_exist):
@@ -1430,9 +1442,20 @@ class DiffuGenePipeline:
                 
             args.random_seed = self.config['global']['random_seed']
             
+            # If a custom covariate profile is specified under generation, use it (no fam matching)
+            gen_cov_profile = expanded_gen_config.get('covariate_profile', None)
+            if gen_cov_profile:
+                args.covariate_file = gen_cov_profile
+                args.use_provided_covariates = True
+                # Also pass training covariate file so generate.py normalizes exactly as in training
+                args.training_covariate_file = diffusion_conditional_config['covariate_file']
+
             logger.info("Conditional generation enabled:")
             logger.info(f"  Covariate file: {args.covariate_file}")
-            logger.info(f"  Fam file: {args.fam_file}")
+            if getattr(args, 'use_provided_covariates', False):
+                logger.info("  Using provided covariate profiles (no fam matching)")
+            else:
+                logger.info(f"  Fam file: {args.fam_file}")
             logger.info(f"  Random seed: {args.random_seed}")
         
         # Add decoding parameters if enabled
@@ -1445,6 +1468,11 @@ class DiffuGenePipeline:
             args.decoded_output_dir = expanded_gen_config['decoded_output_dir']
             args.basename = self.config['global']['basename']
             args.chromosomes = get_chromosome_list(self.config['global']['chromosome'])
+            # Ensure visualizations can be created in decoder
+            try:
+                args.viz_recoded_dir = expanded_config['data_prep']['recoded_block_folder']
+            except Exception:
+                pass
             
             # Visualization defaults for generate() so decode visualizations are automatic
             try:
@@ -1516,7 +1544,7 @@ class DiffuGenePipeline:
             except Exception as e:
                 logger.warning(f"Skipping latent histogram due to error: {e}")
 
-        # 2-4) Decoded visualizations using consolidated decoded file
+        # 2-4) Decoded visualizations using decoded file (consolidated or first batch)
         decoded_dir = gen_cfg['decoded_output_dir']
         decoded_pngs = [
             os.path.join(decoded_dir, 'ld_heatmaps.png'),
@@ -1531,8 +1559,14 @@ class DiffuGenePipeline:
             basename = self.config['global']['basename']
             decoded_gen_file = os.path.join(decoded_dir, f"{basename}_decoded.pt")
             if not os.path.exists(decoded_gen_file):
-                logger.info("Consolidated decoded file not found; skipping decoded visualizations.")
-                return
+                # Try batch decoded files
+                batch_candidates = sorted(glob.glob(os.path.join(decoded_dir, f"{basename}_batch*_decoded.pt")))
+                if batch_candidates:
+                    decoded_gen_file = batch_candidates[0]
+                    logger.info(f"Using batch decoded file for visualizations: {decoded_gen_file}")
+                else:
+                    logger.info("No decoded files found; skipping decoded visualizations.")
+                    return
 
             spans_file = self.get_spans_file_path('vae')
             recoded_dir = expanded_config['data_prep']['recoded_block_folder']
@@ -1605,37 +1639,23 @@ class DiffuGenePipeline:
             expanded_config = expand_variables(temp_config)
             expanded_gen_config = expanded_config['generation']
             
-            # Load existing latents (handle batch files)
+            # Load existing latents (handle batch files without concatenating)
             batch_files = get_batch_files(latents_path)
-            logger.info(f"Found {len(batch_files)} batch files to decode")
-            
-            all_latents = []
-            for batch_file in batch_files:
-                batch_data = torch.load(batch_file, map_location='cpu')
-                all_latents.append(batch_data)
-                logger.info(f"Loaded batch from {batch_file}: {batch_data.shape}")
-            
-            latents = torch.cat(all_latents, dim=0)
-            logger.info(f"Combined latents: {latents.shape}")
-            
-            # Prepare canonical decode parameters
+            logger.info(f"Found {len(batch_files)} latent file(s) to decode")
+
+            # Prepare canonical decode parameters (constant across batches)
             vae_model_path = expanded_gen_config['vae_model_path']
             pca_loadings_dir = expanded_gen_config['pca_loadings_dir']
             embeddings_dir = os.path.dirname(pca_loadings_dir)
             spans_file = self.get_spans_file_path('vae')
             decoded_output_dir = expanded_gen_config['decoded_output_dir']
             os.makedirs(decoded_output_dir, exist_ok=True)
-            output_file = os.path.join(decoded_output_dir, f"{self.config['global']['basename']}_decoded.pt")
-
-            # Skip if consolidated decoded output already exists
-            if os.path.exists(output_file):
-                logger.info(f"Decoded output already exists at {output_file}; skipping decode-only.")
-                return
+            consolidated_output = os.path.join(decoded_output_dir, f"{self.config['global']['basename']}_decoded.pt")
 
             logger.info(f"Loading VAE model from {vae_model_path}")
             logger.info(f"Decoding with spans {spans_file} and embeddings_dir {embeddings_dir}")
 
-            # Run canonical decoder
+            # Run canonical decoder per batch file
             chromosome = None
             chr_spec = self.config['global']['chromosome']
             if isinstance(chr_spec, int):
@@ -1647,23 +1667,39 @@ class DiffuGenePipeline:
                 if decoded_orig_path and not os.path.exists(decoded_orig_path):
                     decoded_orig_path = None
 
-                decode_latents_fn(
-                    latents_file=latents_path,
-                    model_file=vae_model_path,
-                    embeddings_dir=embeddings_dir,
-                    spans_file=spans_file,
-                    output_file=output_file,
-                    batch_size=256,
-                    chromosome=chromosome,
-                    viz_original_latents=original_latents_path,
-                    viz_decoded_original=None,
-                    viz_latent_dims=[0,1,2,3,4,5,6],
-                    viz_latent_samples=512,
-                    viz_min_snps=50,
-                    viz_num_blocks=10,
-                    viz_recoded_dir=expanded_config['data_prep']['recoded_block_folder']
-                )
-                logger.info("Decode-only operation completed successfully!")
+                # If consolidated exists already, skip decoding batches
+                if os.path.exists(consolidated_output):
+                    logger.info(f"Consolidated decoded output exists at {consolidated_output}; skipping batch decode-only.")
+                    return
+
+                basename = self.config['global']['basename']
+                for idx, batch_file in enumerate(batch_files, start=1):
+                    # Determine output path per batch
+                    if len(batch_files) > 1:
+                        output_file = os.path.join(decoded_output_dir, f"{basename}_batch{idx}_decoded.pt")
+                    else:
+                        output_file = os.path.join(decoded_output_dir, f"{basename}_decoded.pt")
+                    if os.path.exists(output_file):
+                        logger.info(f"Decoded output for batch {idx} already exists: {output_file}. Skipping.")
+                        continue
+                    logger.info(f"Decoding batch {idx}: {batch_file} -> {output_file}")
+                    decode_latents_fn(
+                        latents_file=batch_file,
+                        model_file=vae_model_path,
+                        embeddings_dir=embeddings_dir,
+                        spans_file=spans_file,
+                        output_file=output_file,
+                        batch_size=256,
+                        chromosome=chromosome,
+                        viz_original_latents=original_latents_path,
+                        viz_decoded_original=None,
+                        viz_latent_dims=[0,1,2,3,4,5,6],
+                        viz_latent_samples=512,
+                        viz_min_snps=50,
+                        viz_num_blocks=10,
+                        viz_recoded_dir=expanded_config['data_prep']['recoded_block_folder']
+                    )
+                logger.info("Decode-only operation for all batches completed successfully!")
             except Exception as e:
                 logger.error(f"Decode-only failed: {e}")
                 raise

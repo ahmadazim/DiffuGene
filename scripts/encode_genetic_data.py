@@ -68,26 +68,32 @@ def run_plink_recode_blocks(plink_basename, genetic_binary_folder, chromosomes,
             logger.warning(f"No block file specified for chromosome {chromosome}, skipping")
             continue
             
-        # Load existing LD blocks (includes SNP IDs)
-        # Use training snplist files if available for exact SNP matching
+        # Load existing LD blocks (includes SNP IDs) and decide snplist source
+        # Prefer EXACT training snplist files if available to avoid SNP mismatches
         if training_snplist_dir and training_basename:
             logger.info(f"Chr{chromosome}: Using training snplist files from {training_snplist_dir} with basename {training_basename}")
+            # Training snplists are expected under training_snplist_dir[/chr{chromosome}]
+            chr_snplist_folder = os.path.join(training_snplist_dir, f"chr{chromosome}")
+            if not os.path.exists(chr_snplist_folder):
+                chr_snplist_folder = training_snplist_dir
+            snplist_basename = training_basename
         else:
             logger.info(f"Chr{chromosome}: Using original block file {block_file}")
             
-        LD_blocks = load_blocks_for_chr(block_file, chromosome, training_snplist_dir, training_basename, training_bim_file)
+            LD_blocks = load_blocks_for_chr(block_file, chromosome, training_snplist_dir, training_basename, training_bim_file)
+            
+            # Log SNP counts per block to verify we're getting the right data
+            total_snps = sum(len(block.snps) for block in LD_blocks)
+            logger.info(f"Chr{chromosome}: Loaded {len(LD_blocks)} LD blocks with {total_snps} total SNPs")
+            
+            # Create SNP list files using the EXACT same function as training
+            chr_snplist_folder = os.path.join(snplist_folder, f"chr{chromosome}")
+            ensure_dir_exists(chr_snplist_folder)
+            create_snplist_files(LD_blocks, chr_snplist_folder, plink_basename, chromosome)
+            snplist_basename = plink_basename
         
-        # Log SNP counts per block to verify we're getting the right data
-        total_snps = sum(len(block.snps) for block in LD_blocks)
-        logger.info(f"Chr{chromosome}: Loaded {len(LD_blocks)} LD blocks with {total_snps} total SNPs")
-        
-        # Create SNP list files using the EXACT same function as training
-        chr_snplist_folder = os.path.join(snplist_folder, f"chr{chromosome}")
-        ensure_dir_exists(chr_snplist_folder)
-        create_snplist_files(LD_blocks, chr_snplist_folder, plink_basename, chromosome)
-        
-        # Find all created SNP list files
-        snplist_pattern = os.path.join(chr_snplist_folder, f"{plink_basename}_chr{chromosome}_block*.snplist")
+        # Find SNP list files
+        snplist_pattern = os.path.join(chr_snplist_folder, f"{snplist_basename}_chr{chromosome}_block*.snplist")
         snplist_files = glob.glob(snplist_pattern)
         logger.info(f"Chr{chromosome}: Created {len(snplist_files)} SNP list files")
         

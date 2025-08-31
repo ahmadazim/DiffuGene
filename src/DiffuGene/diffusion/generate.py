@@ -28,6 +28,45 @@ from .viz_generated_samples import (
 
 logger = get_logger(__name__)
 
+def prepare_user_covariates(covariate_file: str, metadata_path: str, num_needed: int = None, training_covariate_file: str = None):
+    """Load user-provided covariate profiles and align/normalize to training schema.
+    - Matches columns to training covariate_names
+    - Applies normalization using training norm_params if available
+    - Returns tensor [N, cond_dim] and original profiles (numpy array) for logging
+    """
+    import pandas as pd
+    covariate_names, norm_params = load_covariate_metadata(metadata_path)
+    df = pd.read_csv(covariate_file)
+    # Ensure all required columns exist
+    missing = [c for c in covariate_names if c not in df.columns]
+    if missing:
+        raise ValueError(f"Provided covariate file is missing required columns: {missing[:10]}... (total {len(missing)})")
+    # Reorder and drop extras
+    df = df[covariate_names]
+    # Normalization: strictly compute from training covariate file to match training
+    if training_covariate_file is None or not os.path.exists(training_covariate_file):
+        raise ValueError("training_covariate_file must be provided and exist for normalization (no fallbacks).")
+    train_df = pd.read_csv(training_covariate_file)
+    missing_train = [c for c in covariate_names if c not in train_df.columns]
+    if missing_train:
+        raise ValueError(f"Training covariate file missing required columns: {missing_train[:10]}... (total {len(missing_train)})")
+    train_df = train_df[covariate_names]
+    # Compute mean/std ignoring NaNs; avoid zero std
+    col_means = train_df.astype(float).mean(skipna=True)
+    col_stds = train_df.astype(float).std(skipna=True).replace(0.0, 1.0)
+    for col in covariate_names:
+        m = float(col_means[col]) if col in col_means else 0.0
+        s = float(col_stds[col]) if col in col_stds else 1.0
+        if s == 0.0:
+            s = 1.0
+        df[col] = (df[col].astype(float) - m) / s
+    # Slice if fewer needed
+    if num_needed is not None and len(df) > num_needed:
+        df = df.iloc[:num_needed]
+    covariates_tensor = torch.tensor(df.values, dtype=torch.float32)
+    original_profiles = df.values.copy()
+    return covariates_tensor, original_profiles
+
 def prepare_conditional_generation_data(model_dir, model_name, num_samples,
                                        covariate_file, fam_file, random_seed=None):
     """Prepare covariate data for conditional generation by sampling from training data.
@@ -526,124 +565,194 @@ def generate(args):
         fam_file = getattr(args, 'fam_file', None)
         random_seed = getattr(args, 'random_seed', None)
         
-        if not covariate_file or not fam_file:
-            raise ValueError("Conditional generation requires --covariate-file and --fam-file arguments")
+        if not covariate_file:
+            raise ValueError("Conditional generation requires --covariate-file argument")
         
-        covariates, original_covariate_profiles = prepare_conditional_generation_data(
-            model_dir=model_dir,
-            model_name=model_name,
-            num_samples=args.num_samples,
-            covariate_file=covariate_file,
-            fam_file=fam_file,
-            random_seed=random_seed
-        )
+        use_provided = bool(getattr(args, 'use_provided_covariates', False))
+        if use_provided:
+            # Use provided covariate profiles directly (no fam matching)
+            metadata_path = os.path.join(model_dir, f"{model_name}_covariate_metadata.json")
+            covariates, original_covariate_profiles = prepare_user_covariates(
+                covariate_file=covariate_file,
+                metadata_path=metadata_path,
+                num_needed=args.num_samples,
+                training_covariate_file=getattr(args, 'training_covariate_file', None)
+            )
+            logger.info(f"Using provided covariate profiles: {covariates.shape}")
+        else:
+            if not fam_file:
+                raise ValueError("Conditional generation with sampling requires --fam-file")
+            covariates, original_covariate_profiles = prepare_conditional_generation_data(
+                model_dir=model_dir,
+                model_name=model_name,
+                num_samples=args.num_samples,
+                covariate_file=covariate_file,
+                fam_file=fam_file,
+                random_seed=random_seed
+            )
         # Keep covariates on CPU; move per-batch to GPU during generation
     
     guidance_scale = args.guidance_scale
 
-    # Generate samples
-    logger.info(f"Generating {args.num_samples} samples...")
-    all_samples = []
-    
-    for i in tqdm(range(0, args.num_samples, args.batch_size)):
-        batch_size = min(args.batch_size, args.num_samples - i)
-        
+    # Generate samples with outer chunking to cap memory
+    # Determine total samples when using provided covariates
+    total_samples = int(args.num_samples)
+    if is_conditional and covariates is not None:
+        total_samples = min(total_samples, covariates.shape[0])
+    logger.info(f"Generating {total_samples} samples with max chunk size 25000...")
+    MAX_SAMPLES_PER_CHUNK = 25000
+    use_chunking = total_samples > MAX_SAMPLES_PER_CHUNK
+    chunk_index = 1
+    current_chunk_samples = []
+    current_chunk_count = 0
+    first_chunk_hist_done = False
+
+    def finalize_and_save_current_chunk():
+        nonlocal chunk_index, current_chunk_samples, current_chunk_count, first_chunk_hist_done
+        if current_chunk_count == 0:
+            return
+        chunk_tensor = torch.cat(current_chunk_samples, dim=0)
+        logger.info(f"Finalizing chunk {chunk_index}: shape={chunk_tensor.shape}")
+        os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+        base, ext = os.path.splitext(args.output_path)
+        if use_chunking:
+            latents_file = f"{base}_batch{chunk_index}{ext}"
+        else:
+            latents_file = args.output_path
+        torch.save(chunk_tensor, latents_file)
+        logger.info(f"Latent samples saved to {latents_file}")
+
+        # Visualization 1: latent histograms (only once, on first chunk)
+        if (not first_chunk_hist_done) and hasattr(args, 'original_latents') and args.original_latents:
+            try:
+                logger.info("Creating latent histogram visualization for first chunk...")
+                out_dir = os.path.dirname(args.output_path)
+                ensure_dir_exists(out_dir)
+                orig_data = torch.load(args.original_latents, map_location='cpu')
+                if isinstance(orig_data, dict) and 'latents' in orig_data:
+                    orig_latents = orig_data['latents']
+                elif isinstance(orig_data, torch.Tensor):
+                    orig_latents = orig_data
+                else:
+                    orig_latents = torch.tensor(orig_data, dtype=torch.float32)
+                dims = args.viz_latent_dims if hasattr(args, 'viz_latent_dims') and args.viz_latent_dims else [0,1,2,3,4,5,6]
+                num_samples = int(getattr(args, 'viz_latent_samples', 512))
+                plot_latent_histograms(
+                    gen_latents=chunk_tensor,
+                    orig_latents=orig_latents,
+                    dims=dims,
+                    num_samples=num_samples,
+                    output_path=os.path.join(out_dir, 'latent_histograms.png')
+                )
+                logger.info("Saved latent_histograms.png")
+            except Exception as e:
+                logger.warning(f"Latent histogram visualization failed: {e}")
+            first_chunk_hist_done = True
+
+        # Decode this chunk if requested
+        if hasattr(args, 'decode_samples') and args.decode_samples:
+            try:
+                logger.info("Starting sample decoding via decode_vae_latents.py for current chunk...")
+                from ..joint_embed.decode_vae_latents import decode_latents as decode_latents_fn
+                embeddings_dir = os.path.dirname(args.pca_loadings_dir)
+                latents_file_for_decode = latents_file
+                chromosome = getattr(args, 'chromosome', None)
+                if isinstance(getattr(args, 'chromosomes', None), list) and len(args.chromosomes) == 1:
+                    chromosome = args.chromosomes[0]
+                decoded_base = os.path.join(args.decoded_output_dir, f"{args.basename}")
+                if use_chunking:
+                    decoded_gen_file = f"{decoded_base}_batch{chunk_index}_decoded.pt"
+                else:
+                    decoded_gen_file = f"{decoded_base}_decoded.pt"
+                if os.path.exists(decoded_gen_file):
+                    logger.info(f"Decoded file already exists at {decoded_gen_file}; skipping decoding for this chunk.")
+                else:
+                    decode_kwargs = dict(
+                        latents_file=latents_file_for_decode,
+                        model_file=args.vae_model_path,
+                        embeddings_dir=embeddings_dir,
+                        spans_file=args.spans_file,
+                        output_file=decoded_gen_file,
+                        batch_size=256,
+                        chromosome=chromosome
+                    )
+                    # Optional visualization hints if available
+                    if hasattr(args, 'original_latents') and args.original_latents:
+                        decode_kwargs['viz_original_latents'] = args.original_latents
+                    if hasattr(args, 'viz_min_snps'):
+                        decode_kwargs['viz_min_snps'] = int(args.viz_min_snps)
+                    if hasattr(args, 'viz_num_blocks'):
+                        decode_kwargs['viz_num_blocks'] = int(args.viz_num_blocks)
+                    if hasattr(args, 'viz_recoded_dir') and args.viz_recoded_dir:
+                        decode_kwargs['viz_recoded_dir'] = args.viz_recoded_dir
+                    decode_latents_fn(**decode_kwargs)
+                    logger.info("Sample decoding for chunk completed successfully!")
+            except Exception as e:
+                logger.error(f"Error during sample decoding for chunk: {e}")
+                logger.info("Continuing without decoding for this chunk...")
+
+        # Reset chunk accumulators
+        current_chunk_samples = []
+        current_chunk_count = 0
+        chunk_index += 1
+
+    # Main generation loop with chunk accumulation
+    for i in tqdm(range(0, total_samples, args.batch_size)):
+        batch_size = min(args.batch_size, total_samples - i)
+
         # Initialize at T via scheduler
         x0 = torch.zeros(batch_size, 64, 64, 64, device="cuda", dtype=torch.float32)
         t_T = scheduler.timesteps[0]
         t_full = torch.full((batch_size,), t_T, device="cuda", dtype=torch.long)
         noise = torch.randn_like(x0)
         latents = scheduler.add_noise(x0, noise, t_full)
-        
+
         # Get batch covariates if conditional
         batch_covariates = None
         if is_conditional:
             batch_covariates = covariates[i:i+batch_size]
-        
+
         # Denoising loop
         with torch.no_grad():
             for t in tqdm(scheduler.timesteps, desc=f"Denoising batch {i//args.batch_size + 1}"):
-                # Model prediction - conditional or unconditional
-                # if is_conditional:
-                #     noise_pred = model(latents, t.expand(batch_size), batch_covariates)
-                # else:
-                #     noise_pred = model(latents, t.expand(batch_size))
                 if is_conditional:
                     B = latents.size(0)
-                    # Move only the current batch of covariates to GPU
                     batch_covariates_gpu = batch_covariates.to(latents.device, non_blocking=True)
                     with torch.autocast(device_type='cuda', dtype=torch.float16):
-                        e_cond = model.cond_emb(batch_covariates_gpu).unsqueeze(1)  # (B,1,256)
+                        e_cond = model.cond_emb(batch_covariates_gpu).unsqueeze(1)
                         e_null = model.null_cond_emb.unsqueeze(0).expand(B,1,256)
-
-                        # Double batch
                         x_in   = torch.cat([latents,      latents],      dim=0)
                         t_in   = torch.cat([t.expand(B),  t.expand(B)],  dim=0)
                         emb_in = torch.cat([e_null,       e_cond],        dim=0)
-
                         h_all   = model.input_proj(x_in)
                         feats   = model.unet(h_all, t_in, encoder_hidden_states=emb_in).sample
                         eps_all = model.output_proj(feats)
                         eps0, eps1 = eps_all.chunk(2, dim=0)
-
-                        # CFG mix
                         noise_pred = eps0 + guidance_scale * (eps1 - eps0)
-                    # Cast back to match latents dtype for scheduler
                     noise_pred = noise_pred.to(latents.dtype)
                 else:
                     with torch.autocast(device_type='cuda', dtype=torch.float16):
                         noise_pred = model(latents, t.expand(batch_size))
                     noise_pred = noise_pred.to(latents.dtype)
-                
-                # Scheduler step
+
                 latents = scheduler.step(
                     model_output=noise_pred,
                     timestep=t,
                     sample=latents,
                     eta=0.0
                 ).prev_sample
-        
-        # Denormalize with CPU scalar to avoid device transfers
+
         latents = latents * sigma_hat_value
-        all_samples.append(latents.cpu())
-    
-    # Concatenate all samples
-    all_samples = torch.cat(all_samples, dim=0)
-    logger.info(f"Generated samples shape: {all_samples.shape}")
-    
-    # Save latent samples
-    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
-    torch.save(all_samples, args.output_path)
-    logger.info(f"Latent samples saved to {args.output_path}")
-    
-    # Visualization 1: latent histograms (if original latents provided)
-    if hasattr(args, 'original_latents') and args.original_latents:
-        try:
-            logger.info("Creating latent histogram visualization...")
-            out_dir = os.path.dirname(args.output_path)
-            ensure_dir_exists(out_dir)
-            # Load original latents on CPU
-            orig_data = torch.load(args.original_latents, map_location='cpu')
-            if isinstance(orig_data, dict) and 'latents' in orig_data:
-                orig_latents = orig_data['latents']
-            elif isinstance(orig_data, torch.Tensor):
-                orig_latents = orig_data
-            else:
-                orig_latents = torch.tensor(orig_data, dtype=torch.float32)
-            # Use in-memory generated latents (CPU) and loaded original latents
-            dims = args.viz_latent_dims if hasattr(args, 'viz_latent_dims') and args.viz_latent_dims else [0,1,2,3,4,5,6]
-            num_samples = int(getattr(args, 'viz_latent_samples', 512))
-            plot_latent_histograms(
-                gen_latents=all_samples,
-                orig_latents=orig_latents,
-                dims=dims,
-                num_samples=num_samples,
-                output_path=os.path.join(out_dir, 'latent_histograms.png')
-            )
-            logger.info("Saved latent_histograms.png")
-        except Exception as e:
-            logger.warning(f"Latent histogram visualization failed: {e}")
-    
+        current_chunk_samples.append(latents.cpu())
+        current_chunk_count += batch_size
+
+        # Finalize chunk if reached limit
+        if current_chunk_count >= MAX_SAMPLES_PER_CHUNK:
+            finalize_and_save_current_chunk()
+
+    # Finalize any remaining samples in the last chunk
+    finalize_and_save_current_chunk()
+
     # Save covariate profiles if conditional generation
     if is_conditional and original_covariate_profiles is not None:
         # Save covariate profiles in the same directory as generated samples

@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=300G
 #SBATCH -t 3-00:00:00
-#SBATCH -c 16
+#SBATCH -c 2
 #SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_condDiff_%j.out
 #SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_condDiff_%j.err
 
@@ -15,11 +15,11 @@ module load cudnn/9.5.1.17_cuda12-fasrc01
 module load R gcc cmake
 nvidia-smi
 
-export OMP_NUM_THREADS=16
+export OMP_NUM_THREADS=2
 export MKL_INTERFACE_LAYER=GNU,LP64
 export MKL_THREADING_LAYER=GNU
 export MKL_DYNAMIC=TRUE
-export MKL_NUM_THREADS=16
+export MKL_NUM_THREADS=2
 
 yaml_file=$1
 
@@ -28,4 +28,4 @@ ${difdir}/scripts/run_pipeline.sh --config ${yaml_file}
 
 # sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh /n/home03/ahmadazim/WORKING/genGen/UKB/pipeline_ukb_allchr_unrel_britishWhite.yaml
 # sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh /n/home03/ahmadazim/WORKING/genGen/UKB/pipeline_ukb_allchr_unrel_britishWhite_condDiff.yaml
-# sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh ~/SCRIPTS/DiffuGene/UKBconditionalLDM.yaml
+# sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh ~/SCRIPTS/DiffuGene/UKBconditionalLDM_6PC.yaml
