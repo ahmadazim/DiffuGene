@@ -29,3 +29,4 @@ ${difdir}/scripts/run_pipeline.sh --config ${yaml_file}
 # sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh /n/home03/ahmadazim/WORKING/genGen/UKB/pipeline_ukb_allchr_unrel_britishWhite.yaml
 # sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh /n/home03/ahmadazim/WORKING/genGen/UKB/pipeline_ukb_allchr_unrel_britishWhite_condDiff.yaml
 # sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh ~/SCRIPTS/DiffuGene/UKBconditionalLDM_6PC.yaml
+# sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh ~/SCRIPTS/DiffuGene/UKBconditionalLDM_6PC_500K.yaml

@@ -15,7 +15,8 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..'))
 
-from src.DiffuGene.joint_embed.vae_OLD import SNPVAE
+# from src.DiffuGene.joint_embed.vae_OLD import SNPVAE
+from src.DiffuGene.joint_embed.vae import SNPVAE
 from src.DiffuGene.diffusion.viz_generated_samples import (
     load_decoded_recon,
     plot_latent_histograms,

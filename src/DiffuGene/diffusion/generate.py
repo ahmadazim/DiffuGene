@@ -11,7 +11,18 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 
-from ..utils import setup_logging, get_logger, load_covariate_metadata, prepare_covariates_for_training, sample_training_covariates
+import json
+import hashlib
+import time
+from contextlib import nullcontext
+
+from ..utils import (
+    setup_logging, get_logger, load_covariate_metadata,
+    prepare_covariates_for_training, sample_training_covariates,
+)
+from ..utils.covariate_utils import (
+    load_covariate_file, load_fam_file, match_covariates_to_fam,
+)
 from .unet import LatentUNET2D as ConditionalUNET
 from .unet_unconditional import LatentUNET2D as UnconditionalUNET
 from ..joint_embed.vae import SNPVAE
@@ -27,12 +38,93 @@ from .viz_generated_samples import (
 )
 
 logger = get_logger(__name__)
+DEBUG = False
+
+def _tensor_stats(name, x, log_fn=logger.debug):
+    """Small helper to print finiteness and magnitude stats."""
+    try:
+        x_detached = x.detach()
+    except:
+        x_detached = x
+    isfinite = torch.isfinite(x_detached).all().item()
+    with torch.no_grad():
+        flat = x_detached.reshape(-1).float()
+        if flat.numel() == 0:
+            log_fn(f"[STATS] {name}: EMPTY tensor")
+            return
+        mx = torch.nan_to_num(flat.abs(), nan=torch.tensor(float("inf"))).max().item()
+        mn = flat.min().item() if torch.isfinite(flat).any() else float("nan")
+        mxv = flat.max().item() if torch.isfinite(flat).any() else float("nan")
+        mean = flat.mean().item() if torch.isfinite(flat).any() else float("nan")
+        log_fn(f"[STATS] {name}: finite={isfinite} shape={tuple(x.shape)} max_abs={mx:.4e} min={mn:.4e} max={mxv:.4e} mean={mean:.4e}")
+
+def _env_fprint():
+    try:
+        gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+        logger.info(f"[ENV] torch={torch.__version__} cuda={torch.version.cuda} device={gpu}")
+        logger.info(f"[ENV] matmul.allow_tf32={torch.backends.cuda.matmul.allow_tf32} cudnn.allow_tf32={torch.backends.cudnn.allow_tf32}")
+        logger.info(f"[ENV] cudnn.benchmark={torch.backends.cudnn.benchmark} cudnn.deterministic={torch.backends.cudnn.deterministic}")
+    except Exception as e:
+        logger.info(f"[ENV] inspection failed: {e}")
+
+def _ckpt_signature(ckpt):
+    try:
+        keys = sorted(list(ckpt.keys()))
+        sig = hashlib.md5(json.dumps(keys).encode()).hexdigest()
+        return sig, keys[:12]
+    except Exception:
+        return "NA", []
+
+def _impute_covariates_from_metadata(df, covariate_names, norm_params):
+    """Impute missing values exactly per training policy using saved metadata.
+    - Categorical variables: fill with mode (or 0.0 if no mode)
+    - Binary variables: fill with 0.0
+    - Quantitative variables: fill with training mean from metadata
+    Verifies no NaNs remain.
+    Returns float32 numpy array aligned to covariate_names.
+    """
+    X = df[covariate_names].astype(float).values
+    binary_cols = norm_params.get('binary_cols', []) or []
+    categorical_cols = norm_params.get('categorical_cols', []) or []
+    means = np.asarray(norm_params.get('means', []), dtype=np.float32)
+    if means.shape[0] != len(covariate_names):
+        raise ValueError("Normalization means length does not match covariate_names length")
+    name_to_idx = {name: i for i, name in enumerate(covariate_names)}
+    for name in covariate_names:
+        j = name_to_idx[name]
+        col = X[:, j]
+        mask = np.isnan(col)
+        if not mask.any():
+            continue
+        if name in binary_cols:
+            col[mask] = 0.0
+        elif name in categorical_cols:
+            # Mode of non-missing, fallback 0.0
+            non_missing = col[~mask]
+            if non_missing.size > 0:
+                mode_val = pd.Series(non_missing).mode()
+                fill_val = float(mode_val.iloc[0]) if len(mode_val) > 0 else 0.0
+            else:
+                fill_val = 0.0
+            col[mask] = fill_val
+        else:
+            # Quantitative: fill with training mean from metadata
+            col[mask] = float(means[j])
+        X[:, j] = col
+    # Final verification
+    if np.isnan(X).any():
+        bad = np.argwhere(np.isnan(X))
+        i, j = bad[0]
+        raise ValueError(f"Imputation failed; NaN remains at row {i}, col {covariate_names[j]}")
+    return X.astype(np.float32, copy=False)
 
 def prepare_user_covariates(covariate_file: str, metadata_path: str, num_needed: int = None, training_covariate_file: str = None):
-    """Load user-provided covariate profiles and align/normalize to training schema.
-    - Matches columns to training covariate_names
-    - Applies normalization using training norm_params if available
-    - Returns tensor [N, cond_dim] and original profiles (numpy array) for logging
+    """Prepare user covariates EXACTLY like training normalization.
+    - Load training metadata (covariate_names, normalization_params)
+    - Reorder columns to match training schema
+    - Mean-center ONLY those variables marked as normalized in training (normalized_flags)
+    - Do NOT re-estimate stats; use saved training means
+    - Return torch.float32 tensor and a numpy copy of the centered values for logging
     """
     import pandas as pd
     covariate_names, norm_params = load_covariate_metadata(metadata_path)
@@ -41,36 +133,35 @@ def prepare_user_covariates(covariate_file: str, metadata_path: str, num_needed:
     missing = [c for c in covariate_names if c not in df.columns]
     if missing:
         raise ValueError(f"Provided covariate file is missing required columns: {missing[:10]}... (total {len(missing)})")
-    # Reorder and drop extras
-    df = df[covariate_names]
-    # Normalization: strictly compute from training covariate file to match training
-    if training_covariate_file is None or not os.path.exists(training_covariate_file):
-        raise ValueError("training_covariate_file must be provided and exist for normalization (no fallbacks).")
-    train_df = pd.read_csv(training_covariate_file)
-    missing_train = [c for c in covariate_names if c not in train_df.columns]
-    if missing_train:
-        raise ValueError(f"Training covariate file missing required columns: {missing_train[:10]}... (total {len(missing_train)})")
-    train_df = train_df[covariate_names]
-    # Compute mean/std ignoring NaNs; avoid zero std
-    col_means = train_df.astype(float).mean(skipna=True)
-    col_stds = train_df.astype(float).std(skipna=True).replace(0.0, 1.0)
-    for col in covariate_names:
-        m = float(col_means[col]) if col in col_means else 0.0
-        s = float(col_stds[col]) if col in col_stds else 1.0
-        if s == 0.0:
-            s = 1.0
-        df[col] = (df[col].astype(float) - m) / s
-    # Slice if fewer needed
-    if num_needed is not None and len(df) > num_needed:
-        df = df.iloc[:num_needed]
-    covariates_tensor = torch.tensor(df.values, dtype=torch.float32)
-    original_profiles = df.values.copy()
+    # Reorder to training schema
+    df = df[covariate_names].copy()
+    imputed = _impute_covariates_from_metadata(df, covariate_names, norm_params)
+    # Normalize
+    means = norm_params.get('means', None)
+    normalized_flags = norm_params.get('normalized_flags', None)
+    if means is None or normalized_flags is None:
+        raise ValueError("Training normalization parameters (means, normalized_flags) not found in metadata; cannot reproduce training preprocessing.")
+    if len(means) != len(covariate_names) or len(normalized_flags) != len(covariate_names):
+        raise ValueError("Normalization parameter lengths do not match number of covariates.")
+    # Center only those flagged
+    for i, col in enumerate(covariate_names):
+        if bool(normalized_flags[i]):
+            imputed[:, i] = imputed[:, i] - float(means[i])
+    # Optional truncation
+    if num_needed is not None and imputed.shape[0] > num_needed:
+        imputed = imputed[:num_needed]
+    covariates_tensor = torch.tensor(imputed, dtype=torch.float32)
+    # Build original (unnormalized) profiles for logging by adding means back to centered variables
+    original = imputed.copy()
+    for i in range(len(covariate_names)):
+        if bool(normalized_flags[i]):
+            original[:, i] = original[:, i] + float(means[i])
+    original_profiles = original
     return covariates_tensor, original_profiles
 
 def prepare_conditional_generation_data(model_dir, model_name, num_samples,
-                                       covariate_file, fam_file, random_seed=None):
+                                       covariate_file, random_seed=None):
     """Prepare covariate data for conditional generation by sampling from training data.
-    
     Args:
         model_dir: Directory containing covariate metadata
         model_name: Model name for metadata file
@@ -78,7 +169,6 @@ def prepare_conditional_generation_data(model_dir, model_name, num_samples,
         covariate_file: Path to covariate CSV file
         fam_file: Path to training fam file
         random_seed: Random seed for reproducible sampling
-    
     Returns:
         Tuple of (covariates_for_model, original_covariate_profiles)
         - covariates_for_model: Tensor for model input (num_samples, cond_dim)
@@ -99,18 +189,36 @@ def prepare_conditional_generation_data(model_dir, model_name, num_samples,
     logger.info(f"Binary variables: {binary_cols}")
     logger.info(f"Categorical variables: {categorical_cols}")
     
-    # Sample covariate profiles from actual training data
-    covariates_for_model, original_profiles = sample_training_covariates(
-        covariate_path=covariate_file,
-        fam_path=fam_file,
-        num_samples=num_samples,
-        binary_cols=binary_cols,
-        categorical_cols=categorical_cols,
-        random_seed=random_seed
-    )
-    
+    # Prepare covariate profiles 
+    if random_seed is not None:
+        np.random.seed(random_seed)
+    # Load provided covariate file
+    cov_df = load_covariate_file(covariate_file)
+    missing = [c for c in covariate_names if c not in cov_df.columns]
+    if missing:
+        raise ValueError(f"Provided covariate file is missing required columns: {missing[:10]}... (total {len(missing)})")
+    cov_df = cov_df[covariate_names]
+    cov_matrix = cov_df.values
+    # Apply training normalization (mean-center only where flagged)
+    means = np.asarray(norm_params.get('means', []), dtype=np.float32)
+    norm_flags = np.asarray(norm_params.get('normalized_flags', []), dtype=bool)
+    if means.shape[0] != len(covariate_names) or norm_flags.shape[0] != len(covariate_names):
+        raise ValueError("Covariate metadata dimensions do not match number of covariates.")
+    cov_centered = cov_matrix.astype(np.float32, copy=True)
+    for j in range(len(covariate_names)):
+        if norm_flags[j]:
+            cov_centered[:, j] -= float(means[j])
+    # Sample indices with replacement
+    n_avail = cov_centered.shape[0]
+    sel = np.random.choice(n_avail, size=int(num_samples), replace=True)
+    covariates_for_model = torch.tensor(cov_centered[sel], dtype=torch.float32)
+    # Build original profiles by adding means back for normalized vars
+    orig = cov_centered.copy()
+    for j in range(len(covariate_names)):
+        if norm_flags[j]:
+            orig[:, j] += float(means[j])
+    original_profiles = orig[sel]
     logger.info(f"Sampled covariate profiles from training data: {covariates_for_model.shape}")
-    
     return covariates_for_model, original_profiles
 
 def load_vae_model(vae_model_path, device="cuda"):
@@ -504,11 +612,25 @@ def generate(args):
     
     # Load checkpoint on CPU to minimize GPU memory usage
     checkpoint = torch.load(args.model_path, map_location='cpu')
+    sig, head = _ckpt_signature(checkpoint)
+    logger.info(f"[CKPT] path={args.model_path} keyset_md5={sig} sample_keys={head}")
     
     # Detect if model is conditional or unconditional
     is_conditional = checkpoint.get('conditional', False)
     cond_dim = checkpoint.get('cond_dim', None)
     
+    logger.info(f"[CKPT] conditional={is_conditional} cond_dim_in_ckpt={cond_dim}")
+    if DEBUG:
+        # Quick peek at EMA presence & a couple param shapes
+        has_ema = 'ema' in checkpoint
+        logger.info(f"[CKPT] has_ema={has_ema} keys={list(checkpoint.keys())[:6]}")
+        try:
+            ema_sd = checkpoint.get('ema', {})
+            any_w = next(iter(ema_sd.values()))
+            logger.debug(f"[CKPT] ema first tensor dtype/shape: {getattr(any_w,'dtype',None)} {getattr(any_w,'shape',None)}")
+        except Exception:
+            pass
+
     # Create appropriate model
     if is_conditional:
         if cond_dim is None:
@@ -525,6 +647,12 @@ def generate(args):
     ema = ModelEmaV3(model, decay=0.9)
     ema.load_state_dict(checkpoint['ema'])
     model.load_state_dict(ema.module.state_dict())
+
+    if DEBUG:
+        nparams = sum(p.numel() for p in model.parameters())
+        logger.info(f"[MODEL] class={model.__class__.__name__} n_params={nparams}")
+        logger.info(f"[MODEL] has cond_emb={hasattr(model, 'cond_emb')} null_cond_emb={hasattr(model,'null_cond_emb')}")
+
     # Free CPU copies of checkpoint/EMA
     del checkpoint
     del ema
@@ -539,60 +667,66 @@ def generate(args):
         beta_schedule="linear",
         beta_start=1e-4,
         beta_end=0.02, 
-        clip_sample=False, 
+        clip_sample=True, 
+        clip_sample_range=50,
         prediction_type="epsilon"
     )
     scheduler.set_timesteps(args.num_inference_steps, device="cuda")
+
+    if DEBUG:
+        logger.info(f"[SCHED] {scheduler.__class__.__name__} "
+                    f"train_T={scheduler.config.num_train_timesteps} "
+                    f"infer_steps={len(scheduler.timesteps)} "
+                    f"clip={getattr(scheduler.config,'clip_sample',None)} "
+                    f"clip_range={getattr(scheduler.config,'clip_sample_range',None)} "
+                    f"pred_type={scheduler.config.prediction_type} "
+                    f"t0={int(scheduler.timesteps[0])} tN={int(scheduler.timesteps[-1])}")
+     
     
     # Load normalization stats on CPU
     model_dir = os.path.dirname(args.model_path)
-    # Extract model name from model path (without extension)
     model_name = os.path.splitext(os.path.basename(args.model_path))[0]
-    # channel_means = torch.load(os.path.join(model_dir, f"train_{model_name}_channel_means.pt"), map_location='cuda', weights_only=False)
-    # channel_stds = torch.load(os.path.join(model_dir, f"train_{model_name}_channel_stds.pt"), map_location='cuda', weights_only=False)
-    sigma_hat = torch.load(os.path.join(model_dir, f"train_{model_name}_sigma.pt"), map_location='cpu', weights_only=False)
-    sigma_hat_value = float(sigma_hat)
+    sigma_hat = torch.load(
+        os.path.join(model_dir, f"train_{model_name}_sigma.pt"), 
+        map_location='cpu', 
+        weights_only=False
+    )
+    # sigma_hat_value = float(sigma_hat)
+    sigma_hat = torch.as_tensor(sigma_hat, dtype=torch.float32)
+    if DEBUG:
+        _tensor_stats("sigma_hat", sigma_hat, log_fn=logger.info)
+        if not torch.isfinite(sigma_hat).all():
+            logger.warning("[WARN] sigma_hat contains non-finite values")
     
     # Prepare conditional data if needed
     covariates = None
     original_covariate_profiles = None
     if is_conditional:
-        model_dir = os.path.dirname(args.model_path)
-        model_name = os.path.splitext(os.path.basename(args.model_path))[0]
-        
         # Get conditional generation arguments
         covariate_file = getattr(args, 'covariate_file', None)
-        fam_file = getattr(args, 'fam_file', None)
         random_seed = getattr(args, 'random_seed', None)
         
         if not covariate_file:
             raise ValueError("Conditional generation requires --covariate-file argument")
         
-        use_provided = bool(getattr(args, 'use_provided_covariates', False))
-        if use_provided:
-            # Use provided covariate profiles directly (no fam matching)
-            metadata_path = os.path.join(model_dir, f"{model_name}_covariate_metadata.json")
-            covariates, original_covariate_profiles = prepare_user_covariates(
-                covariate_file=covariate_file,
-                metadata_path=metadata_path,
-                num_needed=args.num_samples,
-                training_covariate_file=getattr(args, 'training_covariate_file', None)
-            )
-            logger.info(f"Using provided covariate profiles: {covariates.shape}")
-        else:
-            if not fam_file:
-                raise ValueError("Conditional generation with sampling requires --fam-file")
-            covariates, original_covariate_profiles = prepare_conditional_generation_data(
-                model_dir=model_dir,
-                model_name=model_name,
-                num_samples=args.num_samples,
-                covariate_file=covariate_file,
-                fam_file=fam_file,
-                random_seed=random_seed
-            )
+        # Always use provided covariates; no fam needed at generation time
+        metadata_path = os.path.join(model_dir, f"{model_name}_covariate_metadata.json")
+        covariates, original_covariate_profiles = prepare_user_covariates(
+            covariate_file=covariate_file,
+            metadata_path=metadata_path,
+            num_needed=25000,
+            training_covariate_file=None
+        )
+        logger.info(f"Using provided covariate profiles: {covariates.shape}")
         # Keep covariates on CPU; move per-batch to GPU during generation
+        if DEBUG:
+            _tensor_stats("covariates(cpu)", covariates, log_fn=logger.info)
+            if not torch.isfinite(covariates).all():
+                logger.warning("[WARN] covariates contain non-finite values")
     
     guidance_scale = args.guidance_scale
+    if DEBUG:
+        logger.info(f"[CFG] guidance_scale={guidance_scale}")
 
     # Generate samples with outer chunking to cap memory
     # Determine total samples when using provided covariates
@@ -697,8 +831,10 @@ def generate(args):
         chunk_index += 1
 
     # Main generation loop with chunk accumulation
-    for i in tqdm(range(0, total_samples, args.batch_size)):
-        batch_size = min(args.batch_size, total_samples - i)
+    samples_generated = 0
+    batch_index = 0
+    while samples_generated < total_samples:
+        batch_size = min(int(args.batch_size), total_samples - samples_generated)
 
         # Initialize at T via scheduler
         x0 = torch.zeros(batch_size, 64, 64, 64, device="cuda", dtype=torch.float32)
@@ -706,21 +842,28 @@ def generate(args):
         t_full = torch.full((batch_size,), t_T, device="cuda", dtype=torch.long)
         noise = torch.randn_like(x0)
         latents = scheduler.add_noise(x0, noise, t_full)
+        
+        if DEBUG and batch_index == 0:
+            _tensor_stats("init_noise", noise)
+            _tensor_stats("latents@tT", latents)
 
         # Get batch covariates if conditional
         batch_covariates = None
         if is_conditional:
-            batch_covariates = covariates[i:i+batch_size]
+            batch_covariates = covariates[samples_generated:samples_generated+batch_size]
 
         # Denoising loop
         with torch.no_grad():
-            for t in tqdm(scheduler.timesteps, desc=f"Denoising batch {i//args.batch_size + 1}"):
+            # for t in tqdm(scheduler.timesteps, desc=f"Denoising batch {batch_index + 1}"):
+            for step_i, t in enumerate(tqdm(scheduler.timesteps, desc=f"Denoising batch {batch_index + 1}")):
                 if is_conditional:
                     B = latents.size(0)
                     batch_covariates_gpu = batch_covariates.to(latents.device, non_blocking=True)
-                    with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    # with torch.autocast(device_type='cuda', enabled=False):
+                    autocast_ctx = nullcontext()
+                    with autocast_ctx:
                         e_cond = model.cond_emb(batch_covariates_gpu).unsqueeze(1)
-                        e_null = model.null_cond_emb.unsqueeze(0).expand(B,1,256)
+                        e_null = model.null_cond_emb.expand(B, -1).unsqueeze(1).to(latents.dtype)
                         x_in   = torch.cat([latents,      latents],      dim=0)
                         t_in   = torch.cat([t.expand(B),  t.expand(B)],  dim=0)
                         emb_in = torch.cat([e_null,       e_cond],        dim=0)
@@ -728,27 +871,80 @@ def generate(args):
                         feats   = model.unet(h_all, t_in, encoder_hidden_states=emb_in).sample
                         eps_all = model.output_proj(feats)
                         eps0, eps1 = eps_all.chunk(2, dim=0)
-                        noise_pred = eps0 + guidance_scale * (eps1 - eps0)
-                    noise_pred = noise_pred.to(latents.dtype)
+                        noise_pred = (eps0.float() + guidance_scale * (eps1.float() - eps0.float())).to(latents.dtype)
+                    if DEBUG and (step_i == 0 or step_i == len(scheduler.timesteps)-1):
+                        _tensor_stats(f"e_null(step{step_i})", e_null)
+                        _tensor_stats(f"e_cond(step{step_i})", e_cond)
+                        _tensor_stats(f"eps0(step{step_i})", eps0)
+                        _tensor_stats(f"eps1(step{step_i})", eps1)
+                        _tensor_stats(f"noise_pred(step{step_i})", noise_pred, log_fn=logger.info)
                 else:
-                    with torch.autocast(device_type='cuda', dtype=torch.float16):
-                        noise_pred = model(latents, t.expand(batch_size))
-                    noise_pred = noise_pred.to(latents.dtype)
-
+                    # with torch.autocast(device_type='cuda', enabled=False):
+                    autocast_ctx = nullcontext()
+                    with autocast_ctx:
+                        noise_pred = model(latents, t.expand(batch_size)).to(latents.dtype)
+                    if DEBUG and (step_i == 0 or step_i == len(scheduler.timesteps)-1):
+                        _tensor_stats(f"noise_pred(step{step_i})", noise_pred, log_fn=logger.info)
+ 
+                if DEBUG and step_i == 0:
+                    _tensor_stats("latents(pre-step0)", latents, log_fn=logger.info)
                 latents = scheduler.step(
                     model_output=noise_pred,
                     timestep=t,
                     sample=latents,
                     eta=0.0
                 ).prev_sample
+                if DEBUG and step_i == 0:
+                    _tensor_stats("latents(post-step0)", latents, log_fn=logger.info)
+                if DEBUG and (step_i % 10 == 0):
+                    ok = torch.isfinite(latents).all().item()
+                    if not ok:
+                        logger.warning(f"[HEALTH] non-finite latents detected at step={step_i} (batch={batch_index+1})")
+                        break
+        latents = latents * sigma_hat
+        if DEBUG:
+            _tensor_stats("latents*sig", latents, log_fn=logger.info)
 
-        latents = latents * sigma_hat_value
-        current_chunk_samples.append(latents.cpu())
-        current_chunk_count += batch_size
+        # Keep only valid samples (no NaNs); drop invalid and backfill in subsequent batches
+        valid_mask = ~torch.isnan(latents.view(latents.size(0), -1)).any(dim=1)
+        num_valid = int(valid_mask.sum().item())
+        if num_valid < batch_size:
+            logger.warning(f"Dropped {batch_size - num_valid} NaN samples in batch {batch_index + 1}; will generate additional samples to meet target.")
+            if DEBUG:
+                bad_idx = (~valid_mask).nonzero(as_tuple=False).view(-1)
+                k = min(int(getattr(args, "debug_sample_limit", 8)), bad_idx.numel())
+                sel = bad_idx[:k]
+                sel_cpu = sel.detach().cpu()
+                dump = {
+                    "model": model.__class__.__name__,
+                    "scheduler": scheduler.__class__.__name__,
+                    "guidance_scale": guidance_scale,
+                    "timesteps": scheduler.timesteps.cpu(),
+                    "sigma_hat": sigma_hat.cpu(),
+                    "latents_bad": latents[sel].cpu(),
+                }
+                if is_conditional:
+                    # batch_covariates is on CPU; index with CPU indices
+                    dump["covariates_bad"] = batch_covariates[sel_cpu].cpu()
+                dump_path = os.path.join(os.path.dirname(args.output_path),
+                                         f"nan_repro_batch{batch_index+1}_ts{int(time.time())}.pt")
+                try:
+                    torch.save(dump, dump_path)
+                    logger.warning(f"[DUMP] wrote minimal repro to {dump_path} (rows={k})")
+                    first_dump_done = True
+                except Exception as e:
+                    logger.warning(f"[DUMP] failed: {e}")
+        if num_valid > 0:
+            valid_latents = latents[valid_mask]
+            current_chunk_samples.append(valid_latents.cpu())
+            current_chunk_count += num_valid
+            samples_generated += num_valid
 
         # Finalize chunk if reached limit
         if current_chunk_count >= MAX_SAMPLES_PER_CHUNK:
             finalize_and_save_current_chunk()
+
+        batch_index += 1
 
     # Finalize any remaining samples in the last chunk
     finalize_and_save_current_chunk()
@@ -773,7 +969,8 @@ def generate(args):
         logger.info(f"Saved {len(covariate_df)} covariate profiles with {len(covariate_names)} features")
     
     # Decode samples if decoding arguments are provided (use canonical decoder)
-    if hasattr(args, 'decode_samples') and args.decode_samples:
+    # If chunking was used, decoding was already handled per-chunk in finalize_and_save_current_chunk()
+    if hasattr(args, 'decode_samples') and args.decode_samples and not use_chunking:
         try:
             logger.info("Starting sample decoding via decode_vae_latents.py...")
             
@@ -865,7 +1062,6 @@ def main():
     
     # Conditional generation arguments (for conditional models only)
     parser.add_argument("--covariate-file", type=str, help="Path to covariate CSV file (for conditional models)")
-    parser.add_argument("--fam-file", type=str, help="Path to training fam file (for conditional models)")
     parser.add_argument("--random-seed", type=int, help="Random seed for reproducible sampling")
     parser.add_argument("--guidance-scale", type=float, default=5, help="CFG scale (how strongly to apply covariates)")
     

@@ -64,7 +64,7 @@ def load_decoded_batch(pt_file: str) -> Tuple[np.ndarray, int]:
     n_samples = int(data["n_samples"])  # type: ignore
     # Concatenate blocks along variant dimension
     geno = np.concatenate([b.numpy() for b in blocks], axis=1)
-    # Round to nearest genotype and clip to [0,2]
+    # Round to nearest genotype and clip to [0,2]; ensure no NaNs remain
     geno = np.rint(geno)
     geno = np.clip(geno, 0, 2).astype(np.float32)
     if geno.shape[0] != n_samples:
@@ -147,10 +147,11 @@ def write_batch_plink(
 
     # Write PLINK1 bed/bim/fam trio using provided BIM path and per-batch FAM
     write_plink1_bin(G, f"{out_prefix}.bed", bim=bim_path_src, fam=fam_path_tmp, verbose=False)
-    # Copy the provided BIM exactly; do not alter contents or formatting
+    # Force BIM/FAM to match provided sources exactly (pandas_plink may rewrite placeholders)
     dst_bim = f"{out_prefix}.bim"
-    if not os.path.exists(dst_bim):
-        shutil.copy2(bim_path_src, dst_bim)
+    shutil.copy2(bim_path_src, dst_bim)
+    # Re-write FAM slice after writer runs to avoid any internal rewriting
+    fam_to_write.to_csv(fam_path_tmp, sep=" ", header=False, index=False)
     return out_prefix
 
 
