@@ -714,7 +714,7 @@ def generate(args):
         covariates, original_covariate_profiles = prepare_user_covariates(
             covariate_file=covariate_file,
             metadata_path=metadata_path,
-            num_needed=25000,
+            num_needed=args.num_samples,
             training_covariate_file=None
         )
         logger.info(f"Using provided covariate profiles: {covariates.shape}")
