@@ -19,10 +19,10 @@ import os
 import re
 import subprocess
 import shutil
+import shlex
 from typing import List, Tuple
 
 import numpy as np
-import pandas as pd
 import torch
 import xarray as xr
 from pandas_plink import write_plink1_bin
@@ -72,46 +72,19 @@ def load_decoded_batch(pt_file: str) -> Tuple[np.ndarray, int]:
     return geno, n_samples
 
 
-def read_bim(bim_path: str) -> pd.DataFrame:
-    if not os.path.exists(bim_path):
-        raise FileNotFoundError(f"BIM file not found: {bim_path}")
-    bim = pd.read_csv(
-        bim_path,
-        sep=r"\s+",
-        header=None,
-        names=["chrom", "snp", "cm", "pos", "a1", "a2"],
-    )
-    return bim
-
-
-def read_fam_all(fam_path: str) -> pd.DataFrame:
-    if not os.path.exists(fam_path):
-        raise FileNotFoundError(f"FAM file not found: {fam_path}")
-    fam = pd.read_csv(
-        fam_path,
-        sep=r"\s+",
-        header=None,
-        names=["fid", "iid", "pid", "mid", "sex", "phen"],
-    )
-    return fam
-
-
 def write_batch_plink(
     batch_idx: int,
     geno: np.ndarray,
-    bim: pd.DataFrame,
-    fam_slice: pd.DataFrame,
+    n_samples: int,
+    fam_start_row_zero_indexed: int,
     out_prefix: str,
     bim_path_src: str,
+    fam_all_path: str,
 ) -> str:
-    # Validate shapes
-    if geno.shape[1] != len(bim):
+    # Validate sample dimension only (BIM/FAM handled via shell)
+    if geno.shape[0] != n_samples:
         raise ValueError(
-            f"Variant count mismatch for batch {batch_idx}: geno has {geno.shape[1]} variants, BIM has {len(bim)}"
-        )
-    if geno.shape[0] != len(fam_slice):
-        raise ValueError(
-            f"Sample count mismatch for batch {batch_idx}: geno has {geno.shape[0]} samples, FAM slice has {len(fam_slice)}"
+            f"Sample count mismatch for batch {batch_idx}: geno has {geno.shape[0]} samples, expected {n_samples}"
         )
 
     # Skip creation if full PLINK trio already exists
@@ -121,37 +94,44 @@ def write_batch_plink(
     if os.path.exists(bed_path) and os.path.exists(bim_path_out) and os.path.exists(fam_path_out):
         return out_prefix
 
-    # Persist per-batch FAM slice
-    fam_path_tmp = fam_path_out
-    # Ensure strict column order and types for PLINK .fam
-    fam_to_write = fam_slice[["fid","iid","pid","mid","sex","phen"]].copy()
-    # Coerce types minimally (fid/iid string; sex/phen numeric as-is)
-    fam_to_write["fid"] = fam_to_write["fid"].astype(str)
-    fam_to_write["iid"] = fam_to_write["iid"].astype(str)
-    fam_to_write.to_csv(fam_path_tmp, sep=" ", header=False, index=False)
+    # 1) Copy BIM via shell
+    cp_res = subprocess.run(["cp", "--", bim_path_src, bim_path_out], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if cp_res.returncode != 0:
+        raise RuntimeError(
+            f"Failed to copy BIM for batch {batch_idx}: {bim_path_src} -> {bim_path_out}\nSTDOUT:\n{cp_res.stdout}\nSTDERR:\n{cp_res.stderr}"
+        )
 
-    # Build xarray DataArray with coordinates matching fam/bim
+    # 2) Slice FAM via shell (tail/head piping)
+    #    fam files are 1-indexed for tail's +N; start line is zero_indexed + 1
+    start_line = fam_start_row_zero_indexed + 1
+    slice_cmd = (
+        f"tail -n +{start_line} {shlex.quote(fam_all_path)} | head -n {n_samples} > {shlex.quote(fam_path_out)}"
+    )
+    fam_res = subprocess.run(["/bin/bash", "-lc", slice_cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if fam_res.returncode != 0:
+        raise RuntimeError(
+            f"Failed to slice FAM for batch {batch_idx}: lines {start_line}..{start_line + n_samples - 1}\nSTDOUT:\n{fam_res.stdout}\nSTDERR:\n{fam_res.stderr}"
+        )
+
+    # 3) Write only the BED using pandas_plink, referencing the shell-prepared BIM/FAM
+    geno = (2.0 - geno).astype(np.float32)
     G = xr.DataArray(
         geno,
         dims=("sample", "variant"),
-        coords={
-            "fid": ("sample", fam_slice["fid"].values),
-            "iid": ("sample", fam_slice["iid"].values),
-            "snp": ("variant", bim["snp"].values),
-            "chrom": ("variant", bim["chrom"].values),
-            "pos": ("variant", bim["pos"].values),
-            "a1": ("variant", bim["a1"].values),
-            "a2": ("variant", bim["a2"].values),
-        },
     )
-
-    # Write PLINK1 bed/bim/fam trio using provided BIM path and per-batch FAM
-    write_plink1_bin(G, f"{out_prefix}.bed", bim=bim_path_src, fam=fam_path_tmp, verbose=False)
-    # Force BIM/FAM to match provided sources exactly (pandas_plink may rewrite placeholders)
-    dst_bim = f"{out_prefix}.bim"
-    shutil.copy2(bim_path_src, dst_bim)
-    # Re-write FAM slice after writer runs to avoid any internal rewriting
-    fam_to_write.to_csv(fam_path_tmp, sep=" ", header=False, index=False)
+    write_plink1_bin(G, f"{out_prefix}.bed", bim=bim_path_out, fam=fam_path_out, verbose=False)
+    
+    # 4) Restore BIM and FAM via shell since writer overwrites them with placeholders
+    cp_res_after = subprocess.run(["cp", "--", bim_path_src, bim_path_out], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if cp_res_after.returncode != 0:
+        raise RuntimeError(
+            f"Failed to re-copy BIM after bed write for batch {batch_idx}: {bim_path_src} -> {bim_path_out}\nSTDOUT:\n{cp_res_after.stdout}\nSTDERR:\n{cp_res_after.stderr}"
+        )
+    fam_res_after = subprocess.run(["/bin/bash", "-lc", slice_cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if fam_res_after.returncode != 0:
+        raise RuntimeError(
+            f"Failed to re-slice FAM after bed write for batch {batch_idx}: lines {start_line}..{start_line + n_samples - 1}\nSTDOUT:\n{fam_res_after.stdout}\nSTDERR:\n{fam_res_after.stderr}"
+        )
     return out_prefix
 
 
@@ -180,53 +160,58 @@ def main():
     plink_bin = args.plink
 
     batches = discover_batches(batch_dir)
-    bim = read_bim(bim_path)
-    fam_all = read_fam_all(fam_all_path)
+
+    print(f"Found {len(batches)} batches")
 
     # Generate per-batch PLINK trios
     per_batch_prefixes: List[str] = []
     fam_row_cursor = 0
     for batch_no, pt_path in batches:
+        print(f"Loading batch {batch_no} from {pt_path}")
         geno, n_samples = load_decoded_batch(pt_path)
-        fam_slice = fam_all.iloc[fam_row_cursor : fam_row_cursor + n_samples]
-        if len(fam_slice) != n_samples:
-            raise ValueError(
-                f"Insufficient FAM rows for batch {batch_no}: needed {n_samples}, have {len(fam_slice)}"
-            )
+        print(f"Loaded batch {batch_no} with {n_samples} samples")
+        # Prepare per-batch outputs without reading/writing FAM/BIM in Python
+        start_row = fam_row_cursor
         fam_row_cursor += n_samples
 
         batch_prefix = os.path.join(batch_dir, f"decoded_batch{batch_no}")
-        write_batch_plink(batch_no, geno, bim, fam_slice, batch_prefix, bim_path)
+        write_batch_plink(batch_no, geno, n_samples, start_row, batch_prefix, bim_path, fam_all_path)
+        print(f"Wrote batch {batch_no} to {batch_prefix}")
         per_batch_prefixes.append(batch_prefix)
 
     # Merge batches iteratively
     current_prefix = per_batch_prefixes[0]
     for idx in range(1, len(per_batch_prefixes)):
         next_prefix = per_batch_prefixes[idx]
+        print(f"Merging batch {idx} from {current_prefix} to {next_prefix}")
         merge_out = os.path.join(batch_dir, f".tmp_merge_{idx}")
         run_plink_merge(plink_bin, current_prefix, next_prefix, merge_out)
+        print(f"Merged batch {idx} to {merge_out}")
         current_prefix = merge_out
 
     # Move final merged to desired output prefix
     for ext in (".bed", ".bim", ".fam", ".log", ".nosex"):
         src = f"{current_prefix}{ext}"
         if os.path.exists(src):
+            print(f"Moving final merged to {out_prefix_final}{ext}")
             dst = f"{out_prefix_final}{ext}"
             os.replace(src, dst)
 
     # Cleanup per-batch PLINK trios and temp merges
+    print("Cleaning up per-batch PLINK trios and temp merges")
     for prefix in per_batch_prefixes:
         for ext in (".bed", ".bim", ".fam", ".log", ".nosex"):
             p = f"{prefix}{ext}"
             if os.path.exists(p):
                 os.remove(p)
+    print("Cleaned up per-batch PLINK trios")
     for idx in range(1, len(per_batch_prefixes)):
         prefix = os.path.join(batch_dir, f".tmp_merge_{idx}")
         for ext in (".bed", ".bim", ".fam", ".log", ".nosex"):
             p = f"{prefix}{ext}"
             if os.path.exists(p):
                 os.remove(p)
-
+    print("Cleaned up temp merges")
 
 if __name__ == "__main__":
     main()

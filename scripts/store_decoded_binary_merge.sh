@@ -13,10 +13,10 @@ module load R gcc cmake
 
 key=$1 # 294Korig, 500K
 
-UKBdir=/n/home03/ahmadazim/WORKING/genGen/UKB/
-decoded_dir=${UKBdir}genomic_data/generated_samples/decoded_snps_ukb_allchr_unrel_britishWhite_unrelWhite_allchr_4PC_64z_${key}/
+UKBdir=/n/home03/ahmadazim/WORKING/genGen/UKB6PC/
+decoded_dir=${UKBdir}genomic_data/generated_samples/decoded_snps_ukb_allchr_unrel_britishWhite_unrelWhite_allchr_6PC_64z_${key}/
 
-python ~/WORKING/genGen/DiffuGene/scripts/store_decoded_binary_merge.py \
+python -u ~/WORKING/genGen/DiffuGene/scripts/store_decoded_binary_merge.py \
   --batch-dir ${decoded_dir} \
   --bim-file ${decoded_dir}ukb_allchr_unrel_britishWhite_${key}.bim \
   --fam-file ${decoded_dir}ukb_allchr_unrel_britishWhite_${key}.fam \
