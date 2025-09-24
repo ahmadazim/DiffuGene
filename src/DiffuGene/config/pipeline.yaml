@@ -1,124 +1,141 @@
-# DiffuGene Pipeline Configuration
-# This file contains all configurable parameters for the complete pipeline
-
 # Global settings
 global:
-  data_root: "/n/home03/ahmadazim/WORKING/genGen/DiffuGene/data"
-  model_root: "/n/home03/ahmadazim/WORKING/genGen/DiffuGene/models" 
-  basename: "all_hm3_15k"
-  chromosome: 22
+  data_root: /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/genomic_data/
+  model_root: /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/models/
+  basename: ukb_allchr_unrel_britishWhite
+  chromosome: all
   random_seed: 42
-  device: "cuda"
+  device: cuda
+  unique_id: unrelWhite_allchr_6PC_64z
+  # Optional overrides for PLINK bfile prefix
+  bed_file: "${global.data_root}/geneticBinary/ukb_allchr_unrel_britishWhite.bed"
+  bim_file: "${global.data_root}/geneticBinary/ukb_allchr_unrel_britishWhite.bim"
 
-# Step 1: Data Preparation & LD Block Inference
-data_prep:
-  genetic_binary_folder: "${global.data_root}/geneticBinary"
-  block_folder: "${global.data_root}/haploblocks"
-  recoded_block_folder: "${global.data_root}/haploblocks_recoded"
-  snplist_folder: "${global.data_root}/haploblocks_snps"
-  
-  # PLINK LD block parameters
-  plink:
-    max_kb: 100000
-    min_maf: 0.01
-    strong_lowci: 0.5001
-    strong_highci: 0.8301
-    recomb_highci: 0.60
-    inform_frac: 0.90
+# Input datasets: override fam files if you have custom splits
+training_data:
+  vqvae_fam: "${global.data_root}/geneticBinary/ukb_allchr_unrel_britishWhite_genome_encoder_train.fam"
+  diffusion_fam: "${global.data_root}/geneticBinary/ukb_allchr_unrel_britishWhite_conditional_diffusion_train.fam"
 
-# Step 2: Block-wise PCA Embedding
-block_embed:
-  pca_k: 4  # Number of principal components
-  output_dirs:
-    embeddings: "${global.data_root}/haploblocks_embeddings/training_embeddings"
-    reconstructed: "${global.data_root}/haploblocks_embeddings/reconstructed"
-    loadings: "${global.data_root}/haploblocks_embeddings/loadings"
-    means: "${global.data_root}/haploblocks_embeddings/means"
+evaluation_data:
+  vqvae_test_fam: "${global.data_root}/geneticBinary/ukb_allchr_unrel_britishWhite_genome_encoder_test.fam"
+  diffusion_val_fam: "${global.data_root}/geneticBinary/ukb_allchr_unrel_britishWhite_conditional_diffusion_val.fam"
 
-# Step 3: Joint VAE Embedding
-joint_embed:
-  recoded_dir: "${global.data_root}/haploblocks_recoded"
-  embeddings_dir: "${global.data_root}/haploblocks_embeddings"
-  model_save_path: "${global.model_root}/joint_embed/vae_model.pt"
-  checkpoint_path: None
-  latents_output_path: "${global.data_root}/VAE_embeddings/${global.basename}_chr${global.chromosome}_VAE_latents.pt"
-  
-  # Model architecture
+# Step 1: VQ-VAE Embedding
+vqvae:
+  # Data preparation (PLINK to H5 caches)
+  data:
+    bfile_prefix: ${global.data_root}/geneticBinary/${global.basename}
+    fam_file: ${training_data.vqvae_fam}
+    bim_file: ${global.data_root}/geneticBinary/${global.basename}.bim
+    h5_cache_dir: ${global.data_root}/vqvae_h5_cache
+    batch_size: 10000
+  # Model
+  model_save_path: ${global.model_root}/vqvae/VQVAE_${global.unique_id}.pt
   model:
-    grid_h: 32
-    grid_w: 32
-    block_dim: 3
-    pos_dim: 16
-    latent_channels: 32
-  
-  # Training parameters
+    latent_dim: 8
+    codebook_size: 2056
+    num_quantizers: 2
+    latent_grid_dim: 256
+    hidden_channels: 32   #no longer used
+    width_mult_per_stage: 1.0
+    ema_decay: 0.9
+    ema_eps: 1e-5
+    ld_lambda: 1e-3
+    maf_lambda: 1e-3
+    ld_window: 128
+    # Encoder: 778x778x32 -> (k=12,s=3,p=0) -> 256x256x32
+    init_down_kernel: 12
+    init_down_stride: 3
+    init_down_padding: 0
+    init_down_out_channels: 32
+    keep_layers_at_T: 2         # two residual blocks at 256x256x32
+    # Decoder: start 256x256x8 -> (proj to ch=32) -> stay -> upsample
+    dec_up_kernel: 12
+    dec_up_stride: 3
+    dec_up_padding: 0
+    dec_up_output_padding: 1
+    dec_up_out_channels: 32
   training:
-    epochs: 10
-    batch_size: 256
-    learning_rate: 1e-3
-    kld_weight: 1e-5
-    reconstruct_snps: true
-    snp_start_epoch: 7
-    decoded_mse_weight: 1.0
-    eval_frequency: 10  # Evaluation and checkpoint saving frequency (epochs)
+    epochs: 5
+    batch_size: 16
+    learning_rate: 2.0e-4
+  encoding:
+    latents_output_dir: ${global.data_root}/VQVAE_embeddings/vqvae_latents_${global.basename}_${global.unique_id}
+    write_memmap: true
 
-# Step 4: Diffusion Model Training
+# Step 2: Diffusion Model Training
 diffusion:
-  # Input/Output paths
-  train_embed_dataset_path: "${global.data_root}/VAE_embeddings/${global.basename}_chr${global.chromosome}_VAE_latents.pt"
-  model_output_path: "${global.model_root}/diffusion/ddpm_checkpoint.pth"
-  checkpoint_path: None
-  
-  # Model architecture
+  train_embed_dataset_path: ${global.data_root}/VQVAE_embeddings/${global.basename}_conditional_diffusion_train_VAE_latents_6PC_64z.pt
+  model_output_path: ${global.model_root}/diffusion/DDPM_${global.unique_id}.pth
+  checkpoint_path: ${global.model_root}/diffusion/DDPM_${global.unique_id}_checkpoint.pth
+
+  encoding:
+    diffusion_train_latents_path: ${global.data_root}/VQVAE_embeddings/${global.basename}_conditional_diffusion_train_VAE_latents_6PC_64z.pt
+    diffusion_val_latents_path:   ${global.data_root}/VQVAE_embeddings/${global.basename}_conditional_diffusion_val_VAE_latents_6PC_64z.pt
+
   model:
-    input_channels: 16
-    output_channels: 16
+    input_channels: 64
+    output_channels: 64
     time_steps: 1000
-    layers_per_block: 2
-  
-  # Training parameters
+    layers_per_block: 8
+
   training:
-    batch_size: 64
-    num_epochs: 10
-    learning_rate: 2e-5
-    ema_decay: 0.9999
+    batch_size: 128
+    num_epochs: 30  # really 50, checkpoint starts at 20
+    learning_rate: 5e-5
+    ema_decay: 0.9
     num_time_steps: 1000
 
-# Step 5: Sample Generation
+  conditional:
+    enabled: true
+    covariate_file: ${global.data_root}/../covariates/all_covariates.csv
+    binary_cols: ["SEX_MALE", "CAD", "HYPERTENSION", "T2D", "T1D", "STROKE", "CKD", "HYPERLIPIDEMIA", "LUNG_CANCER", 
+                  "BREAST_CANCER", "PROSTATE_CANCER", "COLORECTAL_CANCER", "PANCREATIC_CANCER",  "BIPOLAR", 
+                  "MAJOR_DEPRESSION", "RA", "IBD", "AD_DIMENTIA", "PARKINSONS", "ATRIAL_FIBRILLATION", "CHOL_LOW_MEDS", 
+                  "ASSESSMENT_CENTER_10003", "ASSESSMENT_CENTER_11001", "ASSESSMENT_CENTER_11002", "ASSESSMENT_CENTER_11003", 
+                  "ASSESSMENT_CENTER_11004", "ASSESSMENT_CENTER_11005", "ASSESSMENT_CENTER_11006", "ASSESSMENT_CENTER_11007", 
+                  "ASSESSMENT_CENTER_11008", "ASSESSMENT_CENTER_11009", "ASSESSMENT_CENTER_11010", "ASSESSMENT_CENTER_11011", 
+                  "ASSESSMENT_CENTER_11012", "ASSESSMENT_CENTER_11013", "ASSESSMENT_CENTER_11014", "ASSESSMENT_CENTER_11016", 
+                  "ASSESSMENT_CENTER_11017", "ASSESSMENT_CENTER_11018", "ASSESSMENT_CENTER_11020", "ASSESSMENT_CENTER_11021", 
+                  "ASSESSMENT_CENTER_11022", "ASSESSMENT_CENTER_11023"]
+    categorical_cols: ["SMOKING_STATUS", "ALCOHOL_INTAKE"]
+
+# Step 3: Sample Generation
 generation:
   # Input/Output paths
-  model_path: "${global.model_root}/diffusion/ddpm_checkpoint.pth"
-  output_path: "${global.data_root}/generated_samples/generated_latents.pt"
+  model_path: ${diffusion.model_output_path}
+  output_path: ${global.data_root}/generated_samples/generated_latents_${global.basename}_${global.unique_id}_294Korig.pt
   
   # Generation parameters
-  num_samples: 10
-  batch_size: 64
+  num_samples: 294134
+  batch_size: 128
   num_time_steps: 1000
-  num_inference_steps: 100
-  
+  num_inference_steps: 50
+  guidance_scale: 7.0
+  covariate_profile: ${global.data_root}/../covariates/all_covariates.csv
+
   # Decoding parameters (to convert latents back to SNP space)
-  decode_samples: true
-  vae_model_path: "${global.model_root}/joint_embed/vae_model.pt"
-  pca_loadings_dir: "${global.data_root}/haploblocks_embeddings/loadings"
-  recoded_dir: "${global.data_root}/haploblocks_recoded"
-  decoded_output_dir: "${global.data_root}/generated_samples/decoded_snps"
+  decode_samples: false
+  vae_model_path: ${vqvae.model_save_path}
+  decoded_output_dir: ${global.data_root}/generated_samples/decoded_snps_${global.basename}_${global.unique_id}_294Korig
+
 
 # Pipeline execution control
 pipeline:
-  # Which steps to run (set to false to skip)
-  run_data_prep: true
-  run_block_embed: true
-  run_joint_embed: true
-  run_diffusion: true
+  run_vqvae: true
+  run_vae_evaluation: false
+  run_diffusion_encoding: false
+  run_diffusion: false
+  run_diffusion_val_encoding: false
   run_generation: true
   
   # Execution options
-  force_rerun: false  # If true, reruns steps even if outputs exist
+  force_rerun: true  # If true, reruns steps even if outputs exist
   save_intermediate: true  # Save intermediate results
   cleanup_temp: false  # Clean up temporary files after completion
 
 # Logging configuration
 logging:
   level: "INFO"  # DEBUG, INFO, WARNING, ERROR
-  log_file: "${global.model_root}/pipeline.log"
+  log_file: ${global.model_root}/pipeline_${global.basename}_${global.unique_id}.log
   console_output: true 

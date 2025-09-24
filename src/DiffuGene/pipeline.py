@@ -673,41 +673,9 @@ class DiffuGenePipeline:
             
         chromosomes = get_chromosome_list(self.config['global']['chromosome'])
         
-        if step_name == 'data_prep':
-            # Check if recoded block files exist for all required chromosomes
-            pca_basename = self.get_dataset_basename('pca')
-            all_chr_exist = True
-            for chr_num in chromosomes:
-                pattern = os.path.join(
-                    self.config['data_prep']['recoded_block_folder'],
-                    f"{pca_basename}_chr{chr_num}_block*_recodeA.raw"
-                )
-                if len(glob.glob(pattern)) == 0:
-                    all_chr_exist = False
-                    break
-            return all_chr_exist
-            
-        elif step_name == 'block_embed':
-            # Check if both embeddings and spans CSV exist for all chromosomes
-            embeddings_dir = self.config['block_embed']['output_dirs']['embeddings']
-            
-            # Check embeddings exist for all chromosomes
-            all_emb_exist = True
-            for chr_num in chromosomes:
-                pattern = f"{embeddings_dir}/*_chr{chr_num}_*_embeddings.pt"
-                if len(glob.glob(pattern)) == 0:
-                    all_emb_exist = False
-                    break
-            
-            # Check automatically generated spans CSV exists
-            spans_csv = self.get_spans_file_path('pca')
-            
-            return all_emb_exist and os.path.exists(spans_csv)
-            
-        elif step_name == 'joint_embed':
-            model_path = self.config['joint_embed']['model_save_path']
-            latents_path = self.config['joint_embed']['latents_output_path']
-            return os.path.exists(model_path) and check_for_batch_files(latents_path)
+        if step_name == 'vqvae':
+            model_path = self.config['vqvae']['model_save_path']
+            return os.path.exists(model_path)
             
         elif step_name == 'diffusion':
             model_path = self.config['diffusion']['model_output_path']
@@ -1019,12 +987,91 @@ class DiffuGenePipeline:
     def run_joint_embed(self):
         """Step 3: Joint VAE embedding."""
         logger.info("=" * 60)
-        logger.info("STEP 3: Joint VAE Embedding")
+        logger.info("STEP 3: Joint VQ-VAE Embedding")
         logger.info("=" * 60)
         
-        if self.check_step_outputs('joint_embed'):
-            logger.info("Joint embedding outputs found, skipping...")
-            return
+        # Use new VQ-VAE flow
+        if self.check_step_outputs('vqvae'):
+            logger.info("VQ-VAE model found, skipping training...")
+        else:
+            from .VAEembed.prepare_vqvae_data import main as prep_main
+            from .VAEembed.train_vqvae import main as train_main
+            # Prepare H5 caches (per-chromosome, per-batch)
+            data_cfg = self.config['vqvae']['data']
+            fam_override = self.config.get('training_data', {}).get('vqvae_fam')
+            fam_path = fam_override if fam_override else data_cfg['fam_file']
+            args = [
+                "--bfile", data_cfg['bfile_prefix'],
+                "--fam", fam_path,
+                "--bim", data_cfg['bim_file'],
+                "--out-dir", data_cfg['h5_cache_dir'],
+                "--batch-size", str(int(data_cfg.get('batch_size', 10000)))
+            ]
+            # Chromosomes
+            chromo = self.config['global']['chromosome']
+            if str(chromo).lower() != 'all':
+                args += ["--chromosomes", str(int(chromo))]
+            sys.argv = ["prep_vqvae_data.py"] + args
+            prep_main()
+            # Train VQ-VAE
+            model_cfg = self.config['vqvae']['model']
+            train_cfg = self.config['vqvae']['training']
+            args = [
+                "--h5-dir", data_cfg['h5_cache_dir'],
+                "--bim", data_cfg['bim_file'],
+                "--save-path", self.config['vqvae']['model_save_path'],
+                "--latent-dim", str(int(model_cfg['latent_dim'])),
+                "--codebook-size", str(int(model_cfg['codebook_size'])),
+                "--num-quantizers", str(int(model_cfg['num_quantizers'])),
+                "--latent-grid-dim", str(int(model_cfg['latent_grid_dim'])),
+                "--hidden-channels", str(int(model_cfg['hidden_channels'])),
+                "--width-mult-per-stage", str(float(model_cfg.get('width_mult_per_stage', 1.0))),
+                "--ema-decay", str(float(model_cfg.get('ema_decay', 0.99))),
+                "--ema-eps", str(float(model_cfg.get('ema_eps', 1e-5))),
+                "--ld-lambda", str(float(model_cfg.get('ld_lambda', 1e-3))),
+                "--maf-lambda", str(float(model_cfg.get('maf_lambda', 0.0))),
+                "--ld-window", str(int(model_cfg.get('ld_window', 128))),
+                # Direct mapping params (optional)
+                "--init-down-kernel", str(int(model_cfg.get('init_down_kernel', 0))),
+                "--init-down-stride", str(int(model_cfg.get('init_down_stride', 0))),
+                "--init-down-padding", str(int(model_cfg.get('init_down_padding', 0))),
+                "--init-down-out-channels", str(int(model_cfg.get('init_down_out_channels', 0))),
+                "--keep-layers-at-T", str(int(model_cfg.get('keep_layers_at_T', 0))),
+                "--dec-up-kernel", str(int(model_cfg.get('dec_up_kernel', 0))),
+                "--dec-up-stride", str(int(model_cfg.get('dec_up_stride', 0))),
+                "--dec-up-padding", str(int(model_cfg.get('dec_up_padding', 0))),
+                "--dec-up-output-padding", str(int(model_cfg.get('dec_up_output_padding', 0))),
+                "--dec-up-out-channels", str(int(model_cfg.get('dec_up_out_channels', 0))),
+                "--epochs", str(int(train_cfg['epochs'])),
+                "--batch-size", str(int(train_cfg['batch_size'])),
+                "--lr", str(float(train_cfg['learning_rate'])),
+                "--device", self.config['global'].get('device', 'cuda'),
+            ]
+            chromo = self.config['global']['chromosome']
+            if str(chromo).lower() != 'all':
+                args += ["--chromosomes", str(int(chromo))]
+            sys.argv = ["train_vqvae.py"] + args
+            train_main()
+
+        # Encode latents for diffusion training/validation as needed
+        from .VAEembed.encode_vqvae import main as encode_main
+        enc_cfg = self.config['vqvae']['encoding']
+        # Allow inference-time override of fam for encoding if needed in future (kept simple for now)
+        args = [
+            "--model", self.config['vqvae']['model_save_path'],
+            "--h5-dir", self.config['vqvae']['data']['h5_cache_dir'],
+            "--out-dir", enc_cfg['latents_output_dir'],
+            "--device", self.config['global'].get('device', 'cuda')
+        ]
+        if enc_cfg.get('write_memmap', True):
+            args.append("--write-memmap")
+        chromo = self.config['global']['chromosome']
+        if str(chromo).lower() != 'all':
+            args += ["--chromosomes", str(int(chromo))]
+        sys.argv = ["encode_vqvae.py"] + args
+        encode_main()
+        logger.info("VQ-VAE encoding completed successfully")
+        return
         
         # Get the datasets for VAE training
         vae_fam_file = self.get_dataset_fam_file('vae')
@@ -1715,10 +1762,7 @@ class DiffuGenePipeline:
         
         # Define all available steps
         all_steps = [
-            ('data_prep', self.run_data_prep, pipeline_config.get('run_data_prep', True)),
-            ('block_embed', self.run_block_embed, pipeline_config.get('run_block_embed', True)),
-            ('joint_embed', self.run_joint_embed, pipeline_config.get('run_joint_embed', True)),
-            ('vae_evaluation', self.run_vae_evaluation, pipeline_config.get('run_vae_evaluation', True)),
+            ('vqvae', self.run_joint_embed, pipeline_config.get('run_vqvae', True)),
             ('diffusion_encoding', self.run_diffusion_encoding, pipeline_config.get('run_diffusion_encoding', True)),
             ('diffusion', self.run_diffusion, pipeline_config.get('run_diffusion', True)),
             ('diffusion_val_encoding', self.run_diffusion_val_encoding, pipeline_config.get('run_diffusion_val_encoding', True)),
@@ -1734,14 +1778,23 @@ class DiffuGenePipeline:
         logger.info("Starting DiffuGene Pipeline")
         logger.info(f"Steps to run: {[name for name, _, _ in steps_to_run]}")
         
-        # Create output directories
+        # Create output directories (VQ-VAE + Diffusion + Generation)
+        vqvae_model_dir = os.path.dirname(self.config['vqvae']['model_save_path']) if 'vqvae' in self.config else None
+        diffusion_model_dir = os.path.dirname(self.config['diffusion']['model_output_path']) if 'diffusion' in self.config else None
+        generation_out_dir = os.path.dirname(self.config['generation']['output_path']) if 'generation' in self.config else None
+        vqvae_cache_dir = self.config.get('vqvae', {}).get('data', {}).get('h5_cache_dir')
+        vqvae_latents_dir = self.config.get('vqvae', {}).get('encoding', {}).get('latents_output_dir')
+
         for dir_path in [
             self.config['global']['model_root'],
-            os.path.dirname(self.config['joint_embed']['model_save_path']),
-            os.path.dirname(self.config['diffusion']['model_output_path']),
-            os.path.dirname(self.config['generation']['output_path'])
+            vqvae_model_dir,
+            diffusion_model_dir,
+            generation_out_dir,
+            vqvae_cache_dir,
+            vqvae_latents_dir,
         ]:
-            ensure_dir_exists(dir_path)
+            if dir_path:
+                ensure_dir_exists(dir_path)
         
         # Run steps
         try:
