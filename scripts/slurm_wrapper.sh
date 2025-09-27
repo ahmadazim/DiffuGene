@@ -3,9 +3,9 @@
 #SBATCH --gres=gpu:1
 #SBATCH --mem=300G
 #SBATCH -t 3-00:00:00
-#SBATCH -c 2
-#SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_condDiff_%j.out
-#SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_condDiff_%j.err
+#SBATCH -c 8
+#SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_VQVAE_%j.out
+#SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_VQVAE_%j.err
 
 conda init
 eval "$(conda shell.bash hook)"
@@ -26,7 +26,4 @@ yaml_file=$1
 difdir=/n/home03/ahmadazim/WORKING/genGen/DiffuGene
 ${difdir}/scripts/run_pipeline.sh --config ${yaml_file} 
 
-# sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh /n/home03/ahmadazim/WORKING/genGen/UKB/pipeline_ukb_allchr_unrel_britishWhite.yaml
-# sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh /n/home03/ahmadazim/WORKING/genGen/UKB/pipeline_ukb_allchr_unrel_britishWhite_condDiff.yaml
-# sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh ~/SCRIPTS/DiffuGene/UKBconditionalLDM_6PC.yaml
-# sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh ~/SCRIPTS/DiffuGene/UKBconditionalLDM_6PC_500K.yaml
+# sbatch /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_wrapper.sh /n/home03/ahmadazim/WORKING/genGen/DiffuGene/src/DiffuGene/config/pipeline.yaml

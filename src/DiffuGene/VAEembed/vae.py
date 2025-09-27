@@ -1,234 +1,55 @@
 """
-vqvae_genomics.py
-==================
+This module defines the SNPVQVAE model which implements a variant of
+vector-quantised variational autoencoder (VQ-VAE) tailored for per-SNP
+genotype sequences. The model strictly follows a deterministic
+downsampling/up-sampling strategy outlined by the user:
 
-An implementation of a Vector-Quantized Variational Autoencoder (VQ‑VAE)
-tailored for genomic data. Unlike typical image VQ-VAEs, this model
-treats the input 1D sequence as a 2D grid using a Morton (Z-order)
-curve, embeds it via a small 2D convolutional encoder, and learns a
-discrete latent representation with a codebook. It mirrors the
-encoder with a 2D transposed convolution decoder to reconstruct the
-original sequence logits. The design supports residual vector
-quantization (RVQ) levels, EMA codebook updates, and optional
-auxiliary losses to encourage realistic allele frequency (MAF) and
-local linkage disequilibrium (LD) patterns.
+1. Determine a pair of integers c and k such that c * 2**k is
+   closest to the input length L. A helper function find_best_ck is
+   declared but not implemented here; it should return (c, k) for a
+   given L.
+2. If c * 2**k < L, the input is compressed via linear interpolation
+   down to c * 2**k. If c * 2**k > L, the input is right-padded
+   with zeros (a mask is carried forward for padded positions) up to
+   c * 2**k.
+3. A 1D convolution with kernel size c and stride c then maps
+   length c * 2**k down to length 2**k. The output channel
+   dimension is fixed at eight.
+4. If k is odd, an additional stride-2 convolution halves the length
+   to 2**(k-1). This layer preserves the eight channels.
+5. The resulting 1D representation is reordered using a Morton (Z-order)
+   curve into a square S x S grid (S = 2**floor(k/2)) with
+   eight channels.
+6. A stack of stride-2 2D convolutions further downscales the spatial
+   dimensions to latent_grid_dim x latent_grid_dim while projecting
+   into latent_dim feature channels. A residual vector quantiser
+   compresses the latent representation. The decoder mirrors the
+   encoder: 2D transposed convolutions restore the spatial resolution,
+   the Morton ordering is undone, and transposed 1D convolutions (plus
+   interpolation or cropping) recover the original sequence length.
 
-Key components:
+Only the configuration parameters input_length, latent_dim and
+latent_grid_dim are used from the provided cfg. All other
+convolutional parameters in earlier versions are deliberately ignored.
 
-- **Morton 2D order mapping** to reorder the 1D sequence into a 2D grid
-  preserving locality.
-- **2D convolutional encoder** that downsamples the padded grid from
-  size S×S to 16×16, producing `latent_dim` channels.
-- **EMA codebook** for discrete latent vectors with residual VQ levels.
-- **2D transpose convolutional decoder** that mirrors the encoder to
-  reconstruct a categorical distribution over {0,1,2} for each site.
-- **Masked loss** that ignores padded positions when computing the
-  reconstruction loss.
-
-This file defines the model and training helpers. To build a model
-instance, call ``build_vqvae`` with the desired configuration.
+The code is organised into small helper modules for clarity. See the
+`SNPVQVAE` docstring for further details.
 """
 
 from __future__ import annotations
 
 import math
-import logging
+from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------
-# Morton (Z-order) mapping: 2D <-> 1D for dim=d (N = d^2 tokens)
-# ---------------------------------------------------------------------
-
-def morton2_index_to_xy(idx: int, dim: int) -> Tuple[int, int]:
-    """
-    Generalized Morton (Z-order) decoding for arbitrary dim≥1.
-    We enumerate classic Morton order over an enclosing M×M grid
-    with M = 2^ceil(log2(dim)), and skip any (x,y) with x>=dim or y>=dim.
-    The idx here is the rank within the filtered sequence: 0 <= idx < dim*dim.
-    Intended mainly for validation / single-lookups; use compute_morton2_order(dim)
-    to construct the full permutation efficiently.
-    """
-    if dim <= 0:
-        raise ValueError("dim must be positive")
-
-    def _decode_pow2(morton: int, bits: int) -> Tuple[int, int]:
-        x = y = 0
-        for i in range(bits):
-            b = (morton >> (2 * i)) & 0x3
-            x |= ((b >> 0) & 1) << i
-            y |= ((b >> 1) & 1) << i
-        return x, y
-
-    bits = max(1, math.ceil(math.log2(dim)))
-    M = 1 << bits
-    target_rank = idx
-    rank = 0
-    for morton in range(M * M):
-        x, y = _decode_pow2(morton, bits)
-        if x < dim and y < dim:
-            if rank == target_rank:
-                return x, y
-            rank += 1
-    raise IndexError(f"generalized Morton idx {idx} out of range for dim={dim}")
-
-
-def compute_morton2_order(dim: int) -> torch.LongTensor:
-    """
-    Build the generalized Morton permutation 'order' of length dim*dim.
-    We enumerate classic Morton over M×M (M = 2^ceil(log2(dim))) and
-    keep only coords with x<dim and y<dim. 'order' maps row-major
-    pos=x*dim+y --> generalized Morton rank in [0, dim*dim).
-    """
-    if dim <= 0:
-        raise ValueError("dim must be positive")
-
-    def _decode_pow2(morton: int, bits: int) -> Tuple[int, int]:
-        x = y = 0
-        for i in range(bits):
-            b = (morton >> (2 * i)) & 0x3
-            x |= ((b >> 0) & 1) << i
-            y |= ((b >> 1) & 1) << i
-        return x, y
-
-    bits = max(1, math.ceil(math.log2(dim)))
-    M = 1 << bits
-
-    coords: List[Tuple[int, int]] = []
-    for morton in range(M * M):
-        x, y = _decode_pow2(morton, bits)
-        if x < dim and y < dim:
-            coords.append((x, y))
-            if len(coords) == dim * dim:
-                break
-
-    if len(coords) != dim * dim:
-        raise RuntimeError("Failed to generate full generalized Morton ordering.")
-
-    n = dim * dim
-    order = torch.empty(n, dtype=torch.long)
-    for rank, (x, y) in enumerate(coords):
-        pos = x * dim + y
-        order[pos] = rank
-    return order
-
-
-def compute_square_size_and_k(L: int, min_hw: int = 16) -> Tuple[int, int]:
-    """
-    Given a 1D input length ``L``, compute the minimal square side
-    length ``S`` and the number of downsampling steps ``k`` such that
-    padding the input to length ``S*S`` allows it to be reshaped to a
-    square grid of side ``S``, and after ``k`` successive stride-2
-    downsampling operations, the spatial dimensions reach
-    ``(min_hw, min_hw)``.
-
-    The function ensures that ``S`` is of the form ``min_hw * 2^k``
-    (hence always a power of two multiple of ``min_hw``) and
-    ``S*S >= L``.
-
-    Args:
-        L: Original 1D sequence length.
-        min_hw: The target spatial height/width after downsampling.
-                 Defaults to 16.
-
-    Returns:
-        A tuple ``(S, k)`` where ``S`` is the side length of the padded
-        square grid and ``k`` is the number of downsampling steps.
-    """
-    if L <= 0:
-        raise ValueError("Input length must be positive")
-    # Pick S as the next even number >= ceil(sqrt(L)) and >= min_hw.
-    root = math.ceil(math.sqrt(L))
-    if root % 2 != 0:
-        root += 1
-    S = max(min_hw, root)
-    # Compute k such that S = min_hw * 2^k (for down/up sampling depth)
-    # If S is not an exact power-of-two multiple of min_hw, choose the smallest k with min_hw*2^k >= S
-    k = 0
-    cur = min_hw
-    while cur < S:
-        cur *= 2
-        k += 1
-    return S, k
-
-
-# ---------------------------------------------------------------------
-# Utilities: local LD penalty
-# ---------------------------------------------------------------------
-
-def local_ld_penalty(x_data: torch.Tensor, x_hat: torch.Tensor, window: int = 128) -> torch.Tensor:
-    """
-    Compute a penalty based on the difference between the local LD
-    correlation matrices of the true data and the reconstruction.
-
-    Args:
-        x_data: Tensor of shape `(B, L)` representing the true genotypes
-                (0/1/2 encoded).
-        x_hat: Tensor of shape `(B, L)` representing the reconstructed
-                expected dosage (float).
-        window: Size of the window used to compute local correlation
-                matrices. Defaults to 128.
-
-    Returns:
-        A scalar tensor representing the Frobenius norm of the
-        difference between correlation matrices averaged over windows.
-    """
-    B, L = x_data.shape
-    total = 0.0
-    num = 0
-    for s in range(0, L - window + 1, window):
-        e = s + window
-        xd = x_data[:, s:e]
-        xr = x_hat[:, s:e]
-        xd = xd - xd.mean(dim=0, keepdim=True)
-        xr = xr - xr.mean(dim=0, keepdim=True)
-        cov_d = (xd.T @ xd) / (B - 1 + 1e-6)
-        cov_r = (xr.T @ xr) / (B - 1 + 1e-6)
-        std_d = torch.sqrt(torch.diag(cov_d) + 1e-6)
-        std_r = torch.sqrt(torch.diag(cov_r) + 1e-6)
-        corr_d = cov_d / (std_d[:, None] * std_d[None, :] + 1e-6)
-        corr_r = cov_r / (std_r[:, None] * std_r[None, :] + 1e-6)
-        total = total + torch.norm(corr_r - corr_d, p='fro')
-        num += 1
-    return total / max(num, 1)
-
-
-# ---------------------------------------------------------------------
-# Residual block (2D) and EMA codebook / Residual VQ
-# ---------------------------------------------------------------------
-
-class ResBlock2D(nn.Module):
-    """
-    A simple 2D residual block consisting of two convolutional layers
-    separated by GroupNorm and SiLU activation. The block adds its
-    input to the output and applies a final activation.
-    """
-    def __init__(self, ch: int, k: int = 3, groups: int = 32):
-        super().__init__()
-        pad = k // 2
-        self.net = nn.Sequential(
-            nn.Conv2d(ch, ch, kernel_size=k, padding=pad, bias=False),
-            nn.GroupNorm(num_groups=min(groups, ch), num_channels=ch),
-            nn.SiLU(),
-            nn.Conv2d(ch, ch, kernel_size=k, padding=pad, bias=False),
-            nn.GroupNorm(num_groups=min(groups, ch), num_channels=ch),
-        )
-        self.act = nn.SiLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(x + self.net(x))
-
-
 class EMACodebook(nn.Module):
     """
     Exponential moving average (EMA) codebook for vector quantization.
-
     Attributes:
         code_dim: Dimensionality of code vectors (d).
         num_codes: Number of distinct code vectors (K).
@@ -251,15 +72,13 @@ class EMACodebook(nn.Module):
 
     def forward(self, z_e: torch.Tensor, beta_commit: float = 0.25) -> Tuple[torch.Tensor, torch.Tensor, torch.LongTensor, Dict[str, torch.Tensor]]:
         """
-        Quantize the continuous latents ``z_e`` by nearest-neighbor lookup
+        Quantize the continuous latents z_e by nearest-neighbor lookup
         in the codebook, apply a straight-through estimator for backprop,
         and perform EMA updates to the codebook entries.
-
         Args:
             z_e: Tensor of shape `(B, d, T)` representing continuous
                  latent codes.
             beta_commit: Weight of the commitment loss term.
-
         Returns:
             z_q_st: Straight-through quantized tensor of shape `(B, d, T)`.
             commit_loss: Scalar commitment loss.
@@ -292,15 +111,20 @@ class EMACodebook(nn.Module):
             indices = torch.cat(idx_chunks, dim=0)  # [BT]
         z_q = self.embedding[indices]  # [BT, d]
         z_q = z_q.view(B, T, d).permute(0, 2, 1).contiguous()  # [B, d, T]
+        # Match activation dtype (autocast-safe)
+        if z_q.dtype != z_e.dtype:
+            z_q = z_q.to(dtype=z_e.dtype)
         # Straight-through estimator
         z_q_st = z_e + (z_q - z_e).detach()
         # Commitment loss
-        commit_loss = beta_commit * F.mse_loss(z_e.detach(), z_q, reduction='mean')
+        commit_loss = beta_commit * F.mse_loss(z_e, z_q.detach(), reduction='mean')
         # EMA updates (only in training mode)
         if self.training:
-            counts = torch.bincount(indices, minlength=self.num_codes).to(flat.dtype)  # [K]
-            embed_sum = torch.zeros_like(self.ema_embed)  # [K, d]
-            embed_sum.index_add_(0, indices, flat)  # sum of z_e per code
+            # Cast to EMA buffer dtypes to avoid dtype mismatch under autocast
+            counts = torch.bincount(indices, minlength=self.num_codes).to(self.ema_cluster_size.dtype)  # [K]
+            embed_sum = torch.zeros_like(self.ema_embed)  # [K, d] (float32 by default)
+            flat_ema = flat.detach().to(embed_sum.dtype)
+            embed_sum.index_add_(0, indices, flat_ema)  # sum of z_e per code
             self.ema_cluster_size.mul_(self.decay).add_(counts * (1.0 - self.decay))
             self.ema_embed.mul_(self.decay).add_(embed_sum * (1.0 - self.decay))
             # Laplace smoothing to avoid dead codes
@@ -368,380 +192,667 @@ class ResidualVQ(nn.Module):
         z_q_total_st = z_e + (z_q_sum - z_e).detach()
         return z_q_total_st, commit_total, indices_list, stats_list
 
+def find_best_ck(x: int, max_c: int = 5, *, min_k: Optional[int] = None, force_even_k: bool = True) -> Tuple[int, int]:
+    """Pick (c,k) with c∈[1..max_c] and integer k so c*2^k approximates x.
+    Optionally enforce k >= min_k and even parity to avoid a second halving conv.
+    """
+    best_c, best_k = 1, 0
+    best_err = abs(1.0 - x)
+    for c in range(1, max_c + 1):
+        k = 0
+        while True:
+            val = c * (1 << k)
+            if abs(val - x) < best_err:
+                best_err = abs(val - x)
+                best_c, best_k = c, k
+            if val > 10 * x:
+                break
+            k += 1
+    # Apply lower bound on k
+    if min_k is not None and best_k < int(min_k):
+        best_k = int(min_k)
+        # refine c to keep c*2^k roughly near x
+        c_est = int(round(float(x) / float(1 << best_k)))
+        best_c = min(max(1, c_est), max_c)
+    # Enforce even k if requested (to avoid extra halving conv)
+    if force_even_k and (best_k % 2) == 1:
+        best_k += 1
+    return best_c, best_k
 
-# ---------------------------------------------------------------------
-# VQ‑VAE 2D Model
-# ---------------------------------------------------------------------
+def compute_morton2_order(dim: int) -> torch.LongTensor:
+    if dim <= 0:
+        raise ValueError("dim must be positive")
 
-@dataclass
-class VQVAEConfig:
-    input_length: int
-    latent_dim: int = 64  # d = latent channels
-    codebook_size: int = 1024  # K = number of codes
-    num_quantizers: int = 2  # RVQ levels
-    ema_decay: float = 0.9
-    ema_eps: float = 1e-5
-    hidden_channels: int = 64  # C0: initial conv channels
-    width_mult_per_stage: float = 1.0
-    beta_commit: float = 0.25
-    ld_lambda: float = 1e-3
-    maf_lambda: float = 0.0
-    ld_window: int = 128
-    # Spatial grid dimension for latent tokens (must be a power of two).
-    # The final latent representation will have shape (latent_grid_dim x latent_grid_dim).
-    latent_grid_dim: int = 16
-    # Optional explicit encoder/decoder specifications
-    init_down_kernel: int = 0
-    init_down_stride: int = 0
-    init_down_padding: int = 0
-    init_down_out_channels: int = 0
-    keep_layers_at_T: int = 0
-    dec_up_kernel: int = 0
-    dec_up_stride: int = 0
-    dec_up_padding: int = 0
-    dec_up_output_padding: int = 0
-    dec_up_out_channels: int = 0
+    def _decode_pow2(morton: int, bits: int) -> Tuple[int, int]:
+        x = y = 0
+        for i in range(bits):
+            b = (morton >> (2 * i)) & 0x3
+            x |= ((b >> 0) & 1) << i
+            y |= ((b >> 1) & 1) << i
+        return x, y
+
+    bits = max(1, math.ceil(math.log2(dim)))
+    M = 1 << bits
+
+    coords: List[Tuple[int, int]] = []
+    for morton in range(M * M):
+        x, y = _decode_pow2(morton, bits)
+        if x < dim and y < dim:
+            coords.append((x, y))
+            if len(coords) == dim * dim:
+                break
+
+    if len(coords) != dim * dim:
+        raise RuntimeError("Failed to generate full generalized Morton ordering.")
+
+    n = dim * dim
+    order = torch.empty(n, dtype=torch.long)
+    for rank, (x, y) in enumerate(coords):
+        pos = x * dim + y
+        order[pos] = rank
+    return order
+
+def local_ld_penalty(x_data: torch.Tensor, x_hat: torch.Tensor, window: int = 128) -> torch.Tensor:
+    """Frobenius norm difference of within-window correlation matrices."""
+    B, L = x_data.shape
+    total = 0.0
+    num = 0
+    for s in range(0, L - window + 1, window):
+        e = s + window
+        xd = x_data[:, s:e]
+        xr = x_hat[:, s:e]
+        xd = xd - xd.mean(dim=0, keepdim=True)
+        xr = xr - xr.mean(dim=0, keepdim=True)
+        cov_d = (xd.T @ xd) / (B - 1 + 1e-6)
+        cov_r = (xr.T @ xr) / (B - 1 + 1e-6)
+        std_d = torch.sqrt(torch.diag(cov_d) + 1e-6)
+        std_r = torch.sqrt(torch.diag(cov_r) + 1e-6)
+        corr_d = cov_d / (std_d[:, None] * std_d[None, :] + 1e-6)
+        corr_r = cov_r / (std_r[:, None] * std_r[None, :] + 1e-6)
+        total = total + torch.norm(corr_r - corr_d, p='fro')
+        num += 1
+    return total / max(num, 1)
+
+class ResBlock2D(nn.Module):
+    """A simple residual block for 2D feature maps."""
+
+    def __init__(self, ch: int, k: int = 3) -> None:
+        super().__init__()
+        p = k // 2
+        self.block = nn.Sequential(
+            nn.Conv2d(ch, ch, kernel_size=k, padding=p, bias=False),
+            nn.GroupNorm(num_groups=min(32, ch), num_channels=ch),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(ch, ch, kernel_size=k, padding=p, bias=False),
+            nn.GroupNorm(num_groups=min(32, ch), num_channels=ch),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.silu(self.block(x) + x)
+
+
+class ResBlock1D(nn.Module):
+    """A simple residual block for 1D feature maps."""
+
+    def __init__(self, ch: int, k: int = 3) -> None:
+        super().__init__()
+        p = k // 2
+        self.block = nn.Sequential(
+            nn.Conv1d(ch, ch, kernel_size=k, padding=p, bias=False),
+            nn.GroupNorm(num_groups=min(32, ch), num_channels=ch),
+            nn.GELU(),
+            nn.Conv1d(ch, ch, kernel_size=k, padding=p, bias=False),
+            nn.GroupNorm(num_groups=min(32, ch), num_channels=ch),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.gelu(self.block(x) + x)
+
+
+class Down2D(nn.Module):
+    """Stack of stride-2 2D convolutions with residual blocks."""
+
+    def __init__(self, ch_in: int, ch_latent: int, steps: int) -> None:
+        super().__init__()
+        layers: List[nn.Module] = []
+        ch = ch_in
+        # First project channels to latent_dim if necessary
+        if ch != ch_latent:
+            layers += [
+                nn.Conv2d(ch, ch_latent, kernel_size=1, bias=False),
+                nn.GroupNorm(num_groups=min(32, ch_latent), num_channels=ch_latent),
+                nn.SiLU(inplace=True),
+            ]
+            ch = ch_latent
+        for _ in range(steps):
+            layers += [
+                nn.Conv2d(ch, ch, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.GroupNorm(num_groups=min(32, ch), num_channels=ch),
+                nn.SiLU(inplace=True),
+                ResBlock2D(ch, k=3),
+            ]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class Up2D(nn.Module):
+    """Stack of stride-2 transpose 2D convolutions with residual blocks."""
+
+    def __init__(self, ch_latent: int, ch_out: int, steps: int) -> None:
+        super().__init__()
+        layers: List[nn.Module] = []
+        ch = ch_latent
+        for _ in range(steps):
+            layers += [
+                nn.ConvTranspose2d(ch, ch, kernel_size=4, stride=2, padding=1, bias=False),
+                nn.GroupNorm(num_groups=min(32, ch), num_channels=ch),
+                nn.SiLU(inplace=True),
+                ResBlock2D(ch, k=3),
+            ]
+        # Project channels back to desired output channels if needed
+        if ch != ch_out:
+            layers += [
+                nn.Conv2d(ch, ch_out, kernel_size=1, bias=False),
+                nn.GroupNorm(num_groups=min(32, ch_out), num_channels=ch_out),
+                nn.SiLU(inplace=True),
+            ]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 class SNPVQVAE(nn.Module):
+    """Vector-quantised variational autoencoder for SNP genotype sequences.
+    1. Determine c and k so that c * 2**k is the closest power-of-two multiple to
+       the input length L. The helper find_best_ck(L) should return
+       these values. c must be an integer >=1 and k a non-negative
+       integer.
+    2. If c * 2**k < L, compress the sequence to length c * 2**k via
+       linear interpolation; otherwise pad with zeros up to that length and
+       carry a mask for the padded positions.
+    3. Apply a 1D convolution with kernel size and stride equal to c,
+       mapping length c * 2**k down to 2**k. The output channel
+       dimension is fixed at eight.
+    4. If k is odd, perform a second 1D convolution with kernel
+       size 2 and stride 2 to halve the length. The resulting
+       length will be 2**floor(k/2).
+    5. Reorder the 1D sequence into a square grid via Morton ordering.
+    6. Downsample the grid to latent_grid_dim x latent_grid_dim using a
+       stack of stride-2 2D convolutions while projecting into
+       latent_dim channels. Quantise and decode by mirroring
+       these steps, ultimately producing logits over {0,1,2} for each
+       original input position.
+    Only cfg.input_length, cfg.latent_dim and cfg.latent_grid_dim
+    are consumed; all other configuration fields are ignored.
     """
-    VQ‑VAE model for per-SNP genotype sequences using a 2D convolutional
-    backbone. The model pads the 1D input to a square of size ``S x S``
-    (where ``S`` is the minimal power-of-two multiple of 16 such that
-    ``S^2 >= input_length``) and reorders it using a Morton (Z-order)
-    curve. It then embeds the one-hot encoded input, applies a series
-    of stride-2 convolutional blocks to reduce the spatial dimensions
-    to 16×16, quantizes the features using a residual VQ, and mirrors
-    the process to reconstruct the logits over {0,1,2} for each input
-    position.
-    """
-    def __init__(self, cfg: VQVAEConfig):
+
+    def __init__(self, cfg: VQVAEConfig) -> None:
         super().__init__()
+        # Retain entire configuration for access in forward/loss
         self.cfg = cfg
-        # Validate that latent_grid_dim is a power of two
-        if cfg.latent_grid_dim <= 0 or (cfg.latent_grid_dim & (cfg.latent_grid_dim - 1)) != 0:
+        # Extract and validate core configuration parameters
+        self.L: int = int(cfg.input_length)
+        self.latent_dim: int = int(cfg.latent_dim)
+        self.latent_grid_dim: int = int(cfg.latent_grid_dim)
+        self.hidden_1d: int = int(cfg.hidden_1d_channels)
+        self.hidden_2d: int = int(cfg.hidden_2d_channels)
+        self.layers_at_final: int = int(cfg.layers_at_final)
+
+        if self.latent_grid_dim <= 0 or (self.latent_grid_dim & (self.latent_grid_dim - 1)) != 0:
             raise ValueError("latent_grid_dim must be a positive power of two")
-        # Compute the square side length S and number of downsampling steps k
-        # S will be the smallest square grid such that S >= latent_grid_dim and S^2 >= input_length
-        # with S = latent_grid_dim * 2^k
-        S, k = compute_square_size_and_k(cfg.input_length, min_hw=cfg.latent_grid_dim)
-        self.S = S
-        self.k = k
-        self.L_pad = S * S
-        # Precompute Morton order for dimension S
-        order2 = compute_morton2_order(S)
-        inv_order2 = torch.empty_like(order2)
-        inv_order2[order2] = torch.arange(order2.numel(), dtype=torch.long)
-        self.register_buffer("order_2d", order2)
-        self.register_buffer("inv_order_2d", inv_order2)
-        # Initial embedding conv: one-hot 3 channels to C0 channels
-        # self.embed = nn.Conv2d(3, cfg.hidden_channels, kernel_size=1, bias=True)
-        self.token_embed = nn.Embedding(3, cfg.hidden_channels)
-        # Downsampling conv stages (automatic) + adaptive pooling to target latent grid
-        T = cfg.latent_grid_dim
-        H, W = self.S, self.S
-        self.enc_in_H, self.enc_in_W = H, W
-        enc_layers: List[nn.Module] = []
-        ch = cfg.hidden_channels
-        if cfg.init_down_kernel > 0 and cfg.init_down_stride > 0 and cfg.init_down_out_channels > 0:
-            out_h = (H + 2 * cfg.init_down_padding - cfg.init_down_kernel) // cfg.init_down_stride + 1
-            out_w = (W + 2 * cfg.init_down_padding - cfg.init_down_kernel) // cfg.init_down_stride + 1
-            if out_h != T or out_w != T:
-                raise ValueError(
-                    f"init_down params map ({H},{W})->({out_h},{out_w}), expected ({T},{T})."
-                )
-            enc_layers += [
-                nn.Conv2d(ch, cfg.init_down_out_channels, kernel_size=cfg.init_down_kernel,
-                          stride=cfg.init_down_stride, padding=cfg.init_down_padding, bias=False),
-                nn.GroupNorm(num_groups=min(32, cfg.init_down_out_channels), num_channels=cfg.init_down_out_channels),
-                nn.SiLU(),
-                ResBlock2D(cfg.init_down_out_channels, k=3),
-            ]
-            ch = cfg.init_down_out_channels
-            for _ in range(max(0, cfg.keep_layers_at_T)):
-                enc_layers += [
-                    nn.Conv2d(ch, ch, kernel_size=3, padding=1, bias=False),
-                    nn.GroupNorm(num_groups=min(32, ch), num_channels=ch),
-                    nn.SiLU(),
-                    ResBlock2D(ch, k=3),
-                ]
-            enc_layers += [
-                nn.Conv2d(ch, cfg.latent_dim, kernel_size=1, bias=False),
-                nn.GroupNorm(num_groups=max(1, min(32, cfg.latent_dim)), num_channels=cfg.latent_dim),
-                nn.SiLU(),
-                ResBlock2D(cfg.latent_dim, k=3),
-            ]
-            self.encoder = nn.Sequential(*enc_layers)
-        else:
+        if self.latent_dim <= 0:
+            raise ValueError("latent_dim must be positive")
+
+        # Determine (c, k) such that c * 2^k approximates L, with k bounded
+        # so that S = 2^{floor(k/2)} >= cfg.latent_grid_dim. Also prefer even k.
+        try:
+            lgd_req = int(max(1, int(cfg.latent_grid_dim)))
+            min_k_req = int(math.ceil(2 * math.log2(lgd_req)))
+            if (min_k_req % 2) == 1:
+                min_k_req += 1
+            # Guard against odd-optimal k halving: add +2 buffer
+            min_k_req += 2
+        except Exception:
+            min_k_req = None
+        c, k = find_best_ck(self.L, min_k=min_k_req, force_even_k=True)
+        self.c: int = c
+        self.k: int = k
+
+        # Compute the target intermediate length (c * 2^k)
+        target_len: int = c * (2 ** k)
+        self.target_len: int = target_len
+        # Flags for compress or pad
+        self.compress_1d: bool = (target_len < self.L)
+        self.pad_1d: bool = (target_len > self.L)
+
+        # Compute the length after convolution(s)
+        # After conv with stride=c: length = target_len // c == 2**k
+        length_after_conv: int = 2 ** k
+        # If k is odd, second conv halves length again
+        if k % 2 == 1:
+            length_after_conv = length_after_conv // 2
+        self.length_after_conv: int = length_after_conv
+
+        # Determine square dimension S for Morton ordering
+        # length_after_conv should be a power of two; S = 2**floor(k/2)
+        if length_after_conv <= 0 or (length_after_conv & (length_after_conv - 1)) != 0:
+            raise ValueError("Length after convolution must be a positive power of two")
+        # side length for square
+        S = 1 << (int(math.log2(length_after_conv)) // 2)
+        if S * S != length_after_conv:
             raise ValueError(
-                "No pooling path allowed. Provide explicit init_down_* and keep_layers_at_T to map S→T exactly."
+                f"Computed square side {S} does not satisfy S*S = {length_after_conv}; check c, k logic"
             )
-        # VQ quantizer
-        self.quantizer = ResidualVQ(
-            code_dim=cfg.latent_dim,
-            num_codes=cfg.codebook_size,
-            num_quantizers=cfg.num_quantizers,
-            decay=cfg.ema_decay,
-            eps=cfg.ema_eps,
-        )
-        # Decoder upsample layers (automatic); final interpolate to exact encoder input grid
-        self.dec_hidden = cfg.hidden_channels
-        dec_layers: List[nn.Module] = []
-        ch_dec = cfg.latent_dim
-        if cfg.dec_up_kernel > 0 and cfg.dec_up_stride > 0 and cfg.dec_up_out_channels > 0:
-            # Project to decoder channels at T×T, then keep capacity via keep_layers_at_T blocks
-            dec_layers += [
-                nn.Conv2d(ch_dec, cfg.dec_up_out_channels, kernel_size=3, padding=1, bias=False),
-                nn.GroupNorm(num_groups=max(1, min(32, cfg.dec_up_out_channels)), num_channels=cfg.dec_up_out_channels),
-                nn.SiLU(inplace=True),
-                ResBlock2D(cfg.dec_up_out_channels, k=3),
-            ]
-            for _ in range(max(0, cfg.keep_layers_at_T)):
-                dec_layers += [
-                    nn.Conv2d(cfg.dec_up_out_channels, cfg.dec_up_out_channels, kernel_size=3, padding=1, bias=False),
-                    nn.GroupNorm(num_groups=max(1, min(32, cfg.dec_up_out_channels)), num_channels=cfg.dec_up_out_channels),
-                    nn.SiLU(inplace=True),
-                    ResBlock2D(cfg.dec_up_out_channels, k=3),
-                ]
-            dec_layers += [
-                nn.ConvTranspose2d(cfg.dec_up_out_channels, cfg.dec_up_out_channels,
-                                   kernel_size=cfg.dec_up_kernel, stride=cfg.dec_up_stride,
-                                   padding=cfg.dec_up_padding,
-                                   output_padding=cfg.dec_up_output_padding,
-                                   bias=False),
-                nn.GroupNorm(num_groups=max(1, min(32, cfg.dec_up_out_channels)), num_channels=cfg.dec_up_out_channels),
-                nn.SiLU(inplace=True),
-            ]
-            ch_dec = cfg.dec_up_out_channels
-            self.decoder_up = nn.Sequential(*dec_layers)
+        self.S: int = S
+
+        # Validate that S >= latent_grid_dim and S % latent_grid_dim == 0
+        if self.S < self.latent_grid_dim:
+            raise ValueError(
+                f"Square side S={self.S} must be >= latent_grid_dim={self.latent_grid_dim}"
+            )
+        if (self.S % self.latent_grid_dim) != 0:
+            raise ValueError(
+                f"S ({self.S}) must be divisible by latent_grid_dim ({self.latent_grid_dim})"
+            )
+        # Number of 2D downsampling steps
+        self.k2d: int = int(math.log2(self.S // self.latent_grid_dim))
+
+        # Precompute Morton order and its inverse for S
+        order = compute_morton2_order(self.S)  # [S*S]
+        if not isinstance(order, torch.Tensor) or order.numel() != self.S * self.S:
+            raise ValueError("compute_morton2_order returned invalid order tensor")
+        order = order.long()
+        inv_order = torch.empty_like(order)
+        inv_order[order] = torch.arange(order.numel(), dtype=torch.long)
+        self.register_buffer("order_2d", order, persistent=False)
+        self.register_buffer("inv_order_2d", inv_order, persistent=False)
+
+        # Token embedding: map 3 genotype classes to hidden_1d embedding channels
+        self.token_embed = nn.Embedding(3, self.hidden_1d)
+
+        # Convolution to reduce length from target_len to 2**k
+        # Kernel size and stride both equal to c; channels stay at hidden_1d
+        self.conv1d_reduce = nn.Conv1d(self.hidden_1d, self.hidden_1d, kernel_size=c, stride=c, bias=False)
+        self.resblock1d = ResBlock1D(self.hidden_1d, k=3)
+        # Optional second conv when k is odd
+        if k % 2 == 1:
+            self.conv1d_extra = nn.Conv1d(self.hidden_1d, self.hidden_1d, kernel_size=2, stride=2, bias=False)
+            self.has_extra_conv = True
         else:
-            H_dec, W_dec = T, T
-            while (H_dec * 2) <= self.enc_in_H and (W_dec * 2) <= self.enc_in_W:
-                ch_next = max(1, int(round(ch_dec / cfg.width_mult_per_stage)))
-                dec_layers += [
-                    nn.ConvTranspose2d(ch_dec, ch_next, kernel_size=5, stride=2, padding=2, output_padding=1, bias=False),
-                    nn.GroupNorm(num_groups=max(1, min(32, ch_next)), num_channels=ch_next),
-                    nn.SiLU(inplace=True),
-                    ResBlock2D(ch_next, k=3),
-                ]
-                ch_dec = ch_next
-                H_dec *= 2
-                W_dec *= 2
-            self.decoder_up = nn.Sequential(*dec_layers)
-        # Final head: map hidden channels to 3 logits (for classes 0, 1, 2)
+            self.conv1d_extra = None
+            self.has_extra_conv = False
+
+        # Transposed 1D convolution layers mirror the forward convs
+        self.deconv1d_expand = nn.ConvTranspose1d(self.hidden_1d, self.hidden_1d, kernel_size=c, stride=c, bias=False)
+        if k % 2 == 1:
+            self.deconv1d_extra = nn.ConvTranspose1d(self.hidden_1d, self.hidden_1d, kernel_size=2, stride=2, bias=False)
+        else:
+            self.deconv1d_extra = None
+
+        # Project 2D features into hidden_2d channels before downsampling
+        self.proj2d = nn.Conv2d(self.hidden_1d, self.hidden_2d, kernel_size=1, bias=False)
+        # Downsample in 2D to latent_grid_dim x latent_grid_dim with hidden_2d channels
+        self.down2d = Down2D(ch_in=self.hidden_2d, ch_latent=self.hidden_2d, steps=self.k2d)
+        # Optional extra convolutional layers at final latent grid resolution (encoder side)
+        if self.layers_at_final > 0:
+            self.final2d_encoder = nn.Sequential(*[ResBlock2D(self.hidden_2d, k=3) for _ in range(self.layers_at_final)])
+        else:
+            self.final2d_encoder = nn.Identity()
+        # Project to latent_dim channels right before quantizer
+        self.pre_quant_proj = nn.Conv2d(self.hidden_2d, self.latent_dim, kernel_size=1, bias=False)
+        # Stabilize scale before quantization
+        self.pre_quant_norm = nn.GroupNorm(num_groups=min(32, self.latent_dim), num_channels=self.latent_dim)
+        # Quantiser (provided externally)
+        self.quantizer = ResidualVQ(
+            code_dim=self.latent_dim,
+            num_codes=int(cfg.codebook_size),
+            num_quantizers=int(cfg.num_quantizers),
+            decay=float(cfg.ema_decay),
+            eps=float(cfg.ema_eps),
+        )
+        # Mirror: after quantizer, project back to hidden_2d channels, optional final layers, then upsample 2D back to S x S, and project to hidden_1d
+        self.post_quant_proj = nn.Conv2d(self.latent_dim, self.hidden_2d, kernel_size=1, bias=False)
+        # Stabilize scale after dequantization
+        self.post_quant_norm = nn.GroupNorm(num_groups=min(32, self.latent_dim), num_channels=self.latent_dim)
+        if self.layers_at_final > 0:
+            self.final2d_decoder = nn.Sequential(*[ResBlock2D(self.hidden_2d, k=3) for _ in range(self.layers_at_final)])
+        else:
+            self.final2d_decoder = nn.Identity()
+        self.up2d = Up2D(ch_latent=self.hidden_2d, ch_out=self.hidden_1d, steps=self.k2d)
+
+        # Final projection to logits
         self.out_head = nn.Sequential(
-            nn.Conv2d(ch_dec, ch_dec, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(num_groups=max(1, min(32, ch_dec)), num_channels=ch_dec),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(ch_dec, 3, kernel_size=1),
+            nn.Conv1d(self.hidden_1d, self.hidden_1d, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(32, self.hidden_1d), num_channels=self.hidden_1d),
+            nn.GELU(),
+            nn.Conv1d(self.hidden_1d, 3, kernel_size=1, bias=True),
         )
 
-        # Log architecture summary
-        logger.info(
-            f"[VQ-VAE] S={self.S}, L_pad={self.L_pad}, latent_grid_dim={T}, enc_in=({self.enc_in_H},{self.enc_in_W})"
-        )
-        logger.info(
-            f"[VQ-VAE] Encoder stages={len(enc_layers)} | Decoder stages={len(dec_layers)} | hidden_ch={self.cfg.hidden_channels}"
-        )
+    # ---------------------------------------------------------------------
+    # Helper methods for encoding
 
-    def pad_and_reorder(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _prepare_1d(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Pad the input sequence to length S^2, reorder it using Morton
-        order, and return the reordered one-hot encoded grid along with a
-        mask indicating valid positions.
-
+        Convert integer genotype sequence x into an embedded 1D tensor of
+        shape [B, 8, target_len]. Performs padding or interpolation to
+        reach the intermediate length target_len. Returns the
+        prepared 1D tensor and an optional mask tensor of shape
+        [B, target_len], where padded positions are marked with 0.
         Args:
-            x: Tensor of shape `(B, L)` with values in {0,1,2}.
-
+            x: Input tensor of shape [B, L] with values in {0,1,2}.
         Returns:
-            x_ohe_reordered: Tensor of shape `(B, 3, S, S)` containing
-                              the one-hot encoded, Morton-reordered
-                              and padded input.
-            mask: Tensor of shape `(B, L_pad)` where mask[i] = 1 for
-                  positions corresponding to the original sequence and 0
-                  for padded positions.
+            x_prepared: [B, 8, target_len]
+            mask: Optional[torch.Tensor] of shape [B, target_len] or None
         """
         B, L = x.shape
-        device = x.device
-        # Pad to S^2 (self.L_pad)
-        pad_len = self.L_pad - L
-        # x_pad: [B, L_pad]
-        if pad_len > 0:
-            x_pad = F.pad(x, (0, pad_len))
-        else:
-            x_pad = x
-        # Build mask: 1 for original data, 0 for padded
-        mask_cpu = torch.zeros(B, self.L_pad, device=torch.device('cpu'), dtype=torch.float32)
-        mask_cpu[:, :L] = 1.0
-        # Reorder using Morton order: order_2d maps row-major positions to Morton indices
-        # x_pad[:, order_2d] places original sequence in row-major order such that
-        # row-major positions correspond to Morton indices.
-        reorder_dev = self.order_2d.to(device)
-        x_reordered = x_pad[:, reorder_dev]  # [B, S*S]
-        # Keep mask on CPU
-        reorder_cpu = self.order_2d.cpu()
-        mask_reordered = mask_cpu[:, reorder_cpu]  # [B, S*S]
-        # One-hot encode: values in {0,1,2}
-        # [B, S*S, 3]
-        # x_onehot = F.one_hot(x_reordered.long(), num_classes=3).float()
-        # # Reshape to [B, S, S, 3] then permute to [B, 3, S, S]
-        # x_ohe_grid = x_onehot.view(B, self.S, self.S, 3).permute(0, 3, 1, 2).contiguous()
-        # return x_ohe_grid, mask_reordered
-        # Embed directly: [B, S*S, C0] -> [B, C0, S, S]
-        e = self.token_embed(x_reordered.long())              # [B, S*S, C0]
-        x_emb_grid = e.view(B, self.S, self.S, -1).permute(0, 3, 1, 2).contiguous()
-        return x_emb_grid, mask_reordered
-
-    def encode_tokens(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Encode the input sequence ``x`` to continuous latent tokens and
-        produce a mask for valid positions.
-
-        Args:
-            x: Tensor of shape `(B, L)` with values in {0,1,2}.
-
-        Returns:
-            z_e_seq: Continuous latent tokens of shape `(B, d, N)` where
-                     `d` is latent_dim and `N`=16*16.
-            mask: Tensor of shape `(B, N)` derived from the original
-                  sequence mask, flattened in row-major order on the
-                  downsampled grid. This is used downstream to weight
-                  the loss.
-        """
-        # Reorder and one-hot encode
-        x_ohe_grid, mask_reordered = self.pad_and_reorder(x)  # [B,3,S,S], [B,S*S]
-        # Embed and downsample
-        # h = self.embed(x_ohe_grid)  # [B, C0, S, S]
-        h = x_ohe_grid
-        h = self.encoder(h)  # [B, d, latent_grid_dim, latent_grid_dim]
-        # Flatten spatial dims (row-major) to tokens
-        # latent_grid_dim x latent_grid_dim = final spatial resolution
-        B, C, H, W = h.shape
-        z_e_seq = h.view(B, C, H * W)  # [B, d, latent_grid_dim^2]
-        # With explicit mapping, encoder output grid must equal T×T; thus mask can pass-through
-        if (H != self.cfg.latent_grid_dim) or (W != self.cfg.latent_grid_dim):
-            raise ValueError(
-                f"Encoder grid {(H,W)} != ({self.cfg.latent_grid_dim},{self.cfg.latent_grid_dim}); no pooling permitted."
+        # Embed to [B, L, 8] then permute to [B,8,L]
+        e = self.token_embed(x.long())
+        h = e.permute(0, 2, 1).contiguous()  # [B, 8, L]
+        mask = None
+        if self.compress_1d:
+            # Compress via linear interpolation to target_len
+            h = F.interpolate(
+                h, size=self.target_len, mode="linear", align_corners=False
             )
-        mask_tokens = mask_reordered
+            # No mask needed; compressed positions are considered valid
+        elif self.pad_1d:
+            # Pad with zeros to target_len
+            pad_len = self.target_len - L
+            if pad_len > 0:
+                h = F.pad(h, (0, pad_len))
+                # Mask marks original data positions as 1 and padded as 0
+                mask = torch.zeros((B, self.target_len), dtype=torch.float32, device=h.device)
+                mask[:, :L] = 1.0
+        else:
+            # Exact match; nothing to do
+            pass
+        return h, mask
+
+    def _downsample_1d(self, h: torch.Tensor, mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Apply the 1D convolutional downsampling steps (stride=c and optional
+        stride=2) and update the mask accordingly. Input h is
+        [B,8,target_len], output is [B,8,length_after_conv]. The
+        returned mask, if provided, is downsampled by taking a max over
+        the corresponding stride windows.
+        """
+        # First conv: stride=c
+        h = self.conv1d_reduce(h)
+        h = self.resblock1d(h)
+        # Downsample mask if present
+        if mask is not None:
+            # Reduce mask by grouping consecutive `c` positions
+            B, L = mask.shape
+            new_len = mask.shape[1] // self.c
+            # Reshape to [B, new_len, c] and take max
+            mask_view = mask.view(B, new_len, self.c)
+            mask = mask_view.max(dim=2).values
+        # Second conv if k is odd
+        if self.has_extra_conv:
+            h = self.conv1d_extra(h)
+            if mask is not None:
+                # Halve the mask length: group pairs and take max
+                B, Lm = mask.shape
+                new_len = Lm // 2
+                mask = mask.view(B, new_len, 2).max(dim=2).values
+        return h, mask
+
+    def _to_square_and_reorder(self, h: torch.Tensor, mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Reorder the 1D representation into a square via Morton ordering.
+        Input h is [B,8,length_after_conv]. Output h2d is
+        [B,8,S,S]. The mask is reordered and reshaped similarly to
+        [B,S,S], or None if no mask was provided.
+        """
+        B, C, L = h.shape
+        if L != self.S * self.S:
+            raise RuntimeError(
+                f"Length after 1D convs ({L}) does not match S*S ({self.S * self.S})"
+            )
+        # Reorder using Morton order along the last dimension
+        order = self.order_2d.to(h.device)
+        h_seq = h  # [B,8,L]
+        h_seq = h_seq[..., order]
+        h2d = h_seq.view(B, C, self.S, self.S)
+        mask2d: Optional[torch.Tensor] = None
+        if mask is not None:
+            m_seq = mask  # [B,L]
+            m_seq = m_seq[..., order]
+            mask2d = m_seq.view(B, self.S, self.S)
+        return h2d, mask2d
+
+    def _downsample_2d(self, h2d: torch.Tensor, mask2d: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Downsample the 2D grid to latent_grid_dim x latent_grid_dim and
+        project to latent_dim channels. Also downsamples the mask by
+        aggregating validity across 2x2 windows.
+        """
+        # Project channels first
+        h = self.proj2d(h2d)
+        # Downsample via stride-2 convs
+        h = self.down2d(h)
+        # Optional extra conv layers at final resolution
+        h = self.final2d_encoder(h)
+        # Project to latent_dim for quantizer input
+        h = self.pre_quant_proj(h)
+        h = self.pre_quant_norm(h)
+        # Downsample mask via average pooling > 0.5 if provided
+        mask_tokens: Optional[torch.Tensor] = None
+        if mask2d is not None:
+            # Each stride-2 conv halves each spatial dimension; pool mask accordingly
+            m = mask2d
+            for _ in range(self.k2d):
+                # 2x2 non-overlapping regions: if any element is valid, mark as 1
+                m = F.avg_pool2d(m.unsqueeze(1), kernel_size=2, stride=2).squeeze(1)
+                m = (m > 0.0).float()
+            # Flatten mask to [B, T*T]
+            mask_tokens = m.view(m.size(0), -1)
+        return h, mask_tokens
+
+    def encode_tokens(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Encode the input integer genotype sequence x into a latent
+        continuous representation and produce a mask for valid token
+        positions. Returns z_e_seq of shape [B,latent_dim,T*T] and
+        mask_tokens of shape [B,T*T] (or None).
+        """
+        # Prepare 1D representation
+        h1d, mask1d = self._prepare_1d(x)
+        # Apply 1D convolutional downsampling
+        h1d, mask1d = self._downsample_1d(h1d, mask1d)
+        # Reorder and reshape to square
+        h2d, mask2d = self._to_square_and_reorder(h1d, mask1d)
+        # Downsample 2D to latent grid and get mask tokens
+        h_latent, mask_tokens = self._downsample_2d(h2d, mask2d)
+        # Flatten spatial dims to [B, latent_dim, T*T]
+        B, C, H, W = h_latent.shape
+        if H != self.latent_grid_dim or W != self.latent_grid_dim:
+            raise RuntimeError(
+                f"2D encoder output has shape ({H},{W}) but expected ({self.latent_grid_dim},{self.latent_grid_dim})"
+            )
+        z_e_seq = h_latent.view(B, C, H * W)
         return z_e_seq, mask_tokens
 
-    def quantize(self, z_e_seq: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], List[Dict[str, torch.Tensor]]]:
-        return self.quantizer(z_e_seq, beta_commit=self.cfg.beta_commit)
+    # ---------------------------------------------------------------------
+    # Decoding helpers
+
+    def _upsample_2d(self, z_q_seq: torch.Tensor) -> torch.Tensor:
+        """
+        Convert quantised tokens of shape [B,latent_dim,T*T] back to
+        a 2D grid [B,hidden_1d,S,S] via 2D transposed convolutions."""
+        B = z_q_seq.size(0)
+        C = z_q_seq.size(1)
+        # Reshape to [B,C,T,T]
+        grid_dim = self.latent_grid_dim
+        h2d = z_q_seq.view(B, C, grid_dim, grid_dim)
+        # Project from latent_dim to hidden_2d and apply optional final layers
+        # Symmetric normalization after dequantization
+        h2d = self.post_quant_norm(h2d)
+        h2d = self.post_quant_proj(h2d)
+        h2d = self.final2d_decoder(h2d)
+        # Upsample via 2D transposed convs; output [B,hidden_1d,S,S]
+        h2d_up = self.up2d(h2d)
+        return h2d_up
+
+    def _from_square_and_reorder(self, h2d: torch.Tensor) -> torch.Tensor:
+        """
+        Reorder the 2D grid back into a 1D sequence using the inverse
+        Morton order. Input h2d is [B,8,S,S]. Returns
+        [B,8,length_after_conv].
+        """
+        B, C, H, W = h2d.shape
+        if H != self.S or W != self.S:
+            raise RuntimeError(
+                f"Expected decoded 2D shape ({self.S},{self.S}), got ({H},{W})"
+            )
+        # Flatten to [B,8,S*S] and reorder
+        h_seq = h2d.view(B, C, H * W)
+        inv = self.inv_order_2d.to(h2d.device)
+        h_seq = h_seq[..., inv]
+        return h_seq
+
+    def _upsample_1d(self, h: torch.Tensor) -> torch.Tensor:
+        """
+        Mirror the 1D downsampling: apply transposed convs and final
+        interpolate or crop to restore the original length L. Input
+        h is [B,8,length_after_conv]. Returns [B,8,L].
+        """
+        # Mirror optional extra conv if used
+        if self.has_extra_conv:
+            if self.deconv1d_extra is None:
+                raise RuntimeError("deconv1d_extra missing despite has_extra_conv")
+            h = self.deconv1d_extra(h)
+        # Transposed conv with stride=c
+        h = self.deconv1d_expand(h)
+        # At this point length should be target_len
+        # If we padded originally, crop to L; if we compressed, interpolate back to L
+        B, C, L_curr = h.shape
+        if self.pad_1d:
+            # Crop padded part
+            if L_curr < self.L:
+                raise RuntimeError(
+                    f"Decoded length {L_curr} is smaller than original length {self.L}"
+                )
+            h = h[..., : self.L]
+        elif self.compress_1d:
+            # Upsample back to original length
+            if L_curr != self.target_len:
+                raise RuntimeError(
+                    f"Expected length {self.target_len} after deconv, got {L_curr}"
+                )
+            h = F.interpolate(
+                h, size=self.L, mode="linear", align_corners=False
+            )
+        else:
+            if L_curr != self.L:
+                raise RuntimeError(
+                    f"Expected decoded length {self.L}, got {L_curr}"
+                )
+        return h
+
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Encode x and return quantisable latent representation along
+        with a mask for valid token positions."""
+        return self.encode_tokens(x)
 
     def decode_logits(self, z_q_seq: torch.Tensor) -> torch.Tensor:
+        """Decode quantised tokens z_q_seq into logits over
+        {0,1,2} for each input position. The returned tensor has
+        shape [B,3,L].
         """
-        Decode the quantized latents into logits over {0,1,2} for each
-        position in the original sequence.
-
-        Args:
-            z_q_seq: Quantized latent tokens of shape `(B, d, 16*16)`.
-            pad: Unused; kept for API compatibility.
-
-        Returns:
-            logits3: Tensor of shape `(B, 3, L)` representing logits
-                     over the classes for each of the original
-                     positions. Padded positions (if any) are
-                     truncated.
-        """
-        B = z_q_seq.size(0)
-        # Reshape tokens back to [B,d,latent_grid_dim,latent_grid_dim]
-        grid_dim = self.cfg.latent_grid_dim
-        h = z_q_seq.view(B, z_q_seq.size(1), grid_dim, grid_dim)
-        # Decode upsample
-        h = self.decoder_up(h)
-        # Ensure spatial matches encoder input grid exactly
-        if (h.shape[-2] != self.enc_in_H) or (h.shape[-1] != self.enc_in_W):
-            h = F.interpolate(h, size=(self.enc_in_H, self.enc_in_W), mode="bilinear", align_corners=False)
-        # Project to 3 logits
-        y = self.out_head(h)  # [B, 3, S, S]
-        # Flatten row-major [B, 3, S*S]
-        y_flat = y.view(B, 3, -1)
-        # Reorder back to original sequence: apply inverse Morton mapping
-        inv_order = self.inv_order_2d.to(y_flat.device)
-        y_orig = y_flat[:, :, inv_order]  # [B, 3, L_pad]
-        # Truncate to original length (we drop padded positions)
-        L = self.cfg.input_length
-        logits3 = y_orig[:, :, :L]
+        # 2D upsample to [B,8,S,S]
+        h2d_up = self._upsample_2d(z_q_seq)
+        # Inverse Morton order and reshape to [B,8,length_after_conv]
+        h1d = self._from_square_and_reorder(h2d_up)
+        # Upsample to original 1D length
+        h1d_up = self._upsample_1d(h1d)
+        # Final 1D head to logits
+        logits3 = self.out_head(h1d_up)
         return logits3
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], List[Dict[str, torch.Tensor]], torch.Tensor]:
-        """
-        Run the full VQ‑VAE forward pass: encode, quantize, and decode.
+    def forward(
+        self, x: torch.Tensor, beta_commit: Optional[float] = None
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        List[torch.Tensor],
+        List[Dict[str, torch.Tensor]],
+        Optional[torch.Tensor],
+    ]:
+        """Run the full VQ-VAE forward pass: encode, quantise and decode.
 
-        Args:
-            x: Input tensor of shape `(B, L)` with values in {0,1,2}.
-
-        Returns:
-            logits3: Reconstructed logits of shape `(B, 3, L)`.
-            z_q_seq: Quantized latent tokens `(B, d, 16*16)`.
-            commit_loss: Scalar commitment loss.
-            indices_list: List of index tensors per RVQ level.
-            stats_list: List of statistics per RVQ level.
-            mask_tokens: Mask for tokens (shape `(B,16*16)`) indicating
-                        which token positions correspond to valid input
-                        positions. (Useful for future extensions.)
+        Returns a tuple consisting of the reconstructed logits, the
+        quantised latent representation, the commitment loss, the list of
+        indices per residual quantisation layer, the list of running
+        statistics for the quantiser and the token mask (or None).
         """
         z_e_seq, mask_tokens = self.encode_tokens(x)
-        z_q_seq, commit_loss, indices_list, stats_list = self.quantize(z_e_seq)
+        z_q_seq, commit_loss, indices_list, stats_list = self.quantizer(
+            z_e_seq, beta_commit=(self.cfg.beta_commit if beta_commit is None else beta_commit)
+        )
         logits3 = self.decode_logits(z_q_seq)
         return logits3, z_q_seq, commit_loss, indices_list, stats_list, mask_tokens
 
-    def loss_function(self,
-                      logits3: torch.Tensor,
-                      x: torch.Tensor,
-                      commit_loss: torch.Tensor,
-                      mask_tokens: torch.Tensor,
-                      *,
-                      ld_lambda: Optional[float] = None,
-                      maf_lambda: Optional[float] = None,
-                      ld_window: Optional[int] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        Compute the loss for a batch. The loss consists of the
-        cross-entropy reconstruction loss (masked to ignore padded
-        positions), the commitment loss from quantization, and optional
-        auxiliary penalties on allele frequency (MAF) and local LD.
+    def loss_function(
+        self,
+        logits3: torch.Tensor,
+        x: torch.Tensor,
+        commit_loss: torch.Tensor,
+        mask_tokens: Optional[torch.Tensor],
+        *,
+        ld_lambda: Optional[float] = None,
+        maf_lambda: Optional[float] = None,
+        ld_window: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute the training loss for a batch.
+
+        The loss is the sum of masked cross-entropy reconstruction loss,
+        commitment loss from quantisation and optional auxiliary penalties
+        for minor allele frequency (MAF) and local linkage disequilibrium
+        (LD).
 
         Args:
-            logits3: Reconstructed logits of shape `(B,3,L)`.
-            x: True genotypes of shape `(B,L)` with values in {0,1,2}.
-            commit_loss: Scalar commitment loss.
-            mask_tokens: Mask for valid positions on the token grid
-                         flattened to `(B,16*16)`. Not used here but
-                         retained for extensibility.
-            ld_lambda: Weight for the local LD penalty (defaults to
-                       cfg.ld_lambda).
-            maf_lambda: Weight for the MAF penalty (defaults to
-                        cfg.maf_lambda).
-            ld_window: Window size for LD penalty (defaults to
-                        cfg.ld_window).
+            logits3: [B,3,L] reconstructed logits.
+            x: [B,L] true genotype labels.
+            commit_loss: scalar commitment loss returned by the quantiser.
+            mask_tokens: optional [B,T*T] mask for valid latent tokens. This
+                implementation does not currently use it directly but
+                retains the parameter for forward compatibility.
+            ld_lambda: weight for the LD penalty (overrides cfg.ld_lambda).
+            maf_lambda: weight for the MAF penalty (overrides cfg.maf_lambda).
+            ld_window: window size for LD penalty (overrides cfg.ld_window).
 
         Returns:
-            Tuple of (loss, metrics) where metrics is a dictionary
-            containing individual loss terms for logging.
+            loss: scalar tensor
+            metrics: dictionary of individual loss terms for logging
         """
         cfg = self.cfg
+        # Override with provided lambdas if specified
         ld_lambda = cfg.ld_lambda if ld_lambda is None else ld_lambda
         maf_lambda = cfg.maf_lambda if maf_lambda is None else maf_lambda
         ld_window = cfg.ld_window if ld_window is None else ld_window
         device = logits3.device
-        # Cross-entropy per position (unreduced)
-        ce_per_pos = F.cross_entropy(logits3, x.long(), reduction='none')  # [B,L]
-        # Normalize without allocating a large mask tensor on GPU
-        recon = ce_per_pos.mean()
+
+        # Masked cross-entropy over positions
+        ce_per_pos = F.cross_entropy(logits3, x.long(), reduction="none")  # [B,L]
+        recon: torch.Tensor = ce_per_pos.mean()
+
         # Auxiliary penalties
         aux_maf = torch.tensor(0.0, device=device)
         aux_ld = torch.tensor(0.0, device=device)
-        if (maf_lambda > 0) or (ld_lambda > 0):
+        if maf_lambda and maf_lambda > 0:
             pi = torch.softmax(logits3, dim=1)  # [B,3,L]
-            x_hat = pi[:, 1, :] + 2.0 * pi[:, 2, :]  # E[X]
-            if maf_lambda > 0:
-                maf_data = x.float().mean(dim=0) / 2.0
-                maf_recon = x_hat.mean(dim=0) / 2.0
-                aux_maf = maf_lambda * torch.mean(torch.abs(maf_recon - maf_data))
-            if ld_lambda > 0 and x.size(1) >= ld_window:
-                aux_ld = ld_lambda * local_ld_penalty(x.float(), x_hat, window=ld_window)
-        # Total loss
+            x_hat = pi[:, 1, :] + 2.0 * pi[:, 2, :]  # Expected genotype
+            maf_data = x.float().mean(dim=0) / 2.0
+            maf_recon = x_hat.mean(dim=0) / 2.0
+            aux_maf = maf_lambda * torch.mean(torch.abs(maf_recon - maf_data))
+        if ld_lambda and ld_lambda > 0 and x.size(1) >= (ld_window or 0):
+            aux_ld = ld_lambda * local_ld_penalty(x.float(), x_hat, window=ld_window)
+
         loss = recon + commit_loss + aux_maf + aux_ld
         return loss, {
             "recon": recon.detach(),
@@ -869,11 +980,12 @@ def train_vqvae(model: SNPVQVAE,
                 optimizer: torch.optim.Optimizer,
                 device: Optional[torch.device] = None,
                 num_epochs: int = 10,
-                grad_clip: float = 1.0) -> None:
+                grad_clip: float = 1.0,
+                scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
+                beta_warmup_steps: int = 0) -> None:
     """
-    Train the VQ‑VAE model on a dataloader. Prints out aggregate
+    Train the VQ-VAE model on a dataloader. Prints out aggregate
     statistics per epoch.
-
     Args:
         model: The model to train.
         dataloader: PyTorch DataLoader providing batches of shape `(B,L)`.
@@ -889,22 +1001,32 @@ def train_vqvae(model: SNPVQVAE,
         model.to(device)
     model.train()
     
+    global_step = 0
     for epoch in range(num_epochs):
         tot_loss = tot_recon = tot_commit = tot_maf = tot_ld = 0.0
         tot_n = 0
-        for batch in tqdm(dataloader, desc="Epoch {epoch+1}/{num_epochs}"):
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+        # for batch in dataloader:
             x = batch
             x = x.to(device) if device is not None else x
             optimizer.zero_grad(set_to_none=True)
             # logits3, z_q_seq, commit_loss, _, _, mask_tokens = model(x)
             # loss, metrics = model.loss_function(logits3, x, commit_loss, mask_tokens)
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                logits3, z_q_seq, commit_loss, _, _, mask_tokens = model(x)
+                if beta_warmup_steps and beta_warmup_steps > 0:
+                    frac = min(1.0, float(global_step + 1) / float(beta_warmup_steps))
+                    beta_now = frac * model.cfg.beta_commit
+                else:
+                    beta_now = model.cfg.beta_commit
+                logits3, z_q_seq, commit_loss, _, _, mask_tokens = model(x, beta_commit=beta_now)
                 loss, metrics = model.loss_function(logits3, x, commit_loss, mask_tokens)
             loss.backward()
             if grad_clip is not None and grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            global_step += 1
             B = x.size(0)
             tot_n += B
             tot_loss += loss.item() * B
@@ -912,9 +1034,12 @@ def train_vqvae(model: SNPVQVAE,
             tot_commit += metrics["commit"].item() * B
             tot_maf += metrics["aux_maf"].item() * B
             tot_ld += metrics["aux_ld"].item() * B
+        if scheduler is not None:
+            scheduler.step()
         print(f"Epoch {epoch+1}/{num_epochs}: "
               f"loss={tot_loss/tot_n:.4f}, recon={tot_recon/tot_n:.4f}, "
-              f"commit={tot_commit/tot_n:.4f}, aux_maf={tot_maf/tot_n:.5f}, aux_ld={tot_ld/tot_n:.5f}")
+              f"commit={tot_commit/tot_n:.4f}, aux_maf={tot_maf/tot_n:.5f}, "
+              f"aux_ld={tot_ld/tot_n:.5f}, lr={scheduler.get_last_lr()[0]:.6f}, beta={beta_now:.4f}")
         # Clear GPU cache to free memory between epochs
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -927,6 +1052,23 @@ def train_vqvae(model: SNPVQVAE,
 # Convenience: build model + optimizer with sane defaults
 # ---------------------------------------------------------------------
 
+@dataclass
+class VQVAEConfig:
+    input_length: int
+    latent_dim: int 
+    codebook_size: int
+    num_quantizers: int
+    ema_decay: float
+    ema_eps: float
+    beta_commit: float
+    ld_lambda: float
+    maf_lambda: float
+    ld_window: int
+    latent_grid_dim: int
+    hidden_1d_channels: int
+    hidden_2d_channels: int
+    layers_at_final: int
+
 def build_vqvae(input_length: int,
                 latent_dim: int = 64,
                 codebook_size: int = 1024,
@@ -937,59 +1079,28 @@ def build_vqvae(input_length: int,
                 ld_lambda: float = 1e-3,
                 maf_lambda: float = 1e-3,
                 ld_window: int = 128,
-                ema_decay: float = 0.99,
-                ema_eps: float = 1e-5, 
-                hidden_channels: int = 64,
-                width_mult_per_stage: float = 1.0,
-                # NEW: explicit S->T and T->~S mapping knobs
-                init_down_kernel: int = 0,
-                init_down_stride: int = 0,
-                init_down_padding: int = 0,
-                init_down_out_channels: int = 0,
-                keep_layers_at_T: int = 0,
-                dec_up_kernel: int = 0,
-                dec_up_stride: int = 0,
-                dec_up_padding: int = 0,
-                dec_up_output_padding: int = 0,
-                dec_up_out_channels: int = 0) -> Tuple[SNPVQVAE, torch.optim.Optimizer]:
-    """
-    Construct a SNPVQVAE model and its optimizer with default hyperparameters.
-
-    Args:
-        input_length: Length of the input sequence (number of SNPs).
-        latent_dim: Number of latent channels.
-        codebook_size: Number of codes in the VQ codebook.
-        num_quantizers: Number of residual VQ levels.
-        beta_commit: Commitment loss weight.
-        lr: Learning rate for the Adam optimizer.
-
-    Returns:
-        A tuple `(model, optimizer)` ready for training.
-    """
+                ema_decay: float = 0.9,
+                ema_eps: float = 1e-5,
+                hidden_1d_channels: int = 8,
+                hidden_2d_channels: Optional[int] = None,
+                layers_at_final: int = 0) -> Tuple[SNPVQVAE, torch.optim.Optimizer]:
+    if hidden_2d_channels is None:
+        hidden_2d_channels = latent_dim
     cfg = VQVAEConfig(
         input_length=input_length,
         latent_dim=latent_dim,
         codebook_size=codebook_size,
         num_quantizers=num_quantizers,
         beta_commit=beta_commit,
-        hidden_channels=hidden_channels,
-        width_mult_per_stage=width_mult_per_stage,
         ema_decay=ema_decay,
         ema_eps=ema_eps,
         ld_lambda=ld_lambda,
         maf_lambda=maf_lambda,
         ld_window=ld_window,
         latent_grid_dim=latent_grid_dim,
-        init_down_kernel=init_down_kernel,
-        init_down_stride=init_down_stride,
-        init_down_padding=init_down_padding,
-        init_down_out_channels=init_down_out_channels,
-        keep_layers_at_T=keep_layers_at_T,
-        dec_up_kernel=dec_up_kernel,
-        dec_up_stride=dec_up_stride,
-        dec_up_padding=dec_up_padding,
-        dec_up_output_padding=dec_up_output_padding,
-        dec_up_out_channels=dec_up_out_channels,
+        hidden_1d_channels=hidden_1d_channels,
+        hidden_2d_channels=hidden_2d_channels,
+        layers_at_final=layers_at_final,
     )
     model = SNPVQVAE(cfg)
     optim = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999))

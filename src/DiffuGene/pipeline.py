@@ -35,6 +35,7 @@ warnings.filterwarnings('ignore')
 
 from .config import load_config, get_default_config_path, expand_variables
 from .utils import setup_logging, get_logger, ensure_dir_exists, load_blocks_for_chr
+from .VAEembed.latentAlloc_MILP import solve_quadtree_milp, organize_quadtree_solution
 
 
 logger = get_logger(__name__)
@@ -1013,64 +1014,71 @@ class DiffuGenePipeline:
                 args += ["--chromosomes", str(int(chromo))]
             sys.argv = ["prep_vqvae_data.py"] + args
             prep_main()
-            # Train VQ-VAE
+            # Train VQ-VAE (per chromosome)
             model_cfg = self.config['vqvae']['model']
             train_cfg = self.config['vqvae']['training']
-            args = [
-                "--h5-dir", data_cfg['h5_cache_dir'],
-                "--bim", data_cfg['bim_file'],
-                "--save-path", self.config['vqvae']['model_save_path'],
-                "--latent-dim", str(int(model_cfg['latent_dim'])),
-                "--codebook-size", str(int(model_cfg['codebook_size'])),
-                "--num-quantizers", str(int(model_cfg['num_quantizers'])),
-                "--latent-grid-dim", str(int(model_cfg['latent_grid_dim'])),
-                "--hidden-channels", str(int(model_cfg['hidden_channels'])),
-                "--width-mult-per-stage", str(float(model_cfg.get('width_mult_per_stage', 1.0))),
-                "--ema-decay", str(float(model_cfg.get('ema_decay', 0.99))),
-                "--ema-eps", str(float(model_cfg.get('ema_eps', 1e-5))),
-                "--ld-lambda", str(float(model_cfg.get('ld_lambda', 1e-3))),
-                "--maf-lambda", str(float(model_cfg.get('maf_lambda', 0.0))),
-                "--ld-window", str(int(model_cfg.get('ld_window', 128))),
-                # Direct mapping params (optional)
-                "--init-down-kernel", str(int(model_cfg.get('init_down_kernel', 0))),
-                "--init-down-stride", str(int(model_cfg.get('init_down_stride', 0))),
-                "--init-down-padding", str(int(model_cfg.get('init_down_padding', 0))),
-                "--init-down-out-channels", str(int(model_cfg.get('init_down_out_channels', 0))),
-                "--keep-layers-at-T", str(int(model_cfg.get('keep_layers_at_T', 0))),
-                "--dec-up-kernel", str(int(model_cfg.get('dec_up_kernel', 0))),
-                "--dec-up-stride", str(int(model_cfg.get('dec_up_stride', 0))),
-                "--dec-up-padding", str(int(model_cfg.get('dec_up_padding', 0))),
-                "--dec-up-output-padding", str(int(model_cfg.get('dec_up_output_padding', 0))),
-                "--dec-up-out-channels", str(int(model_cfg.get('dec_up_out_channels', 0))),
-                "--epochs", str(int(train_cfg['epochs'])),
-                "--batch-size", str(int(train_cfg['batch_size'])),
-                "--lr", str(float(train_cfg['learning_rate'])),
-                "--device", self.config['global'].get('device', 'cuda'),
-            ]
             chromo = self.config['global']['chromosome']
-            if str(chromo).lower() != 'all':
-                args += ["--chromosomes", str(int(chromo))]
-            sys.argv = ["train_vqvae.py"] + args
-            train_main()
+            chromosomes = list(range(1,23)) if str(chromo).lower() == 'all' else [int(chromo)]
+            # Derive base path for model saves
+            base_model_path = self.config['vqvae']['model_save_path']
+            base_dir = os.path.dirname(base_model_path)
+            base_name = os.path.splitext(os.path.basename(base_model_path))[0]
+            multi_chr = len(chromosomes) > 1
+            for c in chromosomes:
+                save_path = os.path.join(base_dir, f"{base_name}_chr{c}.pt") if multi_chr else base_model_path
+                args = [
+                    "--h5-dir", data_cfg['h5_cache_dir'],
+                    "--bim", data_cfg['bim_file'],
+                    "--chromosome", str(int(c)),
+                    "--save-path", save_path,
+                    "--latent-dim", str(int(model_cfg['latent_dim'])),
+                    "--codebook-size", str(int(model_cfg['codebook_size'])),
+                    "--num-quantizers", str(int(model_cfg['num_quantizers'])),
+                    "--latent-grid-dim", str(int(model_cfg['latent_grid_dim'])),
+                    "--hidden-1d-channels", str(int(model_cfg.get('hidden_1d_channels', 8))),
+                    "--hidden-2d-channels", str(int(model_cfg.get('hidden_2d_channels', int(model_cfg['latent_dim'])))),
+                    "--layers-at-final", str(int(model_cfg.get('layers_at_final', 0))),
+                    "--ema-decay", str(float(model_cfg.get('ema_decay', 0.99))),
+                    "--ld-lambda", str(float(model_cfg.get('ld_lambda', 1e-3))),
+                    "--maf-lambda", str(float(model_cfg.get('maf_lambda', 0.0))),
+                    "--ld-window", str(int(model_cfg.get('ld_window', 128))),
+                    "--epochs", str(int(train_cfg['epochs'])),
+                    "--batch-size", str(int(train_cfg['batch_size'])),
+                    "--lr", str(float(train_cfg['learning_rate'])),
+                    "--device", self.config['global'].get('device', 'cuda'),
+                ]
+                sys.argv = ["train_vqvae.py"] + args
+                logger.info(f"Training VQ-VAE for chromosome {c} -> {save_path}")
+                train_main()
 
         # Encode latents for diffusion training/validation as needed
-        from .VAEembed.encode_vqvae import main as encode_main
-        enc_cfg = self.config['vqvae']['encoding']
-        # Allow inference-time override of fam for encoding if needed in future (kept simple for now)
-        args = [
-            "--model", self.config['vqvae']['model_save_path'],
-            "--h5-dir", self.config['vqvae']['data']['h5_cache_dir'],
-            "--out-dir", enc_cfg['latents_output_dir'],
-            "--device", self.config['global'].get('device', 'cuda')
-        ]
-        if enc_cfg.get('write_memmap', True):
-            args.append("--write-memmap")
+        # Encoding step: only supported for single-chromosome model in this pipeline
         chromo = self.config['global']['chromosome']
-        if str(chromo).lower() != 'all':
-            args += ["--chromosomes", str(int(chromo))]
-        sys.argv = ["encode_vqvae.py"] + args
-        encode_main()
-        logger.info("VQ-VAE encoding completed successfully")
+        chromosomes = list(range(1,23)) if str(chromo).lower() == 'all' else [int(chromo)]
+        if len(chromosomes) == 1:
+            from .VAEembed.encode_vqvae import main as encode_main
+            enc_cfg = self.config['vqvae']['encoding']
+            # Determine per-chromosome model path if we trained with suffix
+            base_model_path = self.config['vqvae']['model_save_path']
+            c = chromosomes[0]
+            base_dir = os.path.dirname(base_model_path)
+            base_name = os.path.splitext(os.path.basename(base_model_path))[0]
+            per_chr_path = os.path.join(base_dir, f"{base_name}_chr{c}.pt")
+            model_path = per_chr_path if os.path.exists(per_chr_path) else base_model_path
+            args = [
+                "--model", model_path,
+                "--h5-dir", self.config['vqvae']['data']['h5_cache_dir'],
+                "--out-dir", enc_cfg['latents_output_dir'],
+                "--device", self.config['global'].get('device', 'cuda')
+            ]
+            if enc_cfg.get('write_memmap', True):
+                args.append("--write-memmap")
+            args += ["--chromosomes", str(int(c))]
+            sys.argv = ["encode_vqvae.py"] + args
+            encode_main()
+            logger.info("VQ-VAE encoding completed successfully")
+        else:
+            logger.info("Per-chromosome VQ-VAE models trained. Encoding for multi-chromosome layout is orchestrated externally and is skipped here.")
         return
         
         # Get the datasets for VAE training
