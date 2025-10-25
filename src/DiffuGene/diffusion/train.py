@@ -3,25 +3,30 @@
 import argparse
 import os
 import random
+import gc
+from tqdm import tqdm
+from typing import List
+import glob
+import re
+import numpy as np
+from timm.utils import ModelEmaV3
+from diffusers import DDPMScheduler
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from timm.utils import ModelEmaV3
 import torch.cuda.amp as amp
-from tqdm import tqdm
-from diffusers import DDPMScheduler
-from typing import List
-import glob
-import re
-import numpy as np
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from ..utils import setup_logging, get_logger, prepare_covariates_for_training, save_covariate_metadata
 from .unet import LatentUNET2D as ConditionalUNET
 from .unet_unconditional import LatentUNET2D as UnconditionalUNET
-from .unet import set_seed, noise_pred_loss
+from .unet import set_seed, noise_pred_loss, v_pred_loss
 
 logger = get_logger(__name__)
 
@@ -45,7 +50,7 @@ class MemmapDataset(Dataset):
     
     def __getitem__(self, i):
         x = self.arr[i]  # fast slice
-        return torch.from_numpy(x.copy())  # copy to avoid issues with memmap
+        return torch.from_numpy(x)
 
 class ConditionalMemmapDataset(Dataset):
     """Memory-mapped dataset for conditional training with latents and covariates."""
@@ -74,7 +79,7 @@ class ConditionalMemmapDataset(Dataset):
     def __getitem__(self, i):
         x = self.arr[i]  # fast slice
         c = self.covariates[i]  # covariate for this sample
-        return torch.from_numpy(x.copy()), c
+        return torch.from_numpy(x), c
 
 def create_memmap_from_batches(batch_files, memmap_path):
     """Create a memory-mapped numpy array from batch files."""
@@ -135,42 +140,35 @@ def create_memmap_from_batches(batch_files, memmap_path):
     return total_samples, full_shape
 
 def read_prepare_data(path, output_folder, model_output_path):
-    """Load raw latent training data using memory mapping for efficiency"""
-    # Check if single file exists
+    # Case 1: direct memmap path
+    if os.path.exists(path) and path.endswith('.npy'):
+        shape_file = path.replace('.npy', '_shape.txt')
+        if not os.path.exists(shape_file):
+            raise ValueError(f"Shape file missing for memmap: {shape_file}")
+        logger.info(f"Using existing memmap file: {path}")
+        return MemmapDataset(path)
+
+    # Case 2: single tensor file to be converted to memmap
     if os.path.exists(path):
         logger.info(f"Loading single latent file: {path}")
         data = torch.load(path, weights_only=False)
-        
-        # For large single files, also convert to memmap for efficiency
-        if len(data) > 50500:  # max data save batch size
-            logger.info(f"Large dataset ({len(data)} samples), converting to memmap for efficiency")
-            memmap_path = os.path.join(output_folder, f"{os.path.splitext(os.path.basename(model_output_path))[0]}_memmap.npy")
-            shape_file = memmap_path.replace('.npy', '_shape.txt')
-            
-            if not os.path.exists(memmap_path) or not os.path.exists(shape_file):
-                # Convert single large file to memmap
-                if not isinstance(data, torch.Tensor):
-                    data = torch.tensor(data, dtype=torch.float32)
-                
-                logger.info(f"Creating memmap from single file: {data.shape}")
-                memmap_array = np.memmap(memmap_path, dtype='float32', mode='w+', shape=data.shape)
-                memmap_array[:] = data.numpy()
-                del memmap_array
-                
-                # Save shape information
-                with open(shape_file, 'w') as f:
-                    f.write(','.join(map(str, data.shape)))
-                
-                logger.info(f"Memmap file created: {memmap_path}")
-                logger.info(f"Shape file created: {shape_file}")
-                return MemmapDataset(memmap_path, data.shape)
-            else:
-                logger.info(f"Using existing memmap file: {memmap_path}")
-                return MemmapDataset(memmap_path)
+        memmap_path = os.path.join(output_folder, f"{os.path.splitext(os.path.basename(model_output_path))[0]}_memmap.npy")
+        shape_file = memmap_path.replace('.npy', '_shape.txt')
+        if not os.path.exists(memmap_path) or not os.path.exists(shape_file):
+            if not isinstance(data, torch.Tensor):
+                data = torch.tensor(data, dtype=torch.float32)
+            logger.info(f"Creating memmap from single file: {data.shape}")
+            memmap_array = np.memmap(memmap_path, dtype='float32', mode='w+', shape=data.shape)
+            memmap_array[:] = data.numpy()
+            del memmap_array
+            with open(shape_file, 'w') as f:
+                f.write(','.join(map(str, data.shape)))
+            logger.info(f"Memmap file created: {memmap_path}")
+            logger.info(f"Shape file created: {shape_file}")
+            return MemmapDataset(memmap_path, data.shape)
         else:
-            # Small datasets can stay in memory
-            logger.info(f"Small dataset ({len(data)} samples), keeping in memory")
-            return data
+            logger.info(f"Using existing memmap file: {memmap_path}")
+            return MemmapDataset(memmap_path)
     
     # Check for batch files
     base_dir = os.path.dirname(path)
@@ -322,7 +320,7 @@ def train(
     cond_dim: int = 10,
     binary_cols: List[str] = None,
     categorical_cols: List[str] = None, 
-    cfg_drop_prob: float = 0.1
+    cfg_drop_prob: float = 0.1, 
 ):
     setup_logging()
     set_seed(random.randint(0, 2**32-1)) if seed == -1 else set_seed(seed)
@@ -330,139 +328,109 @@ def train(
     output_folder = os.path.dirname(model_output_path)
     model_name = os.path.splitext(os.path.basename(model_output_path))[0]
     
+    # Initialize distributed training if launched with torchrun/torch.distributed
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    distributed = world_size > 1
+    if distributed:
+        logger.info(f"Distributed training with {world_size} GPUs")
+        logger.info(f"Using local rank: {local_rank}")
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank if distributed else 0)
+    logger.info(f"Using device: {device}")
+
+    # Memory/performance toggles: use channels_last, bf16, and enable Flash/SDP attention
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+
     # Load latent training data
     train_dataset_raw = read_prepare_data(train_embed_dataset_path, output_folder, model_output_path)
     
-    # Handle both single file (tensor) and batch file (MemmapDataset) cases
-    if isinstance(train_dataset_raw, MemmapDataset):
-        is_memmap_dataset = True
-        # For memmap datasets, handle conditional and unconditional cases
-        if conditional:
-            logger.info("Training conditional diffusion model with memory-mapped data")
-            if not covariate_file or not fam_file:
-                raise ValueError("Conditional training requires covariate_file and fam_file")
-            
-            train_dataset, actual_cond_dim = prepare_conditional_memmap_data(
-                memmap_dataset=train_dataset_raw,
-                covariate_path=covariate_file,
-                fam_path=fam_file,
-                binary_cols=binary_cols,
-                categorical_cols=categorical_cols,
-                output_folder=output_folder,
-                model_name=model_name
-            )
-            cond_dim = actual_cond_dim  # Use actual dimension from data
-        else:
-            logger.info("Training unconditional diffusion model with memory-mapped data")
-            train_dataset = train_dataset_raw
+    # Always memory-mapped dataset path
+    if conditional:
+        logger.info("Training conditional diffusion model with memory-mapped data")
+        if not covariate_file or not fam_file:
+            raise ValueError("Conditional training requires covariate_file and fam_file")
+        train_dataset, actual_cond_dim = prepare_conditional_memmap_data(
+            memmap_dataset=train_dataset_raw,
+            covariate_path=covariate_file,
+            fam_path=fam_file,
+            binary_cols=binary_cols,
+            categorical_cols=categorical_cols,
+            output_folder=output_folder,
+            model_name=model_name
+        )
+        cond_dim = actual_cond_dim
     else:
-        is_memmap_dataset = False
-        # Original tensor-based approach
-        if conditional:
-            logger.info("Training conditional diffusion model")
-            if not covariate_file or not fam_file:
-                raise ValueError("Conditional training requires covariate_file and fam_file")
-            
-            train_dataset, actual_cond_dim = prepare_conditional_data(
-                latent_data=train_dataset_raw,
-                covariate_path=covariate_file,
-                fam_path=fam_file,
-                binary_cols=binary_cols,
-                categorical_cols=categorical_cols,
-                output_folder=output_folder,
-                model_name=model_name
-            )
-            cond_dim = actual_cond_dim  # Use actual dimension from data
-            
-        else:
-            logger.info("Training unconditional diffusion model")
-            train_dataset = train_dataset_raw
+        logger.info("Training unconditional diffusion model with memory-mapped data")
+        train_dataset = train_dataset_raw
     
-    # Estimate scaling from the first batch(es)
-    if is_memmap_dataset:
-        # For memmap datasets, estimate scaling from multiple batches
-        stats_loader = DataLoader(train_dataset, 
-                                  batch_size=batch_size, 
-                                  shuffle=False, 
-                                  drop_last=True, 
-                                  num_workers=8, 
-                                  pin_memory=True,
-                                  prefetch_factor=2)
-        
-        # Estimate sigma from a few small batches without keeping them all in memory
-        sigma_estimates = []
-        for i, batch_data in enumerate(stats_loader):
-            if conditional:
-                # Extract latents from conditional memmap dataset
-                batch_latents, _ = batch_data
-                batch = batch_latents.float().cuda()
-            else:
-                # Unconditional memmap dataset
-                batch = batch_data.float().cuda()
-            
-            # Compute sigma for this batch and store only the value, not the tensor
-            batch_sigma = batch.std(unbiased=False).item()
-            sigma_estimates.append(batch_sigma)
-            
-            # Clean up immediately
-            del batch
-            if conditional:
-                del batch_latents
-            
-            if i >= 4:  # Use only 5 small batches for estimation
-                break
-        
-        # Average the sigma estimates
-        sigma_hat = torch.tensor(sum(sigma_estimates) / len(sigma_estimates)).cuda()
-        logger.info(f"Estimated sigma from {len(sigma_estimates)} small batches: {sigma_hat:.4f}")
-        
-        # Log dataset info from memmap
-        total_samples = len(train_dataset)
+    # Estimate scaling from the first batch(es) using memmap loader
+    stats_loader = DataLoader(train_dataset, 
+                              batch_size=batch_size, 
+                              shuffle=False, 
+                              drop_last=True, 
+                              num_workers=0, 
+                              pin_memory=False)
+    
+    sigma_estimates = []
+    for i, batch_data in enumerate(stats_loader):
         if conditional:
-            sample_latent_shape = train_dataset[0][0].shape  # First element is latents
-            logger.info(f"Training data shape: ({total_samples},) + {sample_latent_shape} latents + covariates")
+            batch_latents, _ = batch_data
+            batch = batch_latents.to(dtype=torch.float32, device="cpu")
         else:
-            sample_shape = train_dataset[0].shape
-            logger.info(f"Training data shape: ({total_samples},) + {sample_shape}")
-        
-        # Final cleanup before model creation
-        del stats_loader
-        
+            batch = batch_data.to(dtype=torch.float32, device="cpu")
+        sigma_estimates.append(batch.std(unbiased=False).item())
+        if conditional:
+            del batch_latents
+        if i >= 4:
+            break
+    sigma_hat = torch.tensor(sum(sigma_estimates) / len(sigma_estimates), device=device)
+    if distributed:
+        dist.all_reduce(sigma_hat, op=dist.ReduceOp.SUM)
+        sigma_hat /= world_size
+    logger.info(f"Estimated sigma from {len(sigma_estimates)} small batches: {sigma_hat:.4f}")
+    total_samples = len(train_dataset)
+    if conditional:
+        sample_latent_shape = train_dataset[0][0].shape
+        logger.info(f"Training data shape: ({total_samples},) + {sample_latent_shape} latents + covariates")
     else:
-        # Original approach for tensor datasets
-        if conditional:
-            # For conditional, extract latents only for scaling estimation
-            stats_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True, num_workers=1)
-            first_batch_latents, _ = next(iter(stats_loader))
-            first_batch = first_batch_latents.float().cuda()
-        else:
-            stats_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, drop_last=True, num_workers=1)
-            first_batch = next(iter(stats_loader)).float().cuda()
-        
-        sigma_hat = first_batch.std(unbiased=False)
-        logger.info(f"Training data shape: {train_dataset_raw.shape}")
-        logger.info(f"Training data std per channel: {train_dataset_raw.std(dim=(0, 2, 3))}")
-    
+        sample_shape = train_dataset[0].shape
+        logger.info(f"Training data shape: ({total_samples},) + {sample_shape}")
+    del stats_loader, batch, batch_data
+    gc.collect()
+    torch.cuda.empty_cache()
+
     torch.save(sigma_hat, os.path.join(output_folder, f"train_{model_name}_sigma.pt"))
     logger.info(f"Estimated global sigma_hat = {sigma_hat:.4f}")
 
-    # Create data loader with efficient settings
-    if is_memmap_dataset:
-        # Use efficient settings for memmap datasets
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
-            shuffle=True, 
-            drop_last=True, 
-            num_workers=8,
-            pin_memory=True,
-            prefetch_factor=2
+    # Create data loader
+    if distributed: 
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=dist.get_rank(), shuffle=True)
+        loader_args = dict(
+            batch_size=batch_size,
+            sampler=train_sampler,
+            drop_last=True,
+            num_workers=0,
+            pin_memory=False,
+            # prefetch_factor=1,
+            persistent_workers=False
         )
-        logger.info(f"Created memmap DataLoader with {8} workers")
-    else:
-        # Use original settings for tensor datasets
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=1)
-        logger.info(f"Created tensor DataLoader with {1} worker")
+    else: 
+        train_sampler = None
+        loader_args = dict(
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0,
+            pin_memory=False,
+            # prefetch_factor=1, 
+            persistent_workers=False
+        )
+    train_loader = DataLoader(train_dataset, **loader_args)
+    logger.info(f"Created memmap DataLoader with {0} workers")
 
     # Switch to HF's scheduler for noising/denoising
     scheduler = DDPMScheduler(
@@ -472,32 +440,44 @@ def train(
         beta_end=0.02, 
         clip_sample=False
     )
-    scheduler.set_timesteps(num_time_steps, device="cuda")
-    scheduler.alphas_cumprod = scheduler.alphas_cumprod.to("cuda")
-    scheduler.betas         = scheduler.betas.to("cuda")
+    scheduler.set_timesteps(num_time_steps, device=device)
+    scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device)
+    scheduler.betas         = scheduler.betas.to(device)
 
     # Create conditional or unconditional model
     if conditional:
         model = ConditionalUNET(
-            input_channels=64, 
-            output_channels=64, 
+            input_channels=4, 
+            output_channels=4, 
             cond_dim=cond_dim,
             time_steps=num_time_steps
-        ).cuda()
+        )
         logger.info(f"Created conditional UNet with {cond_dim} covariate dimensions")
         logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
         logger.info(f"Model size: {sum(p.numel() for p in model.parameters()) * 4 / 1024**2:.2f} MB")
     else:
         model = UnconditionalUNET(
-            input_channels=64, 
-            output_channels=64,
+            input_channels=4, 
+            output_channels=4,
             time_steps=num_time_steps
-        ).cuda()
+        )
         logger.info("Created unconditional UNet")
     
     # Enable gradient checkpointing
     model.unet.enable_gradient_checkpointing()
     logger.info("Enabled gradient checkpointing for UNet")
+
+    # Convert to channels_last and bf16 for memory efficiency
+    model.to(device, non_blocking=True)
+    model = model.to(memory_format=torch.channels_last, dtype=torch.bfloat16)
+
+    # Wrap in DDP 
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False, find_unused_parameters=True)
+        logger.info("Wrapped model in DDP")
+        ddp_wrapped = True
+    else:
+        ddp_wrapped = False
     
     # Start LR at 1e-4 and schedule down to user-supplied LR
     start_lr = 1e-4
@@ -505,12 +485,13 @@ def train(
     lr_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=lr)
     
     # Create EMA model on CPU to save GPU memory
-    ema = ModelEmaV3(model, decay=ema_decay, device='cpu')
+    ema_src = model.module if ddp_wrapped else model
+    ema = ModelEmaV3(ema_src, decay=ema_decay, device='cpu')
     logger.info("Created EMA model on CPU to save GPU memory")
     
-    # Create mixed precision scaler
-    scaler = amp.GradScaler()
-    logger.info("Enabled mixed precision training")
+    # Create mixed precision scaler (disabled for bfloat16)
+    scaler = amp.GradScaler(enabled=False)
+    logger.info("Mixed precision enabled with bfloat16 autocast; GradScaler disabled for bf16")
     
     # Load initial checkpoint if specified (optional - for resuming training)
     if checkpoint_path is not None and checkpoint_path.strip() and os.path.exists(checkpoint_path):
@@ -535,17 +516,21 @@ def train(
     # classifier‐free guidance drop rate
     p_uncond = cfg_drop_prob if conditional else 0.0
     
+    sigma_dq = 0.01  # small dequantization noise std (to stabilize training, particularly for spiky latent dimensions)
+    
     for i in range(num_epochs):
+        if distributed:
+            train_loader.sampler.set_epoch(i)
         total_loss = 0
         for bidx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {i+1}/{num_epochs}")):
             
             # Handle conditional vs unconditional data
             if conditional:
                 x, covariates = batch_data
-                x = x.float().cuda()
-                covariates = covariates.float().cuda()
+                x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last, dtype=torch.bfloat16)
+                covariates = covariates.float().to(device, non_blocking=True).to(dtype=torch.bfloat16)
             else:
-                x = batch_data.float().cuda()
+                x = batch_data.float().to(device, non_blocking=True).to(memory_format=torch.channels_last, dtype=torch.bfloat16)
                 covariates = None
             
             # Normalize latents by sigma
@@ -554,20 +539,26 @@ def train(
             # Sample random timesteps and noise, then add noise via HF scheduler
             t = torch.randint(0, num_time_steps, (batch_size,), device=x.device, dtype=torch.long)
             noise = torch.randn_like(x)
-            x_clean = x
+            
+            # x_clean = x
+            x_clean = x + sigma_dq * torch.randn_like(x)
+            
             x = scheduler.add_noise(x_clean, noise, t)
             
             optimizer.zero_grad()
             
             # Forward pass with mixed precision
-            with amp.autocast():
+            with amp.autocast(dtype=torch.bfloat16):
+                # Access custom attributes whether wrapped by DDP or not
+                net = model.module if isinstance(model, DDP) else model
                 if conditional:
                     # CFG Training: drop + double-batch approach
                     B = x.size(0)
                     
                     # 1) Embed covariates
-                    e_cond = model.cond_emb(covariates).unsqueeze(1)        # (B,1,256)
-                    e_null = model.null_cond_emb.unsqueeze(0).expand(B,1,256)  # (B,1,256)
+                    e_cond = net.cond_emb(covariates).unsqueeze(1)        # (B,1,128)
+                    hidden_dim = e_cond.size(-1)
+                    e_null = net.null_cond_emb.unsqueeze(0).expand(B,1,hidden_dim)  # (B,1,hidden_dim)
                     # Ensure dtype match for masked assignment under AMP
                     if e_null.dtype != e_cond.dtype:
                         e_null = e_null.to(dtype=e_cond.dtype)
@@ -583,17 +574,21 @@ def train(
                     emb_in = torch.cat([e_drop, e_cond], dim=0)
                     
                     # 4) Forward through UNet directly
-                    h = model.input_proj(x_in)  
-                    out = model.unet(h, t_in, encoder_hidden_states=emb_in).sample
-                    out = model.output_proj(out)              # (2B,64,64,64)
+                    h = net.input_proj(x_in)  
+                    out = net.unet(h, t_in, encoder_hidden_states=emb_in).sample
+                    out = net.output_proj(out)              # (2B,4,512,512)
                     
                     # 5) Split & compute loss
                     out_uncond, out_cond = out.chunk(2, dim=0)
-                    loss = noise_pred_loss(out_uncond, noise, t, scheduler, simplified_loss=True)
-                    loss += noise_pred_loss(out_cond, noise, t, scheduler, simplified_loss=True)
+                    
+                    # loss = noise_pred_loss(out_uncond, noise, t, scheduler, simplified_loss=True)
+                    # loss += noise_pred_loss(out_cond, noise, t, scheduler, simplified_loss=True)
+                    loss = v_pred_loss(out_uncond, x_clean, noise, t, scheduler, gamma=10.0)
+                    loss += v_pred_loss(out_cond, x_clean, noise, t, scheduler, gamma=10.0)
                 else:
                     output = model(x, t)
-                    loss = noise_pred_loss(output, noise, t, scheduler, simplified_loss=True)
+                    # loss = noise_pred_loss(output, noise, t, scheduler, simplified_loss=True)
+                    loss = v_pred_loss(output, x_clean, noise, t, scheduler, gamma=10.0)
             
             total_loss += loss.item()
             
@@ -602,7 +597,7 @@ def train(
             scaler.step(optimizer)
             scaler.update()
             
-            ema.update(model)
+            ema.update(ema_src)
             
             # Clean up
             if conditional:
@@ -615,34 +610,40 @@ def train(
         logger.info(f'Epoch {i+1} | Loss {total_loss / (dataset_size/batch_size):.5f} | LR {current_lr:.2e}')
         lr_scheduler.step()
 
-        # Save model every 10 epochs
-        if (i+1) % 10 == 0:
-            checkpoint = {
-                'weights': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'ema': ema.state_dict(),
-                'lr_scheduler': lr_scheduler.state_dict(),
-                'scaler': scaler.state_dict(),
-                'conditional': conditional,
-                'cond_dim': cond_dim if conditional else None
-            }
-            os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
-            torch.save(checkpoint, model_output_path)
-            logger.info(f"Model saved to {model_output_path}")
+        # Save model every epoch, only on the first rank
+        if (not distributed) or (distributed and dist.get_rank() == 0):
+            if (i+1) % 1 == 0:
+                checkpoint = {
+                    'weights': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'ema': ema.state_dict(),
+                    'lr_scheduler': lr_scheduler.state_dict(),
+                    'scaler': scaler.state_dict(),
+                    'conditional': conditional,
+                    'cond_dim': cond_dim if conditional else None
+                }
+                os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
+                model_output_path_epoch = model_output_path.replace(".pth", f"_epoch{i+1}.pth")
+                torch.save(checkpoint, model_output_path_epoch)
+                logger.info(f"Model saved to {model_output_path_epoch}")
 
     # Save final checkpoint
-    checkpoint = {
-        'weights': model.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'ema': ema.state_dict(),
-        'lr_scheduler': lr_scheduler.state_dict(),
-        'scaler': scaler.state_dict(),
-        'conditional': conditional,
-        'cond_dim': cond_dim if conditional else None
-    }
-    os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
-    torch.save(checkpoint, model_output_path)
-    logger.info(f"Model saved to {model_output_path}")
+    if (not distributed) or (distributed and dist.get_rank() == 0):
+        checkpoint = {
+            'weights': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'ema': ema.state_dict(),
+            'lr_scheduler': lr_scheduler.state_dict(),
+            'scaler': scaler.state_dict(),
+            'conditional': conditional,
+            'cond_dim': cond_dim if conditional else None
+        }
+        os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
+        torch.save(checkpoint, model_output_path)
+        logger.info(f"Model saved to {model_output_path}")
+
+    if distributed:
+        dist.destroy_process_group()
 
 
 def main():

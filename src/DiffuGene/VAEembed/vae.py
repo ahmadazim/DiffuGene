@@ -149,9 +149,10 @@ class ResidualVQ(nn.Module):
     to encode residuals. This allows more precise reconstruction with
     smaller codebooks per level.
     """
-    def __init__(self, code_dim: int, num_codes: int, num_quantizers: int = 2, decay: float = 0.99, eps: float = 1e-5):
+    def __init__(self, code_dim: int, num_codes: int, num_quantizers: int = 2, decay: float = 0.99, eps: float = 1e-5, commit_decay: float = 0.9):
         super().__init__()
         assert num_quantizers >= 1
+        self.commit_decay = commit_decay
         self.levels = nn.ModuleList([
             EMACodebook(code_dim, num_codes, decay=decay, eps=eps)
             for _ in range(num_quantizers)
@@ -182,17 +183,22 @@ class ResidualVQ(nn.Module):
         commit_total = torch.tensor(0.0, device=z_e.device)
         indices_list: List[torch.Tensor] = []
         stats_list: List[Dict[str, torch.Tensor]] = []
-        for codebook in self.levels:
-            z_q_l, commit_l, idx_l, stats_l = codebook(residual, beta_commit=beta_commit)
+        residual_norms  = []
+        for li, codebook in enumerate(self.levels):
+            beta_l = beta_commit * (self.commit_decay) ** li
+            residual_norms.append(residual.pow(2).mean().detach())
+            z_q_l, commit_l, idx_l, stats_l = codebook(residual, beta_commit=beta_l)
             z_q_sum = z_q_sum + z_q_l
             commit_total = commit_total + commit_l
             indices_list.append(idx_l)
             stats_list.append(stats_l)
-            residual = (residual - z_q_l).detach() + z_q_l  # keep current gradients
+            residual = residual - z_q_l.detach()  # keep current gradients
         z_q_total_st = z_e + (z_q_sum - z_e).detach()
+        if len(stats_list) > 0:
+            stats_list[-1]["residual_l2_per_level"] = torch.stack(residual_norms)
         return z_q_total_st, commit_total, indices_list, stats_list
 
-def find_best_ck(x: int, max_c: int = 5, *, min_k: Optional[int] = None, force_even_k: bool = True) -> Tuple[int, int]:
+def find_best_ck(x: int, max_c: int = 5, *, min_k: Optional[int] = None) -> Tuple[int, int]:
     """Pick (c,k) with c∈[1..max_c] and integer k so c*2^k approximates x.
     Optionally enforce k >= min_k and even parity to avoid a second halving conv.
     """
@@ -207,16 +213,13 @@ def find_best_ck(x: int, max_c: int = 5, *, min_k: Optional[int] = None, force_e
                 best_c, best_k = c, k
             if val > 10 * x:
                 break
-            k += 1
+            k += 2
     # Apply lower bound on k
     if min_k is not None and best_k < int(min_k):
         best_k = int(min_k)
         # refine c to keep c*2^k roughly near x
         c_est = int(round(float(x) / float(1 << best_k)))
         best_c = min(max(1, c_est), max_c)
-    # Enforce even k if requested (to avoid extra halving conv)
-    if force_even_k and (best_k % 2) == 1:
-        best_k += 1
     return best_c, best_k
 
 def compute_morton2_order(dim: int) -> torch.LongTensor:
@@ -249,7 +252,7 @@ def compute_morton2_order(dim: int) -> torch.LongTensor:
     order = torch.empty(n, dtype=torch.long)
     for rank, (x, y) in enumerate(coords):
         pos = x * dim + y
-        order[pos] = rank
+        order[rank] = pos
     return order
 
 def local_ld_penalty(x_data: torch.Tensor, x_hat: torch.Tensor, window: int = 128) -> torch.Tensor:
@@ -417,7 +420,7 @@ class SNPVQVAE(nn.Module):
             min_k_req += 2
         except Exception:
             min_k_req = None
-        c, k = find_best_ck(self.L, min_k=min_k_req, force_even_k=True)
+        c, k = find_best_ck(self.L, min_k=min_k_req)
         self.c: int = c
         self.k: int = k
 
@@ -516,7 +519,7 @@ class SNPVQVAE(nn.Module):
         # Mirror: after quantizer, project back to hidden_2d channels, optional final layers, then upsample 2D back to S x S, and project to hidden_1d
         self.post_quant_proj = nn.Conv2d(self.latent_dim, self.hidden_2d, kernel_size=1, bias=False)
         # Stabilize scale after dequantization
-        self.post_quant_norm = nn.GroupNorm(num_groups=min(32, self.latent_dim), num_channels=self.latent_dim)
+        self.post_quant_norm = nn.GroupNorm(num_groups=min(32, self.hidden_2d), num_channels=self.hidden_2d)
         if self.layers_at_final > 0:
             self.final2d_decoder = nn.Sequential(*[ResBlock2D(self.hidden_2d, k=3) for _ in range(self.layers_at_final)])
         else:
@@ -530,6 +533,36 @@ class SNPVQVAE(nn.Module):
             nn.GELU(),
             nn.Conv1d(self.hidden_1d, 3, kernel_size=1, bias=True),
         )
+
+    def export_config(self) -> Dict[str, any]:
+        """Return a JSON-serializable copy of the model configuration used to construct this model."""
+        return {
+            'input_length': int(self.cfg.input_length),
+            'latent_dim': int(self.cfg.latent_dim),
+            'codebook_size': int(self.cfg.codebook_size),
+            'num_quantizers': int(self.cfg.num_quantizers),
+            'ema_decay': float(self.cfg.ema_decay),
+            'ema_eps': float(self.cfg.ema_eps),
+            'beta_commit': float(self.cfg.beta_commit),
+            'ld_lambda': float(self.cfg.ld_lambda),
+            'maf_lambda': float(self.cfg.maf_lambda),
+            'ld_window': int(self.cfg.ld_window),
+            'latent_grid_dim': int(self.cfg.latent_grid_dim),
+            'hidden_1d_channels': int(self.cfg.hidden_1d_channels),
+            'hidden_2d_channels': int(self.cfg.hidden_2d_channels),
+            'layers_at_final': int(self.cfg.layers_at_final),
+        }
+
+    def export_construction_metadata(self) -> Dict[str, any]:
+        """Return additional deterministic, derived construction values for exact reproducibility."""
+        return {
+            'c': int(self.c),
+            'k': int(self.k),
+            'target_len': int(self.target_len),
+            'length_after_conv': int(self.length_after_conv),
+            'S': int(self.S),
+            'k2d': int(self.k2d),
+        }
 
     # ---------------------------------------------------------------------
     # Helper methods for encoding
@@ -614,13 +647,11 @@ class SNPVQVAE(nn.Module):
             )
         # Reorder using Morton order along the last dimension
         order = self.order_2d.to(h.device)
-        h_seq = h  # [B,8,L]
-        h_seq = h_seq[..., order]
+        h_seq = h[..., order]
         h2d = h_seq.view(B, C, self.S, self.S)
         mask2d: Optional[torch.Tensor] = None
         if mask is not None:
-            m_seq = mask  # [B,L]
-            m_seq = m_seq[..., order]
+            m_seq = mask[..., order]
             mask2d = m_seq.view(B, self.S, self.S)
         return h2d, mask2d
 
@@ -690,8 +721,8 @@ class SNPVQVAE(nn.Module):
         h2d = z_q_seq.view(B, C, grid_dim, grid_dim)
         # Project from latent_dim to hidden_2d and apply optional final layers
         # Symmetric normalization after dequantization
-        h2d = self.post_quant_norm(h2d)
         h2d = self.post_quant_proj(h2d)
+        h2d = self.post_quant_norm(h2d)
         h2d = self.final2d_decoder(h2d)
         # Upsample via 2D transposed convs; output [B,hidden_1d,S,S]
         h2d_up = self.up2d(h2d)
@@ -773,6 +804,52 @@ class SNPVQVAE(nn.Module):
         logits3 = self.out_head(h1d_up)
         return logits3
 
+    def _quantize_then_decode(
+        self,
+        z_e_seq: torch.Tensor,
+        beta_commit: Optional[float],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[torch.Tensor], List[Dict[str, torch.Tensor]]]:
+        """Absorb VQ into the decoding pathway: quantize, then decode.
+        Args:
+            z_e_seq: [B, latent_dim, T*T] continuous latents from encoder
+            beta_commit: optional override of commitment weight
+        Returns:
+            logits3: [B, 3, L]
+            z_q_seq: [B, latent_dim, T*T] (straight-through quantized)
+            commit_loss: scalar tensor
+            indices_list: list of LongTensors per RVQ level
+            stats_list: list of dicts with 'perplexity', 'usage_hist'
+        """
+        z_q_seq, commit_loss, indices_list, stats_list = self.quantizer(
+            z_e_seq,
+            beta_commit=(self.cfg.beta_commit if beta_commit is None else beta_commit),
+        )
+        logits3 = self.decode_logits(z_q_seq)
+        return logits3, z_q_seq, commit_loss, indices_list, stats_list
+
+    # def forward(
+    #     self, x: torch.Tensor, beta_commit: Optional[float] = None
+    # ) -> Tuple[
+    #     torch.Tensor,
+    #     torch.Tensor,
+    #     torch.Tensor,
+    #     List[torch.Tensor],
+    #     List[Dict[str, torch.Tensor]],
+    #     Optional[torch.Tensor],
+    # ]:
+    #     """Run the full VQ-VAE forward pass: encode, quantise and decode.
+
+    #     Returns a tuple consisting of the reconstructed logits, the
+    #     quantised latent representation, the commitment loss, the list of
+    #     indices per residual quantisation layer, the list of running
+    #     statistics for the quantiser and the token mask (or None).
+    #     """
+    #     z_e_seq, mask_tokens = self.encode_tokens(x)
+    #     z_q_seq, commit_loss, indices_list, stats_list = self.quantizer(
+    #         z_e_seq, beta_commit=(self.cfg.beta_commit if beta_commit is None else beta_commit)
+    #     )
+    #     logits3 = self.decode_logits(z_q_seq)
+    #     return logits3, z_q_seq, commit_loss, indices_list, stats_list, mask_tokens
     def forward(
         self, x: torch.Tensor, beta_commit: Optional[float] = None
     ) -> Tuple[
@@ -783,19 +860,14 @@ class SNPVQVAE(nn.Module):
         List[Dict[str, torch.Tensor]],
         Optional[torch.Tensor],
     ]:
-        """Run the full VQ-VAE forward pass: encode, quantise and decode.
-
-        Returns a tuple consisting of the reconstructed logits, the
-        quantised latent representation, the commitment loss, the list of
-        indices per residual quantisation layer, the list of running
-        statistics for the quantiser and the token mask (or None).
+        """Encode -> decode (VQ inside decoder)
+        Return tuple layout unchanged, but second element is **continuous** latents `z_e_seq`
         """
-        z_e_seq, mask_tokens = self.encode_tokens(x)
-        z_q_seq, commit_loss, indices_list, stats_list = self.quantizer(
-            z_e_seq, beta_commit=(self.cfg.beta_commit if beta_commit is None else beta_commit)
+        z_e_seq, mask_tokens = self.encode_tokens(x)                  # [B, D, T*T]
+        logits3, _z_q_seq, commit_loss, indices_list, stats_list = self._quantize_then_decode(
+            z_e_seq, beta_commit=beta_commit
         )
-        logits3 = self.decode_logits(z_q_seq)
-        return logits3, z_q_seq, commit_loss, indices_list, stats_list, mask_tokens
+        return logits3, z_e_seq, commit_loss, indices_list, stats_list, mask_tokens
 
     def loss_function(
         self,
@@ -844,9 +916,9 @@ class SNPVQVAE(nn.Module):
         # Auxiliary penalties
         aux_maf = torch.tensor(0.0, device=device)
         aux_ld = torch.tensor(0.0, device=device)
+        pi = torch.softmax(logits3, dim=1)
+        x_hat = pi[:, 1, :] + 2.0 * pi[:, 2, :]  # Expected genotype
         if maf_lambda and maf_lambda > 0:
-            pi = torch.softmax(logits3, dim=1)  # [B,3,L]
-            x_hat = pi[:, 1, :] + 2.0 * pi[:, 2, :]  # Expected genotype
             maf_data = x.float().mean(dim=0) / 2.0
             maf_recon = x_hat.mean(dim=0) / 2.0
             aux_maf = maf_lambda * torch.mean(torch.abs(maf_recon - maf_data))
@@ -860,7 +932,7 @@ class SNPVQVAE(nn.Module):
             "aux_maf": aux_maf.detach(),
             "aux_ld": aux_ld.detach(),
         }
-
+    
 
 # ---------------------------------------------------------------------
 # Training & Eval Helpers
@@ -982,7 +1054,18 @@ def train_vqvae(model: SNPVQVAE,
                 num_epochs: int = 10,
                 grad_clip: float = 1.0,
                 scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
-                beta_warmup_steps: int = 0) -> None:
+                beta_warmup_steps: int = 0,
+                val_dataloader: Optional[torch.utils.data.DataLoader] = None,
+                # Early stopping on validation MSE (relative improvement with patience)
+                plateau_min_rel_improve: float = 0.005,
+                plateau_patience: int = 3,
+                plateau_mse_threshold: float = 0.01,
+                # MMD finetuning settings
+                mmd_start_epoch: int = 6,
+                mmd_lambda: float = 1e-4,
+                mmd_warmup_epochs: int = 3,
+                mmd_max_samples: int = 8192,
+               ) -> Dict[str, any]:
     """
     Train the VQ-VAE model on a dataloader. Prints out aggregate
     statistics per epoch.
@@ -1000,52 +1083,279 @@ def train_vqvae(model: SNPVQVAE,
     if device is not None:
         model.to(device)
     model.train()
-    
+
+    @torch.no_grad()
+    def _eval_validation_mse(model_eval: SNPVQVAE, loader: torch.utils.data.DataLoader) -> float:
+        if loader is None:
+            return float('inf')
+        was_training = model_eval.training
+        model_eval.eval()
+        total_mse = 0.0
+        total_count = 0
+        for xb in loader:
+            xb = xb.to(device) if device is not None else xb
+            logits3, _z_e_seq, _commit_loss, _idxs, _stats, _mask_tokens = model_eval(xb)
+            probs = torch.softmax(logits3, dim=1)
+            x_hat = probs[:, 1, :] + 2.0 * probs[:, 2, :]
+            mse = torch.mean((x_hat - xb.float()) ** 2).item()
+            total_mse += mse * xb.size(0)
+            total_count += xb.size(0)
+        if was_training:
+            model_eval.train()
+        return total_mse / max(1, total_count)
+
+    # Helpers for quantizer metrics and RVQ residual energy
+    @torch.no_grad()
+    def _eval_quantizer_metrics(z_e_seq: torch.Tensor):
+        was_training = model.training
+        model.eval()
+        z_q_seq, _commit, _idxs_list, stats_list = model.quantizer(z_e_seq.detach(), beta_commit=0.0)
+        if was_training:
+            model.train()
+        perplexities: List[float] = []
+        util_ratios: List[float] = []
+        dead_counts: List[float] = []
+        for s in stats_list:
+            usage_hist = s["usage_hist"].float()
+            K = usage_hist.numel()
+            used = int((usage_hist > 0).sum().item())
+            dead = K - used
+            util = used / float(K)
+            if "perplexity" in s and torch.is_tensor(s["perplexity"]):
+                perpl = float(s["perplexity"].item())
+            else:
+                p = usage_hist.clamp_min(1e-12)
+                perpl = float(torch.exp(-(p * p.log()).sum()).item())
+            perplexities.append(perpl)
+            util_ratios.append(util)
+            dead_counts.append(float(dead))
+        return z_q_seq, perplexities, util_ratios, dead_counts
+
+    @torch.no_grad()
+    def _rvq_residual_curve(z_e_seq: torch.Tensor):
+        residual = z_e_seq.detach()
+        total_energy = residual.pow(2).mean().item() + 1e-12
+        fractions: List[float] = []
+        for codebook in model.quantizer.levels:
+            was_training = codebook.training
+            codebook.eval()
+            z_q_l, _commit_l, _idx_l, _stats_l = codebook(residual, beta_commit=0.0)
+            if was_training:
+                codebook.train()
+            new_residual = residual - z_q_l
+            captured = (residual.pow(2).mean() - new_residual.pow(2).mean()).item()
+            fractions.append(max(0.0, captured / total_energy))
+            residual = new_residual
+        return fractions
+
+    def _mean_per_level(nested_lists: List[List[float]]) -> List[float]:
+        if not nested_lists:
+            return []
+        level_count = len(nested_lists[0])
+        means: List[float] = []
+        for level_index in range(level_count):
+            values = [batch_values[level_index] for batch_values in nested_lists if len(batch_values) > level_index]
+            means.append(sum(values) / max(len(values), 1))
+        return means
+
     global_step = 0
-    for epoch in range(num_epochs):
-        tot_loss = tot_recon = tot_commit = tot_maf = tot_ld = 0.0
-        tot_n = 0
-        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-        # for batch in dataloader:
-            x = batch
-            x = x.to(device) if device is not None else x
+    best_val_mse = float('inf')
+    best_epoch = 0
+    epochs_without_improve = 0
+    best_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    best_meta: Dict[str, any] = {}
+    # Track the last MMD state to optionally save separately
+    mmd_last_state_dict: Optional[Dict[str, torch.Tensor]] = None
+    mmd_last_meta: Optional[Dict[str, any]] = None
+    for epoch in range(1, int(num_epochs) + 1):
+        total_loss = 0.0
+        total_recon = 0.0
+        total_commit = 0.0
+        total_maf = 0.0
+        total_ld = 0.0
+        total_examples = 0
+
+        epoch_perplexities: List[List[float]] = []
+        epoch_utils: List[List[float]] = []
+        epoch_deads: List[List[float]] = []
+        epoch_rmsgaps: List[float] = []
+        epoch_cossims: List[float] = []
+        epoch_rvq_fracs: List[List[float]] = []
+
+        for batch in dataloader:
+            x = batch.to(device) if device is not None else batch
             optimizer.zero_grad(set_to_none=True)
-            # logits3, z_q_seq, commit_loss, _, _, mask_tokens = model(x)
-            # loss, metrics = model.loss_function(logits3, x, commit_loss, mask_tokens)
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            with torch.autocast(
+                device_type='cuda',
+                dtype=torch.bfloat16,
+                enabled=(device is not None and device.type == 'cuda')
+            ):
                 if beta_warmup_steps and beta_warmup_steps > 0:
                     frac = min(1.0, float(global_step + 1) / float(beta_warmup_steps))
                     beta_now = frac * model.cfg.beta_commit
                 else:
                     beta_now = model.cfg.beta_commit
-                logits3, z_q_seq, commit_loss, _, _, mask_tokens = model(x, beta_commit=beta_now)
+
+                logits3, z_e_seq, commit_loss, _idxs_list, _stats_list, mask_tokens = model(x, beta_commit=beta_now)
                 loss, metrics = model.loss_function(logits3, x, commit_loss, mask_tokens)
+                # Add MMD finetuning loss after first 5 epochs with warmup
+                if epoch >= int(mmd_start_epoch) and mmd_lambda and mmd_lambda > 0.0:
+                    z = z_e_seq.float()
+                    if z.dim() == 4:
+                        Bz, Dz, Hz, Wz = z.shape
+                        Z = z.permute(0, 2, 3, 1).reshape(Bz * Hz * Wz, Dz)
+                    else:
+                        Bz, Dz, Tz = z.shape
+                        Z = z.permute(0, 2, 1).reshape(Bz * Tz, Dz)
+                    # standardize per-dim and compare to N(0,1)
+                    Z_std = (Z - Z.mean(0)) / (Z.std(0) + 1e-12)
+                    Y = torch.randn_like(Z_std)
+                    def _rbf_mmd2(X1: torch.Tensor, X2: torch.Tensor, sigmas=(0.5, 1.0, 2.0)) -> torch.Tensor:
+                        n1 = X1.size(0); n2 = X2.size(0)
+                        if n1 > mmd_max_samples:
+                            idx = torch.randperm(n1, device=X1.device)[:mmd_max_samples]
+                            X1 = X1[idx]; n1 = X1.size(0)
+                        if n2 > mmd_max_samples:
+                            idx = torch.randperm(n2, device=X2.device)[:mmd_max_samples]
+                            X2 = X2[idx]; n2 = X2.size(0)
+                        def _kmat(A, B):
+                            d2 = torch.cdist(A, B, p=2.0) ** 2
+                            K = 0.0
+                            for s in sigmas:
+                                K = K + torch.exp(-d2 / (2.0 * (s ** 2)))
+                            return K
+                        Kxx = _kmat(X1, X1)
+                        Kyy = _kmat(X2, X2)
+                        Kxy = _kmat(X1, X2)
+                        n = X1.size(0)
+                        eye = torch.eye(n, device=Kxx.device, dtype=Kxx.dtype)
+                        sum_Kxx = (Kxx * (1.0 - eye)).sum() / (n * (n - 1) + 1e-12)
+                        nY = X2.size(0)
+                        eyeY = torch.eye(nY, device=Kyy.device, dtype=Kyy.dtype)
+                        sum_Kyy = (Kyy * (1.0 - eyeY)).sum() / (nY * (nY - 1) + 1e-12)
+                        sum_Kxy = Kxy.mean()
+                        return sum_Kxx + sum_Kyy - 2.0 * sum_Kxy
+                    mmd2 = _rbf_mmd2(Z_std, Y)
+                    # Warmup for MMD weight over mmd_warmup_epochs
+                    warm_frac = 1.0
+                    if mmd_warmup_epochs and mmd_warmup_epochs > 0:
+                        warm_frac = min(1.0, float(epoch - int(mmd_start_epoch) + 1) / float(mmd_warmup_epochs))
+                    loss = loss + float(mmd_lambda) * float(warm_frac) * mmd2
+
             loss.backward()
             if grad_clip is not None and grad_clip > 0:
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
             global_step += 1
-            B = x.size(0)
-            tot_n += B
-            tot_loss += loss.item() * B
-            tot_recon += metrics["recon"].item() * B
-            tot_commit += metrics["commit"].item() * B
-            tot_maf += metrics["aux_maf"].item() * B
-            tot_ld += metrics["aux_ld"].item() * B
+
+            batch_size_now = x.size(0)
+            total_examples += batch_size_now
+            total_loss += loss.item() * batch_size_now
+            total_recon += metrics["recon"].item() * batch_size_now
+            total_commit += metrics["commit"].item() * batch_size_now
+            total_maf += metrics["aux_maf"].item() * batch_size_now
+            total_ld += metrics["aux_ld"].item() * batch_size_now
+
+            with torch.no_grad():
+                z_q_seq, perpl, util, dead = _eval_quantizer_metrics(z_e_seq.float())
+                ze_flat = z_e_seq.float().flatten(1)
+                zq_flat = z_q_seq.float().flatten(1)
+                rmsgap = (
+                    (ze_flat - zq_flat).pow(2).mean(dim=1).sqrt() /
+                    (ze_flat.pow(2).mean(dim=1).sqrt() + 1e-12)
+                )
+                cossim = torch.sum(ze_flat * zq_flat, dim=1) / (
+                    ze_flat.norm(dim=1) * zq_flat.norm(dim=1) + 1e-12
+                )
+                rvq_fracs = _rvq_residual_curve(z_e_seq.float())
+
+                epoch_perplexities.append(perpl)
+                epoch_utils.append(util)
+                epoch_deads.append(dead)
+                epoch_rmsgaps.append(float(rmsgap.mean().item()))
+                epoch_cossims.append(float(cossim.mean().item()))
+                epoch_rvq_fracs.append(rvq_fracs)
+
         if scheduler is not None:
             scheduler.step()
-        print(f"Epoch {epoch+1}/{num_epochs}: "
-              f"loss={tot_loss/tot_n:.4f}, recon={tot_recon/tot_n:.4f}, "
-              f"commit={tot_commit/tot_n:.4f}, aux_maf={tot_maf/tot_n:.5f}, "
-              f"aux_ld={tot_ld/tot_n:.5f}, lr={scheduler.get_last_lr()[0]:.6f}, beta={beta_now:.4f}")
-        # Clear GPU cache to free memory between epochs
+
+        # Epoch aggregates
+        perpl_epoch = _mean_per_level(epoch_perplexities)
+        util_epoch = _mean_per_level(epoch_utils)
+        dead_epoch = _mean_per_level(epoch_deads)
+        rvq_epoch = _mean_per_level(epoch_rvq_fracs)
+        rmsgap_epoch = sum(epoch_rmsgaps) / max(len(epoch_rmsgaps), 1)
+        cossim_epoch = sum(epoch_cossims) / max(len(epoch_cossims), 1)
+        lr_value = (
+            scheduler.get_last_lr()[0] if scheduler is not None
+            else optimizer.param_groups[0].get("lr", 0.0)
+        )
+
+        perpl_txt = " | ".join([f"P{li+1}={v:.1f}" for li, v in enumerate(perpl_epoch)])
+        util_txt = " | ".join([f"U{li+1}={v*100:.1f}%" for li, v in enumerate(util_epoch)])
+        dead_txt = " | ".join([f"D{li+1}={int(v)}" for li, v in enumerate(dead_epoch)])
+        rvq_txt = " | ".join([f"R{li+1}={v*100:.1f}%" for li, v in enumerate(rvq_epoch)])
+
+        print(
+            f"Epoch {epoch}/{num_epochs}: "
+            f"loss={total_loss/total_examples:.4f}, recon={total_recon/total_examples:.4f}, "
+            f"commit={total_commit/total_examples:.4f}, aux_maf={total_maf/total_examples:.5f}, aux_ld={total_ld/total_examples:.5f}, "
+            f"beta={beta_now:.4f}, lr={float(lr_value):.6f}\n"
+            f"   Alignment: RMSgap={rmsgap_epoch:.3f}, cos(ze,zq)={cossim_epoch:.3f}\n"
+            f"   Codebook:  {perpl_txt}  ||  {util_txt}  ||  {dead_txt}\n"
+            f"   RVQ energy: {rvq_txt}"
+        )
+
+        # ---- Validation evaluation & early stopping ----
+        val_mse = _eval_validation_mse(model, val_dataloader) if val_dataloader is not None else float('inf')
+        is_first = (epoch == 1)
+        improved = val_mse < best_val_mse * (1.0 - float(plateau_min_rel_improve))
+        if is_first or improved:
+            best_val_mse = val_mse
+            best_epoch = epoch
+            epochs_without_improve = 0
+            # Snapshot best state on CPU to avoid future mutation
+            best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_meta = {
+                'epoch': int(epoch),
+                'val_mse': float(val_mse),
+            }
+        else:
+            epochs_without_improve += 1
+        # If we're already at good MSE and patience hits plateau, stop
+        if best_val_mse <= float(plateau_mse_threshold) and epochs_without_improve >= int(plateau_patience):
+            print(f"Early stopping: no relative improvement >= {plateau_min_rel_improve*100:.2f}% for {plateau_patience} epochs (best val MSE={best_val_mse:.6f}).")
+            # Optionally capture last MMD state if in MMD phase
+            if epoch >= int(mmd_start_epoch):
+                mmd_last_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                mmd_last_meta = {
+                    'epoch': int(epoch),
+                    'val_mse': float(val_mse),
+                }
+            break
+
+        # Track latest MMD-phase model at the end of each epoch once MMD is active
+        if epoch >= int(mmd_start_epoch):
+            mmd_last_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            mmd_last_meta = {
+                'epoch': int(epoch),
+                'val_mse': float(val_mse),
+            }
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             if hasattr(torch.cuda, 'ipc_collect'):
                 torch.cuda.ipc_collect()
+
+    return {
+        'best_state_dict': best_state_dict if best_state_dict is not None else {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+        'best_meta': best_meta if best_meta else {'epoch': int(best_epoch), 'val_mse': float(best_val_mse)},
+        'mmd_state_dict': mmd_last_state_dict,
+        'mmd_meta': mmd_last_meta,
+    }
 
 
 # ---------------------------------------------------------------------

@@ -6,7 +6,7 @@ global:
   chromosome: all
   random_seed: 42
   device: cuda
-  unique_id: unrelWhite_allchr_6PC_64z
+  unique_id: unrelWhite_allchr_512z
   # Optional overrides for PLINK bfile prefix
   bed_file: "${global.data_root}/geneticBinary/ukb_allchr_unrel_britishWhite.bed"
   bim_file: "${global.data_root}/geneticBinary/ukb_allchr_unrel_britishWhite.bim"
@@ -32,10 +32,10 @@ vqvae:
   # Model
   model_save_path: ${global.model_root}/vqvae/VQVAE_${global.unique_id}.pt
   model:
-    latent_dim: 8
+    latent_dim: 4
     codebook_size: 2056
     num_quantizers: 2
-    latent_grid_dim: 256
+    latent_grid_dim: 512
     hidden_channels: 32   #no longer used
     width_mult_per_stage: 1.0
     ema_decay: 0.9
@@ -65,23 +65,24 @@ vqvae:
 
 # Step 2: Diffusion Model Training
 diffusion:
-  train_embed_dataset_path: ${global.data_root}/VQVAE_embeddings/${global.basename}_conditional_diffusion_train_VAE_latents_6PC_64z.pt
+  # Unified VQ-VAE embeddings directory containing batch*_unified.pt
+  train_embed_dataset_path: ${global.data_root}/VQVAE_embeddings/final_embed
   model_output_path: ${global.model_root}/diffusion/DDPM_${global.unique_id}.pth
-  checkpoint_path: ${global.model_root}/diffusion/DDPM_${global.unique_id}_checkpoint.pth
+  checkpoint_path: ${global.model_root}/diffusion/DDPM_${global.unique_id}.pth
 
   encoding:
-    diffusion_train_latents_path: ${global.data_root}/VQVAE_embeddings/${global.basename}_conditional_diffusion_train_VAE_latents_6PC_64z.pt
-    diffusion_val_latents_path:   ${global.data_root}/VQVAE_embeddings/${global.basename}_conditional_diffusion_val_VAE_latents_6PC_64z.pt
+    diffusion_train_latents_path: ${global.data_root}/VQVAE_embeddings/final_embed
+    diffusion_val_latents_path:   ${global.data_root}/VQVAE_embeddings/final_embed
 
   model:
-    input_channels: 64
-    output_channels: 64
+    input_channels: 4
+    output_channels: 4
     time_steps: 1000
-    layers_per_block: 8
+    layers_per_block: 4
 
   training:
-    batch_size: 128
-    num_epochs: 30  # really 50, checkpoint starts at 20
+    batch_size: 16
+    num_epochs: 15
     learning_rate: 5e-5
     ema_decay: 0.9
     num_time_steps: 1000
@@ -122,12 +123,12 @@ generation:
 
 # Pipeline execution control
 pipeline:
-  run_vqvae: true
+  run_vqvae: false
   run_vae_evaluation: false
   run_diffusion_encoding: false
-  run_diffusion: false
+  run_diffusion: true
   run_diffusion_val_encoding: false
-  run_generation: true
+  run_generation: false
   
   # Execution options
   force_rerun: true  # If true, reruns steps even if outputs exist

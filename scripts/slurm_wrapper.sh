@@ -1,11 +1,13 @@
 #!/bin/bash
-#SBATCH -p gpu,gpu_requeue
-#SBATCH --gres=gpu:1
-#SBATCH --mem=300G
+#SBATCH -p hsph_gpu,gpu
+#SBATCH --gres=gpu:4
+#SBATCH --mem=1000G
 #SBATCH -t 3-00:00:00
-#SBATCH -c 8
-#SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_VQVAE_%j.out
-#SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_VQVAE_%j.err
+#SBATCH --ntasks=4
+#SBATCH --cpus-per-task=1
+#SBATCH --gpus-per-task=1
+#SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_condDiff_regVQVAE_%j.out
+#SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_condDiff_regVQVAE_%j.err
 
 conda init
 eval "$(conda shell.bash hook)"
@@ -15,11 +17,11 @@ module load cudnn/9.5.1.17_cuda12-fasrc01
 module load R gcc cmake
 nvidia-smi
 
-export OMP_NUM_THREADS=2
+export OMP_NUM_THREADS=1
 export MKL_INTERFACE_LAYER=GNU,LP64
 export MKL_THREADING_LAYER=GNU
 export MKL_DYNAMIC=TRUE
-export MKL_NUM_THREADS=2
+export MKL_NUM_THREADS=1
 
 yaml_file=$1
 

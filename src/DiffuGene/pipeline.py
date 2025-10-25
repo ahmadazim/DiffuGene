@@ -27,6 +27,7 @@ os.environ.setdefault('PYTHONWARNINGS', 'ignore')
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import socket
 
 import numpy as np
 import warnings
@@ -39,6 +40,21 @@ from .VAEembed.latentAlloc_MILP import solve_quadtree_milp, organize_quadtree_so
 
 
 logger = get_logger(__name__)
+
+def _find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+def _ddp_worker(rank, world_size, master_port, train_args):
+    # Minimal env that torch.distributed expects (init_method="env://")
+    os.environ["MASTER_ADDR"]  = "127.0.0.1"
+    os.environ["MASTER_PORT"]  = str(master_port)
+    os.environ["RANK"]         = str(rank)
+    os.environ["WORLD_SIZE"]   = str(world_size)
+    os.environ["LOCAL_RANK"]   = str(rank)
+    from .diffusion.train import train as diffusion_train
+    diffusion_train(**train_args)
 
 def check_for_batch_files(base_path: str) -> bool:
     if os.path.exists(base_path):
@@ -288,9 +304,10 @@ class DiffuGenePipeline:
         training_data = self.config.get('training_data', {})
         evaluation_data = self.config.get('evaluation_data', {})
         
-        # Get the default fam file path
+        # Get the default fam file path without relying on data_prep section
+        genetic_binary_folder = os.path.join(self.config['global']['data_root'], 'geneticBinary')
         default_fam = os.path.join(
-            self.config['data_prep']['genetic_binary_folder'],
+            genetic_binary_folder,
             f"{self.config['global']['basename']}.fam"
         )
         
@@ -713,7 +730,6 @@ class DiffuGenePipeline:
                     'global': self.config['global'],
                     'joint_embed': self.config['joint_embed'],
                     'block_embed': self.config['block_embed'],
-                    'data_prep': self.config['data_prep'],
                     'generation': gen_config
                 }
                 expanded_config = expand_variables(temp_config)
@@ -1334,6 +1350,33 @@ class DiffuGenePipeline:
             # Use VAE training latents
             train_embed_dataset_path = self.config['diffusion']['train_embed_dataset_path']
             logger.info(f"Using VAE training latents: {train_embed_dataset_path}")
+
+        # If a directory to unified VQ-VAE batches is provided, consolidate to memmap for train.py
+        try:
+            if os.path.isdir(train_embed_dataset_path):
+                unified_dir = train_embed_dataset_path
+                pattern = os.path.join(unified_dir, 'batch*_unified.pt')
+                batch_files = sorted(glob.glob(pattern))
+                if not batch_files:
+                    # Also support per-chromosome subfolders if present in future
+                    alt_pattern = os.path.join(unified_dir, '**', 'batch*_unified.pt')
+                    batch_files = sorted(glob.glob(alt_pattern, recursive=True))
+                if not batch_files:
+                    raise RuntimeError(f"No unified batch files found under {unified_dir} (expected batch*_unified.pt)")
+
+                # Build memmap path next to the unified directory
+                memmap_path = os.path.join(
+                    unified_dir,
+                    f"{self.config['global']['basename']}_{self.config['global']['unique_id']}_memmap.npy"
+                )
+                from .diffusion.train import create_memmap_from_batches
+                logger.info(f"Consolidating {len(batch_files)} unified batches into memmap: {memmap_path}")
+                total_samples, full_shape = create_memmap_from_batches(batch_files, memmap_path)
+                logger.info(f"Memmap ready with {total_samples} samples and shape {full_shape}")
+                train_embed_dataset_path = memmap_path
+        except Exception as e:
+            logger.error(f"Failed to prepare memmap from unified embeddings at {train_embed_dataset_path}: {e}")
+            raise
         
         # Import and run diffusion training
         from .diffusion.train import train as diffusion_train
@@ -1383,7 +1426,21 @@ class DiffuGenePipeline:
             logger.info("Training unconditional diffusion model")
             train_args['conditional'] = False
         
-        diffusion_train(**train_args)
+        n_gpus = torch.cuda.device_count()
+        use_ddp = (n_gpus >= 2)
+
+        if use_ddp:
+            world_size = n_gpus
+            port = _find_free_port()
+            logger.info(f"Launching DDP via mp.spawn: world_size={world_size}, port={port}")
+            mp.spawn(
+                _ddp_worker,
+                args=(world_size, port, train_args),
+                nprocs=world_size,
+                join=True
+            )
+        else:
+            diffusion_train(**train_args)
         
         logger.info("Diffusion training completed successfully")
     
@@ -1600,7 +1657,9 @@ class DiffuGenePipeline:
                 logger.warning(f"Skipping latent histogram due to error: {e}")
 
         # 2-4) Decoded visualizations using decoded file (consolidated or first batch)
-        decoded_dir = gen_cfg['decoded_output_dir']
+        decoded_dir = gen_cfg.get('decoded_output_dir')
+        if not decoded_dir:
+            return
         decoded_pngs = [
             os.path.join(decoded_dir, 'ld_heatmaps.png'),
             os.path.join(decoded_dir, 'af_and_variance.png'),
@@ -1624,8 +1683,9 @@ class DiffuGenePipeline:
                     return
 
             spans_file = self.get_spans_file_path('vae')
-            recoded_dir = expanded_config['data_prep']['recoded_block_folder']
-            if not os.path.exists(spans_file) or not os.path.exists(recoded_dir):
+            # If spans or recoded_dir missing, skip silently
+            recoded_dir = expanded_config.get('data_prep', {}).get('recoded_block_folder')
+            if not os.path.exists(spans_file) or not recoded_dir or not os.path.exists(recoded_dir):
                 logger.info("Spans or recoded_dir missing; skipping decoded visualizations.")
                 return
 

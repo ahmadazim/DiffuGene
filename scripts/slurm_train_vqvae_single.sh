@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -p gpu,gpu_requeue
+#SBATCH -p hsph_gpu
 #SBATCH --gres=gpu:1
 #SBATCH --mem=20G
 #SBATCH -t 2-00:00:00
@@ -25,5 +25,4 @@ export MKL_NUM_THREADS=8
 
 # This wrapper expects to receive python -m DiffuGene.VAEembed.train_vqvae ... arguments
 python -m DiffuGene.VAEembed.train_vqvae "$@"
-
 

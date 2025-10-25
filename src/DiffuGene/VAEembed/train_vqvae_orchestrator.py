@@ -6,6 +6,8 @@ import subprocess
 from typing import List, Dict, Tuple
 
 import numpy as np
+import json
+import csv
 
 # Support both package and script execution
 try:
@@ -42,6 +44,7 @@ def compute_variant_counts_per_chromosome(bim_file: str, chromosomes: List[int])
 def build_training_command(
     h5_dir: str,
     bim_file: str,
+    val_h5_dir: str,
     chromosome: int,
     latent_grid_dim: int,
     model_out_path: str,
@@ -60,12 +63,23 @@ def build_training_command(
     batch_size: int,
     lr: float,
     device: str,
+    grad_clip: float,
+    beta_warmup_steps: int,
+    # Early stop & MMD knobs forwarded
+    plateau_min_rel_improve: float,
+    plateau_patience: int,
+    plateau_mse_threshold: float,
+    mmd_start_epoch: int,
+    mmd_lambda: float,
+    mmd_warmup_epochs: int,
+    mmd_max_samples: int,
 ) -> List[str]:
     # Use module invocation so PYTHONPATH resolves correctly
     cmd = [
         sys.executable, "-m", "DiffuGene.VAEembed.train_vqvae",
         "--h5-dir", h5_dir,
         "--bim", bim_file,
+        "--val-h5-dir", val_h5_dir,
         "--chromosome", str(int(chromosome)),
         "--save-path", model_out_path,
         "--latent-dim", str(int(latent_dim)),
@@ -84,6 +98,15 @@ def build_training_command(
         "--batch-size", str(int(batch_size)),
         "--lr", str(float(lr)),
         "--device", device,
+        "--grad-clip", str(float(grad_clip)),
+        "--beta-warmup-steps", str(int(beta_warmup_steps)),
+        "--plateau-min-rel-improve", str(float(plateau_min_rel_improve)),
+        "--plateau-patience", str(int(plateau_patience)),
+        "--plateau-mse-threshold", str(float(plateau_mse_threshold)),
+        "--mmd-start-epoch", str(int(mmd_start_epoch)),
+        "--mmd-lambda", str(float(mmd_lambda)),
+        "--mmd-warmup-epochs", str(int(mmd_warmup_epochs)),
+        "--mmd-max-samples", str(int(mmd_max_samples)),
     ]
     return cmd
 
@@ -93,6 +116,7 @@ def main():
     p.add_argument("--h5-dir", required=True, help="H5 cache directory root (with chr*/batch*.h5)")
     p.add_argument("--bim", required=True, help="BIM file for counting variants per chromosome")
     p.add_argument("--output-dir", required=True, help="Directory to save per-chromosome models")
+    p.add_argument("--val-h5-dir", required=True, help="Validation H5 cache root (chr*/batch*.h5)")
     p.add_argument("--chromosomes", nargs='+', type=str, default=["all"], help="Chromosomes to process or 'all'")
     p.add_argument("--total-grid-size", type=int, default=64, help="Total latent grid side (M) for MILP allocation")
     # Model/training hyperparameters
@@ -111,6 +135,16 @@ def main():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--beta-warmup-steps", type=int, default=100)
+    # Mirror early stop & MMD defaults
+    p.add_argument("--plateau-min-rel-improve", type=float, default=0.005)
+    p.add_argument("--plateau-patience", type=int, default=3)
+    p.add_argument("--plateau-mse-threshold", type=float, default=0.01)
+    p.add_argument("--mmd-start-epoch", type=int, default=6)
+    p.add_argument("--mmd-lambda", type=float, default=1e-4)
+    p.add_argument("--mmd-warmup-epochs", type=int, default=3)
+    p.add_argument("--mmd-max-samples", type=int, default=8192)
     # Execution
     p.add_argument("--use-slurm", action='store_true', help="Submit SLURM jobs instead of running locally")
     p.add_argument("--slurm-script", type=str, default=None, help="Path to SLURM wrapper script; defaults to bundled script")
@@ -134,11 +168,74 @@ def main():
     weights = [counts[c] for c in chromosomes]
     logger.info(f"Variant counts per chromosome: {counts}")
 
-    # 2) Solve MILP for tile allocation on total grid size M
-    logger.info(f"Solving MILP for M={args.total_grid_size} with N={len(chromosomes)}")
-    result = solve_quadtree_milp(weights, M=int(args.total_grid_size))
-    placements = organize_quadtree_solution(result)  # index -> (side, x0, y0, M_eff)
-    logger.info(f"MILP solution: {placements}")
+    # 2) Load existing MILP layout if present; otherwise solve and persist
+    json_path = os.path.join(args.output_dir, "vqvae_milp_layout.json")
+    placements = None
+    used_existing = False
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r") as jf:
+                layout_summary = json.load(jf)
+            layout_list = layout_summary.get("layout", [])
+            # Map chromosome -> (side, x0, y0, M_eff)
+            chr_to_place = {int(rec["chromosome"]): (int(rec.get("tile_side", rec.get("latent_grid_dim", 0))),
+                                                      int(rec.get("x0", 0)),
+                                                      int(rec.get("y0", 0)),
+                                                      int(rec.get("grid_M", layout_summary.get("grid_M", args.total_grid_size))))
+                             for rec in layout_list}
+            # Build placements aligned to requested chromosomes
+            missing = [c for c in chromosomes if c not in chr_to_place]
+            if not missing:
+                placements = [chr_to_place[c] for c in chromosomes]
+                used_existing = True
+                logger.info(f"Loaded existing MILP layout from {json_path}")
+            else:
+                logger.info(f"Existing MILP layout missing chromosomes {missing}; will solve anew.")
+        except Exception as e:
+            logger.warning(f"Failed to load existing MILP layout at {json_path}: {e}; will solve anew.")
+
+    if not used_existing:
+        logger.info(f"Solving MILP for M={args.total_grid_size} with N={len(chromosomes)}")
+        result = solve_quadtree_milp(weights, M=int(args.total_grid_size))
+        placements = organize_quadtree_solution(result)  # index -> (side, x0, y0, M_eff)
+        logger.info(f"MILP solution: {placements}")
+
+        # Persist MILP layout so downstream encode/decode can reuse without re-solving
+        try:
+            layout_records = []
+            for idx, c in enumerate(chromosomes):
+                side, x0, y0, M_eff = placements[idx]
+                model_out = os.path.join(args.output_dir, f"vqvae_chr{c}.pt")
+                layout_records.append({
+                    "chromosome": int(c),
+                    "latent_grid_dim": int(side),
+                    "tile_side": int(side),
+                    "x0": int(x0),
+                    "y0": int(y0),
+                    "grid_M": int(M_eff),
+                    "model_file": model_out,
+                })
+            layout_summary = {
+                "solver_status": result.get("status"),
+                "objective": float(result.get("objective", 0.0)),
+                "grid_M": int(result.get("M_eff", args.total_grid_size)),
+                "chromosomes": [int(c) for c in chromosomes],
+                "layout": layout_records,
+            }
+            with open(json_path, "w") as jf:
+                json.dump(layout_summary, jf, indent=2)
+            logger.info(f"Saved MILP layout JSON: {json_path}")
+            csv_path = os.path.join(args.output_dir, "vqvae_milp_layout.csv")
+            with open(csv_path, "w", newline="") as cf:
+                writer = csv.DictWriter(cf, fieldnames=[
+                    "chromosome", "latent_grid_dim", "tile_side", "x0", "y0", "grid_M", "model_file"
+                ])
+                writer.writeheader()
+                for rec in layout_records:
+                    writer.writerow(rec)
+            logger.info(f"Saved MILP layout CSV: {csv_path}")
+        except Exception as e:
+            logger.warning(f"Failed to persist MILP layout: {e}")
 
     # 3) Build training plans
     job_specs: List[Tuple[int, int, str, List[str]]] = []
@@ -152,6 +249,7 @@ def main():
         cmd = build_training_command(
             h5_dir=args.h5_dir,
             bim_file=args.bim,
+            val_h5_dir=args.val_h5_dir,
             chromosome=c,
             latent_grid_dim=int(side),
             model_out_path=model_out,
@@ -170,6 +268,15 @@ def main():
             batch_size=args.batch_size,
             lr=args.lr,
             device=args.device,
+            grad_clip=args.grad_clip,
+            beta_warmup_steps=args.beta_warmup_steps,
+            plateau_min_rel_improve=args.plateau_min_rel_improve,
+            plateau_patience=args.plateau_patience,
+            plateau_mse_threshold=args.plateau_mse_threshold,
+            mmd_start_epoch=args.mmd_start_epoch,
+            mmd_lambda=args.mmd_lambda,
+            mmd_warmup_epochs=args.mmd_warmup_epochs,
+            mmd_max_samples=args.mmd_max_samples,
         )
         job_specs.append((c, int(side), model_out, cmd))
 
@@ -204,14 +311,38 @@ if __name__ == "__main__":
 #   --h5-dir /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/genomic_data/vqvae_h5_cache \
 #   --bim /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/genomic_data/geneticBinary/ukb_allchr_unrel_britishWhite.bim \
 #   --output-dir /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/models/vqvae \
-#   --chromosomes s \
+#   --chromosomes all \
 #   --total-grid-size 256 \
 #   --latent-dim 8 \
-#   --codebook-size 1024 \
+#   --codebook-size 128 \
 #   --num-quantizers 2 \
-#   --beta-commit 0.25 \
+#   --beta-commit 0.5 \
 #   --hidden-1d-channels 8 \
 #   --hidden-2d-channels 32 \
+#   --layers-at-final 2 \
+#   --ema-decay 0.9 \
+#   --ld-lambda 1e-3 \
+#   --maf-lambda 1e-3 \
+#   --ld-window 128 \
+#   --epochs 50 \
+#   --batch-size 256 \
+#   --lr 5e-3 \
+#   --device cuda \
+#   --use-slurm \
+#   --slurm-script /n/home03/ahmadazim/WORKING/genGen/DiffuGene/scripts/slurm_train_vqvae_single.sh
+
+# python train_vqvae_orchestrator.py \
+#   --h5-dir /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/genomic_data/vqvae_h5_cache \
+#   --bim /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/genomic_data/geneticBinary/ukb_allchr_unrel_britishWhite.bim \
+#   --output-dir /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/models/vqvae512 \
+#   --chromosomes all \
+#   --total-grid-size 512 \
+#   --latent-dim 4 \
+#   --codebook-size 128 \
+#   --num-quantizers 2 \
+#   --beta-commit 0.5 \
+#   --hidden-1d-channels 8 \
+#   --hidden-2d-channels 16 \
 #   --layers-at-final 2 \
 #   --ema-decay 0.9 \
 #   --ld-lambda 1e-3 \

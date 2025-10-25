@@ -669,7 +669,8 @@ def generate(args):
         beta_end=0.02, 
         clip_sample=True, 
         clip_sample_range=50,
-        prediction_type="epsilon"
+        # prediction_type="epsilon"
+        prediction_type="v_prediction"
     )
     scheduler.set_timesteps(args.num_inference_steps, device="cuda")
 
