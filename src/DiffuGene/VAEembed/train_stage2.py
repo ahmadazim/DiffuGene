@@ -17,17 +17,27 @@ from torch.utils.data import DataLoader
 
 # Support both package and script execution
 try:
-    from DiffuGene.VAEembed.vae import GenotypeAutoencoder, VAEConfig
+    from DiffuGene.VAEembed.ae import GenotypeAutoencoder, VAEConfig
     from DiffuGene.VAEembed.train import H5ChromosomeDataset
-    from DiffuGene.VAEembed.sharedEmbed import HomogenizedAE, FiLM2D
+    from DiffuGene.VAEembed.sharedEmbed import (
+        FiLM2D,
+        HomogenizedAE,
+        Stage2PenaltyConfig,
+        compute_shared_head_penalties,
+    )
 except Exception:
     this_dir = os.path.dirname(__file__)
     src_root = os.path.abspath(os.path.join(this_dir, "..", "..", "..", ".."))
     if src_root not in sys.path:
         sys.path.insert(0, src_root)
-    from DiffuGene.VAEembed.vae import GenotypeAutoencoder, VAEConfig
+    from DiffuGene.VAEembed.ae import GenotypeAutoencoder, VAEConfig
     from DiffuGene.VAEembed.train import H5ChromosomeDataset
-    from DiffuGene.VAEembed.sharedEmbed import HomogenizedAE, FiLM2D
+    from DiffuGene.VAEembed.sharedEmbed import (
+        FiLM2D,
+        HomogenizedAE,
+        Stage2PenaltyConfig,
+        compute_shared_head_penalties,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight-decay', type=float, default=1e-2)
     parser.add_argument('--latent-loss-weight', type=float, default=0.05, help='Weight for latent MSE penalty (homogenized vs original)')
+    parser.add_argument('--tv-lambda', type=float, default=2e-2, help='Total-variation weight on shared latent tiles')
+    parser.add_argument('--robust-lambda', type=float, default=100.0, help='Weight for latent robustness penalty with additive noise')
+    parser.add_argument('--stable-lambda', type=float, default=3e-1, help='Weight for latent stability penalty (noise before shared encode head)')
+    parser.add_argument('--latent-noise-std', type=float, default=0.05, help='Noise std for robust latent perturbations')
+    parser.add_argument('--embed-noise-std', type=float, default=0.03, help='Noise std applied to pre-shared latents for stability')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--val-h5-dir', type=str, required=True, help='Root directory for H5 validation data')
     parser.add_argument('--num-workers', type=int, default=4)
@@ -238,7 +253,8 @@ def train_one_epoch(
     steps_per_epoch: int,
     device: torch.device,
     args: argparse.Namespace,
-) -> Tuple[float, float, float, int]:
+    penalty_cfg: Stage2PenaltyConfig,
+) -> Tuple[float, float, float, float, float, float, float, int]:
     model.train()
     iterator = build_epoch_iterator(train_loaders)
     optimizer.zero_grad(set_to_none=True)
@@ -246,6 +262,10 @@ def train_one_epoch(
     total_loss = 0.0
     total_ce = 0.0
     total_latent = 0.0
+    total_tv = 0.0
+    total_robust = 0.0
+    total_stable = 0.0
+    total_stable_norm = 0.0
     total_steps = 0
 
     for _ in range(steps_per_epoch):
@@ -266,7 +286,15 @@ def train_one_epoch(
             logits = ae.decode(z_dec)
             ce_loss = F.cross_entropy(logits, batch.long())
             latent_loss = F.mse_loss(z_hom, z_orig)
-            loss = ce_loss + args.latent_loss_weight * latent_loss
+            stage2_loss, penalty_metrics = compute_shared_head_penalties(
+                ae=ae,
+                shared_forward=lambda latent: model(latent, chrom_embed_idx),
+                z_input=z_orig,
+                z_dec=z_dec,
+                x_batch=batch,
+                penalty_cfg=penalty_cfg,
+            )
+            loss = ce_loss + args.latent_loss_weight * latent_loss + stage2_loss
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -276,9 +304,22 @@ def train_one_epoch(
         total_loss += float(loss.detach().item())
         total_ce += float(ce_loss.detach().item())
         total_latent += float(latent_loss.detach().item())
+        total_tv += float(penalty_metrics["tv"].item())
+        total_robust += float(penalty_metrics["robust"].item())
+        total_stable += float(penalty_metrics["stable"].item())
+        total_stable_norm += float(penalty_metrics["stable_norm"].item())
         total_steps += 1
 
-    return total_loss, total_ce, total_latent, total_steps
+    return (
+        total_loss,
+        total_ce,
+        total_latent,
+        total_tv,
+        total_robust,
+        total_stable,
+        total_stable_norm,
+        total_steps,
+    )
 
 
 @torch.no_grad()
@@ -369,6 +410,11 @@ def save_homogenized_models(
                     'lr': float(args.lr),
                     'weight_decay': float(args.weight_decay),
                     'latent_loss_weight': float(args.latent_loss_weight),
+                    'tv_lambda': float(args.tv_lambda),
+                    'robust_lambda': float(args.robust_lambda),
+                    'stable_lambda': float(args.stable_lambda),
+                    'latent_noise_std': float(args.latent_noise_std),
+                    'embed_noise_std': float(args.embed_noise_std),
                     'timestamp': timestamp,
                 },
             },
@@ -407,6 +453,14 @@ def main():
 
     seed = args.seed + rank
     set_random_seed(seed)
+
+    penalty_cfg = Stage2PenaltyConfig(
+        tv_lambda=float(args.tv_lambda),
+        robust_lambda=float(args.robust_lambda),
+        stable_lambda=float(args.stable_lambda),
+        latent_noise_std=float(args.latent_noise_std),
+        embed_noise_std=float(args.embed_noise_std),
+    )
 
     chromosomes = resolve_chromosomes(args.chromosomes)
     if world_size > len(chromosomes):
@@ -496,6 +550,17 @@ def main():
             print(f"[Setup] Loaded shared heads initialization from {initial_heads_path}")
         else:
             print("[Setup] No existing homogenized checkpoints found; initializing shared heads from scratch.")
+        if penalty_cfg.is_active():
+            print(
+                "[Setup] Stage-2 penalties active: "
+                f"tv_lambda={penalty_cfg.tv_lambda:.3e}, "
+                f"robust_lambda={penalty_cfg.robust_lambda:.3e}, "
+                f"stable_lambda={penalty_cfg.stable_lambda:.3e}, "
+                f"latent_noise_std={penalty_cfg.latent_noise_std:.3f}, "
+                f"embed_noise_std={penalty_cfg.embed_noise_std:.3f}"
+            )
+        else:
+            print("[Setup] Stage-2 penalties disabled (all lambdas set to 0).")
 
     if main_process:
         print(
@@ -505,7 +570,16 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         # print(f"[Epoch {epoch}] Training on {len(local_chromosomes)} chromosomes")
-        train_loss, train_ce, train_lat, train_steps = train_one_epoch(
+        (
+            train_loss,
+            train_ce,
+            train_lat,
+            train_tv,
+            train_robust,
+            train_stable,
+            train_stable_norm,
+            train_steps,
+        ) = train_one_epoch(
             shared_heads,
             optimizer,
             scaler,
@@ -515,18 +589,32 @@ def main():
             steps_per_epoch,
             device,
             args,
+            penalty_cfg,
         )
 
         train_tensor = torch.tensor(
-            [train_loss, train_ce, train_lat, float(train_steps)],
+            [
+                train_loss,
+                train_ce,
+                train_lat,
+                train_tv,
+                train_robust,
+                train_stable,
+                train_stable_norm,
+                float(train_steps),
+            ],
             device=device,
             dtype=torch.float64,
         )
         train_tensor = reduce_tensor(train_tensor, op=dist.ReduceOp.SUM)
-        global_steps = max(1.0, train_tensor[3].item())
+        global_steps = max(1.0, train_tensor[7].item())
         mean_train_loss = train_tensor[0].item() / global_steps
         mean_train_ce = train_tensor[1].item() / global_steps
         mean_train_lat = train_tensor[2].item() / global_steps
+        mean_train_tv = train_tensor[3].item() / global_steps
+        mean_train_robust = train_tensor[4].item() / global_steps
+        mean_train_stable = train_tensor[5].item() / global_steps
+        mean_train_stable_norm = train_tensor[6].item() / global_steps
 
         val_ce_sum, val_correct_sum, val_sites_sum = validate(
             shared_heads,
@@ -548,11 +636,22 @@ def main():
         mean_val_acc = val_tensor[1].item() / total_sites
 
         if main_process:
-            print(
-                f"[Epoch {epoch}/{args.epochs}] steps={int(global_steps)} | "
-                f"train_loss={mean_train_loss:.6f} | train_ce={mean_train_ce:.6f} | "
-                f"train_lat={mean_train_lat:.6f}"
-            )
+            log_parts = [
+                f"[Epoch {epoch}/{args.epochs}] steps={int(global_steps)}",
+                f"train_loss={mean_train_loss:.6f}",
+                f"train_ce={mean_train_ce:.6f}",
+                f"train_lat={mean_train_lat:.6f}",
+            ]
+            if penalty_cfg.is_active():
+                log_parts.extend(
+                    [
+                        f"train_tv={mean_train_tv:.6e}",
+                        f"train_robust={mean_train_robust:.6e}",
+                        f"train_stable={mean_train_stable:.6e}",
+                        f"train_stable_norm={mean_train_stable_norm:.6e}",
+                    ]
+                )
+            print(" | ".join(log_parts))
             print(
                 f"[Val][Epoch {epoch}] mean_ce={mean_val_ce:.6f} | mean_acc={mean_val_acc:.6f}"
             )

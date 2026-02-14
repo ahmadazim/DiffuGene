@@ -1,13 +1,12 @@
 #!/bin/bash
-#SBATCH -p hsph_gpu,gpu
+#SBATCH -p hsph_gpu,gpu_h200,gpu
 #SBATCH --gres=gpu:4
-#SBATCH --mem=1000G
+#SBATCH --mem=600G
 #SBATCH -t 3-00:00:00
-#SBATCH --ntasks=4
-#SBATCH --cpus-per-task=1
-#SBATCH --gpus-per-task=1
-#SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_condDiff_regVQVAE_%j.out
-#SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_pipeline_UKB_condDiff_regVQVAE_%j.err
+#SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/train_diffusion_AE128z_%j.out
+#SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/train_diffusion_AE128z_%j.err
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
 
 conda init
 eval "$(conda shell.bash hook)"

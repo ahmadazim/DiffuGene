@@ -66,8 +66,6 @@ def local_ld_penalty(x_data: torch.Tensor, x_hat: torch.Tensor, window: int = 12
     return total / max(num, 1)
 
 
-
-
 def pixel_unshuffle_1d(x: torch.Tensor, factor: int = 2) -> torch.Tensor:
     """1D pixel-unshuffle: (B,C,L) → (B,C*factor,L//factor). factor must divide L."""
     B, C, L = x.shape
@@ -260,6 +258,11 @@ class GenotypeAutoencoder(nn.Module):
         # Store base-space parameters
         self.input_length = int(input_length)
         self.embed_dim = int(embed_dim)
+        
+        # Enable DC-AE 1.5 style structured latent space
+        self.enable_structured_latent: bool = True
+        self._last_masked_channels: int = int(C)
+
         def _log2_int(n: int, name: str) -> int:
             if n <= 0 or (n & (n - 1)) != 0:
                 raise ValueError(f"{name} must be a positive power of two, got {n}")
@@ -364,6 +367,56 @@ class GenotypeAutoencoder(nn.Module):
         
         # Final projection to logits over three genotype states
         self.out_proj = nn.Conv1d(self.embed_dim, 3, kernel_size=1, bias=True)
+
+    def _sample_latent_channel_mask(
+        self, device: torch.device
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Sample a channel-wise mask 
+            mask_{c,c'} = (1,...,1,0,...,0) with c' ∈ {16,20,24,...,c}.
+        Same mask is shared across the batch for a training step.
+        Returns:
+            mask: (1, C, 1, 1) float tensor in {0,1}
+            c_prime: number of active channels (front channels kept)
+        """
+        C = int(self.latent_channels)
+
+        if (not getattr(self, "enable_structured_latent", False)) or C <= 0 or C < 16:
+            mask = torch.ones(1, C, 1, 1, device=device)
+            return mask, C
+
+        # Valid active-channel choices: {16, 20, 24, ..., C}
+        max_c = C
+        c_values = list(range(16, max_c + 1, 4))
+        if len(c_values) == 0:
+            mask = torch.ones(1, C, 1, 1, device=device)
+            return mask, C
+
+        # Sample c' uniformly 
+        idx = torch.randint(len(c_values), (1,), device=device).item()
+        c_prime = int(c_values[idx])
+
+        mask = torch.zeros(1, C, 1, 1, device=device)
+        mask[:, :c_prime, :, :] = 1.0
+        return mask, c_prime
+
+    def decode_with_latent_mask(
+        self,
+        z: torch.Tensor,
+        *,
+        enable_masking: bool = True,
+    ) -> torch.Tensor:
+        """
+        Decode with channel-wise masking.
+        During eval / inference, we typically keep enable_masking=False
+        and use all channels.
+        """
+        if (not self.training) or (not enable_masking):
+            return self.decode(z)
+        mask, c_prime = self._sample_latent_channel_mask(z.device)
+        self._last_masked_channels = int(c_prime)
+        z_masked = z * mask
+        return self.decode(z_masked)
 
     def _prepare_input(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Embed integer genotypes and pad/compress to target_len; return (h, mask)."""
@@ -627,7 +680,14 @@ def train_vae(
                 dtype=torch.bfloat16 if (autocast_device == "cuda") else torch.float32,
                 enabled=(autocast_device == "cuda" and (device is not None and device.type == "cuda")),
             ):
-                logits, _z = model(xb)
+                logits_full, z = model(xb)
+                if hasattr(model, "decode_with_latent_mask") and getattr(
+                    model, "enable_structured_latent", False
+                ):
+                    logits = model.decode_with_latent_mask(z, enable_masking=True)
+                else:
+                    logits = logits_full
+
                 loss, metrics = model.loss_function(
                     logits, xb, None, maf_lambda=maf_lambda, ld_lambda=ld_lambda, ld_window=ld_window
                 )
@@ -668,7 +728,11 @@ def train_vae(
         )
 
         # Validation + early stopping
-        val_mse = _eval_validation_mse(model, val_dataloader) if val_dataloader is not None else float("inf")
+        if val_dataloader is not None:
+            val_mse = _eval_validation_mse(model, val_dataloader)
+            logger.info(f"Epoch {epoch}/{num_epochs}: val_mse={val_mse:.6f}")
+        else:
+            val_mse = float("inf")
         first = (epoch == 1)
         improved = val_mse < best_val_mse * (1.0 - float(plateau_min_rel_improve))
         if first or improved:

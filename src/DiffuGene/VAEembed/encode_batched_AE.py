@@ -17,7 +17,7 @@ src_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
 if src_root not in sys.path:
     sys.path.insert(0, src_root)
 
-from DiffuGene.VAEembed.vae import GenotypeAutoencoder, VAEConfig
+from DiffuGene.VAEembed.ae import GenotypeAutoencoder, VAEConfig
 from DiffuGene.VAEembed.sharedEmbed import FiLM2D
 from DiffuGene.utils import ensure_dir_exists
 from DiffuGene.utils.file_utils import read_bim_file
@@ -210,12 +210,31 @@ class HomogenizedChromosomeEncoder:
             raise KeyError(f"Checkpoint {model_path} missing 'model_state'")
 
         meta = payload.get('meta', {})
-        cfg_dict = meta.get('config') if isinstance(meta, dict) else None
+        cfg_dict = None
+        if isinstance(meta, dict):
+            cfg_dict = meta.get('config')
         if cfg_dict is None:
-            raise KeyError(f"Checkpoint {model_path} missing meta['config'] for AE reconstruction")
+            cfg_dict = payload.get('config')
+        if cfg_dict is None:
+            raise KeyError(
+                f"Checkpoint {model_path} missing configuration metadata ('config' not found)."
+            )
 
         cfg = VAEConfig(**cfg_dict)
         self.cfg = cfg
+
+        self.stage2_meta = meta.get('stage2') if isinstance(meta, dict) else None
+        if self.stage2_meta is not None:
+            best_epoch = self.stage2_meta.get('best_epoch', 'n/a')
+            print(
+                f"[ENC-AE] Loaded homogenized heads for chr{self.chrom_no} "
+                f"(stage2 best_epoch={best_epoch})"
+            )
+        else:
+            print(
+                f"[ENC-AE] Warning: homogenized checkpoint {model_path} lacks stage2 metadata; "
+                "proceeding without additional context."
+            )
 
         self.ae = GenotypeAutoencoder(
             input_length=cfg.input_length,
@@ -245,8 +264,9 @@ class HomogenizedChromosomeEncoder:
         for p in self.encode_head.parameters():
             p.requires_grad = False
 
-        amp_on_cuda = bool(device.type == 'cuda' and cuda_autocast is not None)
-        self.amp_enabled = bool(use_amp and amp_on_cuda)
+        self.amp_enabled = bool(
+            use_amp and device.type == 'cuda' and cuda_autocast is not None
+        )
 
     @property
     def latent_shape(self) -> Tuple[int, int, int]:
@@ -254,15 +274,19 @@ class HomogenizedChromosomeEncoder:
 
     def encode_batch(self, batch_cpu: torch.Tensor) -> torch.Tensor:
         """Encode a CPU batch (B, L) into homogenized latents on CPU."""
-        x_dev = batch_cpu.to(self.device, non_blocking=(self.device.type == 'cuda'))
-        # amp_ctx = cuda_autocast(device_type='cuda') if self.amp_enabled else nullcontext()
-        amp_ctx = nullcontext()
+        device_is_cuda = self.device.type == 'cuda'
+        x_dev = batch_cpu.to(self.device, non_blocking=device_is_cuda).long()
+        amp_ctx = (
+            cuda_autocast()
+            if (self.amp_enabled and device_is_cuda)
+            else nullcontext()
+        )
         with torch.no_grad():
             with amp_ctx:
-                _, z_orig = self.ae(x_dev)
-                z_hom = self.encode_head(z_orig, self.chrom_embed_idx)
+                _, z_sample = self.ae(x_dev)  # match stage-2: use trained encoder forward
+                z_hom = self.encode_head(z_sample, self.chrom_embed_idx)
         latents_cpu = z_hom.detach().to('cpu').float()
-        del x_dev, z_orig, z_hom
+        del x_dev, z_sample, z_hom
         return latents_cpu
 
 
@@ -354,6 +378,50 @@ def unify_batches(layout_json: str,
                   out_unified_root: str,
                   chromosomes: List[int],
                   embed_dtype: str = 'float32') -> None:
+    def _compute_tile_channel_stats(tile: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute per-channel mean/std over batch and spatial dims for a tile tensor (N, C, H, W).
+        Stats are computed in float32.
+        """
+        t = tile.to(dtype=torch.float32, copy=False)
+        mean = t.mean(dim=(0, 2, 3))
+        # population std (unbiased=False) to stabilize with large N
+        std = t.std(dim=(0, 2, 3), unbiased=False)
+        # clamp to avoid division spikes
+        std = torch.clamp(std, min=1e-6)
+        return mean, std
+
+    def _collect_first_batch_paths(latents_root: str, chromosomes: List[int]) -> Dict[int, Optional[str]]:
+        """
+        For each chromosome, find the first available batch*.pt latent path if any.
+        """
+        mapping: Dict[int, Optional[str]] = {}
+        for chr_no in chromosomes:
+            chr_dir = os.path.join(latents_root, f"chr{chr_no}")
+            if not os.path.isdir(chr_dir):
+                mapping[chr_no] = None
+                continue
+            pts = sorted(glob.glob(os.path.join(chr_dir, 'batch*_latents.pt')))
+            mapping[chr_no] = pts[0] if pts else None
+        return mapping
+
+    def _compute_chr_stats(latents_root: str, chromosomes: List[int]) -> Dict[int, Dict[str, torch.Tensor]]:
+        """
+        Compute per-chromosome per-channel stats on the first available batch for each chromosome.
+        Returns mapping: chr_no -> {'mean': Tensor[C], 'std': Tensor[C]} (float32).
+        """
+        stats: Dict[int, Dict[str, torch.Tensor]] = {}
+        first_paths = _collect_first_batch_paths(latents_root, chromosomes)
+        for chr_no, pth in first_paths.items():
+            if pth is None:
+                continue
+            tile = torch.load(pth, map_location='cpu')  # (N, C, s, s)
+            if not isinstance(tile, torch.Tensor) or tile.ndim != 4:
+                raise ValueError(f"Unexpected latent tile shape/type for {pth}: {type(tile)} / {getattr(tile, 'shape', None)}")
+            mu, sd = _compute_tile_channel_stats(tile)
+            stats[int(chr_no)] = {'mean': mu, 'std': sd}
+        return stats
+
     ensure_dir_exists(out_unified_root)
     with open(layout_json, 'r') as jf:
         layout = json.load(jf)
@@ -364,6 +432,12 @@ def unify_batches(layout_json: str,
     available_chr = [chr_no for chr_no in chromosomes if os.path.isdir(os.path.join(latents_root, f"chr{chr_no}"))]
     if not available_chr:
         raise RuntimeError(f"No latent directories found under {latents_root}")
+
+    # Pass 1: compute normalization stats per chromosome from first available batch
+    chr_stats = _compute_chr_stats(latents_root, available_chr)
+    stats_out_path = os.path.join(out_unified_root, "tile_norm_stats.pt")
+    torch.save(chr_stats, stats_out_path)
+    print(f"[ENC-AE] Saved per-chromosome tile normalization stats to {stats_out_path}")
 
     reference_chr: Optional[int] = None
     num_batches: Optional[int] = None
@@ -396,7 +470,21 @@ def unify_batches(layout_json: str,
             tile_path = os.path.join(latents_root, f"chr{chr_no}", f"batch{bi:05d}_latents.pt")
             if not os.path.exists(tile_path):
                 continue
-            tile = torch.load(tile_path, map_location='cpu')
+            tile = torch.load(tile_path, map_location='cpu')  # (N, C, s, s)
+            if not isinstance(tile, torch.Tensor) or tile.ndim != 4:
+                raise ValueError(f"Unexpected latent tile at {tile_path}: {type(tile)} / {getattr(tile, 'shape', None)}")
+            # Apply per-chromosome, per-channel normalization if stats are available
+            st = chr_stats.get(int(chr_no))
+            if st is not None:
+                mu = st['mean']  # (C,)
+                sd = st['std']   # (C,)
+                # ensure float32 operations
+                tile = tile.to(dtype=torch.float32)
+                mu = mu.to(dtype=torch.float32)
+                sd = torch.clamp(sd.to(dtype=torch.float32), min=1e-6)
+                tile = (tile - mu.view(1, -1, 1, 1)) / sd.view(1, -1, 1, 1)
+            # cast to target embed dtype for unified tensor assignment
+            tile = tile.to(getattr(torch, embed_dtype))
             s = int(rec['tile_side'])
             x0 = int(rec['x0']); y0 = int(rec['y0'])
             unified[:, :, y0:y0+s, x0:x0+s] = tile.to(unified.dtype)

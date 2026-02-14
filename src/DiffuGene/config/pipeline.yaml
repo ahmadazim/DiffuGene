@@ -6,7 +6,7 @@ global:
   chromosome: all
   random_seed: 42
   device: cuda
-  unique_id: unrelWhite_allchr_512z
+  unique_id: unrelWhite_allchr_AE128z
   # Optional overrides for PLINK bfile prefix
   bed_file: "${global.data_root}/geneticBinary/ukb_allchr_unrel_britishWhite.bed"
   bim_file: "${global.data_root}/geneticBinary/ukb_allchr_unrel_britishWhite.bim"
@@ -65,26 +65,26 @@ vqvae:
 
 # Step 2: Diffusion Model Training
 diffusion:
-  # Unified VQ-VAE embeddings directory containing batch*_unified.pt
-  train_embed_dataset_path: ${global.data_root}/VQVAE_embeddings/final_embed
+  # Unified AE embeddings directory containing batch*_unified.pt
+  train_embed_dataset_path: ${global.data_root}/AE_embeddings/unified
   model_output_path: ${global.model_root}/diffusion/DDPM_${global.unique_id}.pth
-  checkpoint_path: ${global.model_root}/diffusion/DDPM_${global.unique_id}.pth
+  checkpoint_path: ${global.model_root}/diffusion/DDPM_${global.unique_id}_epoch7.pth
 
   encoding:
-    diffusion_train_latents_path: ${global.data_root}/VQVAE_embeddings/final_embed
-    diffusion_val_latents_path:   ${global.data_root}/VQVAE_embeddings/final_embed
+    diffusion_train_latents_path: ${global.data_root}/AE_embeddings/unified
+    diffusion_val_latents_path:   ${global.data_root}/AE_embeddings/unified
 
   model:
-    input_channels: 4
-    output_channels: 4
+    input_channels: 64
+    output_channels: 64
     time_steps: 1000
     layers_per_block: 4
 
   training:
-    batch_size: 16
-    num_epochs: 15
-    learning_rate: 5e-5
-    ema_decay: 0.9
+    batch_size: 32
+    num_epochs: 30
+    learning_rate: 1e-5
+    ema_decay: 0.99
     num_time_steps: 1000
 
   conditional:
@@ -104,21 +104,21 @@ diffusion:
 # Step 3: Sample Generation
 generation:
   # Input/Output paths
-  model_path: ${diffusion.model_output_path}
+  model_path: ${global.model_root}/diffusion/DDPM_${global.unique_id}.pth
   output_path: ${global.data_root}/generated_samples/generated_latents_${global.basename}_${global.unique_id}_294Korig.pt
   
   # Generation parameters
-  num_samples: 294134
-  batch_size: 128
+  num_samples: 100
+  batch_size: 64
   num_time_steps: 1000
   num_inference_steps: 50
   guidance_scale: 7.0
   covariate_profile: ${global.data_root}/../covariates/all_covariates.csv
 
-  # Decoding parameters (to convert latents back to SNP space)
-  decode_samples: false
-  vae_model_path: ${vqvae.model_save_path}
-  decoded_output_dir: ${global.data_root}/generated_samples/decoded_snps_${global.basename}_${global.unique_id}_294Korig
+  # # Decoding parameters (to convert latents back to SNP space)
+  # decode_samples: false
+  # vae_model_path: ${vqvae.model_save_path}
+  # decoded_output_dir: ${global.data_root}/generated_samples/decoded_snps_${global.basename}_${global.unique_id}_294Korig
 
 
 # Pipeline execution control

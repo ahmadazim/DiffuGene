@@ -1426,7 +1426,33 @@ class DiffuGenePipeline:
             logger.info("Training unconditional diffusion model")
             train_args['conditional'] = False
         
-        n_gpus = torch.cuda.device_count()
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required for diffusion training but no GPU was detected.")
+
+        detected_gpus = torch.cuda.device_count()
+        n_gpus = detected_gpus
+        env_requested = os.environ.get("DIFFUGENE_NUM_GPUS")
+        if env_requested:
+            try:
+                requested = int(env_requested)
+                if requested > 0:
+                    if requested > detected_gpus:
+                        logger.warning(
+                            "DIFFUGENE_NUM_GPUS=%d requested, but only %d CUDA device(s) visible. "
+                            "Falling back to available devices.",
+                            requested,
+                            detected_gpus,
+                        )
+                    n_gpus = min(requested, detected_gpus) if detected_gpus > 0 else 0
+                else:
+                    logger.warning("Ignoring non-positive DIFFUGENE_NUM_GPUS=%s", env_requested)
+            except ValueError:
+                logger.warning("Unable to parse DIFFUGENE_NUM_GPUS=%s as integer", env_requested)
+
+        if n_gpus == 0:
+            raise RuntimeError("Diffusion training needs at least one CUDA device, but none were selected.")
+
+        logger.info("Detected %d CUDA device(s); using %d for diffusion training.", detected_gpus, n_gpus)
         use_ddp = (n_gpus >= 2)
 
         if use_ddp:
@@ -1526,8 +1552,8 @@ class DiffuGenePipeline:
             if decode_enabled and not decoded_samples_exist:
                 logger.info("Decoded samples not found - will decode after generation")
         
-        # Import and run sample generation
-        from .diffusion.generate import generate
+        # Import and run sample generation (latents-only)
+        from .diffusion.generate_latents import generate
         from types import SimpleNamespace
         
         # Prepare arguments (ensure proper types)

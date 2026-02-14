@@ -25,16 +25,9 @@ from ..utils.covariate_utils import (
 )
 from .unet import LatentUNET2D as ConditionalUNET
 from .unet_unconditional import LatentUNET2D as UnconditionalUNET
-from ..joint_embed.vae import SNPVAE
-from ..block_embed.pca import PCA_Block
 from .viz_generated_samples import (
     ensure_dir_exists,
     plot_latent_histograms,
-    load_decoded_recon,
-    pick_blocks_with_min_snps,
-    plot_ld_heatmaps,
-    plot_af_and_variance,
-    plot_af_scatter,
 )
 
 logger = get_logger(__name__)
@@ -472,140 +465,7 @@ def load_spans_data(spans_file_path):
     logger.info(f"Loaded spans data: {spans.shape} blocks")
     return spans
 
-def decode_samples(generated_latents, vae_model, spans, pca_models, device="cuda"):
-    """
-    Decode generated latent samples back to SNP space.
-    
-    Args:
-        generated_latents: Tensor of shape (n_samples, 16, 16, 16)
-        vae_model: Trained VAE model
-        spans: Block span information for VAE decoding
-        pca_models: Dictionary of PCA models for each block
-        device: Computing device
-    
-    Returns:
-        decoded_snps: Dictionary mapping block_id to decoded SNP arrays
-    """
-    logger.info("Decoding generated samples...")
-    
-    n_samples = generated_latents.shape[0]
-    generated_latents = generated_latents.to(device)
-    
-    # Expand spans to match the number of samples
-    if spans.dim() == 2:  # (n_blocks, 3)
-        spans = spans.unsqueeze(0).expand(n_samples, -1, -1)  # (n_samples, n_blocks, 3)
-    
-    spans = spans.to(device)
-    
-    # Decode latents to block embeddings using VAE
-    logger.info("Decoding latents to block embeddings using VAE...")
-    decoded_snps = {}
-    
-    # Process in batches to avoid memory issues
-    batch_size = 32
-    all_block_embeddings = []
-    
-    with torch.no_grad():
-        for i in tqdm(range(0, n_samples, batch_size), desc="VAE decoding"):
-            end_idx = min(i + batch_size, n_samples)
-            batch_latents = generated_latents[i:end_idx]
-            batch_spans = spans[i:end_idx]
-            
-            # VAE decode: latents -> block embeddings
-            batch_block_embs = vae_model.decode(batch_latents, batch_spans)  # (batch_size, n_blocks, 3)
-            all_block_embeddings.append(batch_block_embs.cpu())
-    
-    # Concatenate all block embeddings
-    all_block_embeddings = torch.cat(all_block_embeddings, dim=0)  # (n_samples, n_blocks, 3)
-    logger.info(f"Decoded to block embeddings: {all_block_embeddings.shape}")
-    
-    # Decode each block using corresponding PCA model
-    logger.info("Decoding block embeddings to SNPs using PCA...")
-    n_blocks = all_block_embeddings.shape[1]
-    
-    # Get sorted block IDs for consistent ordering
-    sorted_block_ids = sorted(pca_models.keys())
-    
-    if len(sorted_block_ids) != n_blocks:
-        logger.warning(f"Mismatch: {len(sorted_block_ids)} PCA models but {n_blocks} blocks in embeddings")
-        # Use the minimum to avoid index errors
-        n_blocks_to_process = min(len(sorted_block_ids), n_blocks)
-    else:
-        n_blocks_to_process = n_blocks
-    
-    for block_idx in tqdm(range(n_blocks_to_process), desc="PCA decoding"):
-        block_id = sorted_block_ids[block_idx]
-        pca_model = pca_models[block_id]
-        
-        # Get block embeddings for this block across all samples
-        block_embs = all_block_embeddings[:, block_idx, :]  # (n_samples, 3)
-        
-        # Decode using PCA
-        decoded_snps_block = pca_model.decode(block_embs)  # (n_samples, n_snps_in_block)
-        
-        # Convert to numpy and store
-        if isinstance(decoded_snps_block, torch.Tensor):
-            decoded_snps_block = decoded_snps_block.cpu().numpy()
-        
-        decoded_snps[block_id] = decoded_snps_block
-        
-        logger.debug(f"Block {block_id}: decoded {decoded_snps_block.shape[1]} SNPs for {n_samples} samples")
-    
-    logger.info(f"Successfully decoded {len(decoded_snps)} blocks")
-    return decoded_snps
-
-def save_decoded_samples(decoded_snps, output_dir, basename, chromosomes):
-    """Save decoded SNPs to files."""
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Handle both single chromosome (int) and multiple chromosomes (list)
-    if isinstance(chromosomes, int):
-        chromosomes = [chromosomes]
-    
-    # Group blocks by chromosome for saving
-    chr_blocks = {}
-    for block_id, snps in decoded_snps.items():
-        # Extract chromosome from block_id (format: "chr_blocknum")
-        if '_' in block_id:
-            chr_num, block_num = block_id.split('_', 1)
-            chr_num = int(chr_num)
-        else:
-            # Fallback for old format
-            chr_num = chromosomes[0] if len(chromosomes) == 1 else 22
-            block_num = block_id
-        
-        if chr_num not in chr_blocks:
-            chr_blocks[chr_num] = {}
-        chr_blocks[chr_num][block_num] = snps
-    
-    # Save individual block files organized by chromosome
-    total_blocks = 0
-    for chr_num, blocks in chr_blocks.items():
-        for block_num, snps in blocks.items():
-            block_file = os.path.join(output_dir, f"{basename}_chr{chr_num}_block_{block_num}_decoded.pt")
-            # Convert to tensor and save
-            if isinstance(snps, torch.Tensor):
-                torch.save(snps, block_file)
-            else:
-                torch.save(torch.from_numpy(snps), block_file)
-        total_blocks += len(blocks)
-        logger.info(f"Saved {len(blocks)} blocks for chromosome {chr_num}")
-    
-    # Save summary info
-    chr_suffix = "all" if len(chromosomes) > 1 else str(chromosomes[0])
-    summary_file = os.path.join(output_dir, f"{basename}_chr{chr_suffix}_decode_summary.txt")
-    with open(summary_file, 'w') as f:
-        f.write(f"Decoded SNPs Summary for {basename} chromosomes {chromosomes}\n")
-        f.write(f"Number of chromosomes: {len(chr_blocks)}\n")
-        f.write(f"Total blocks: {total_blocks}\n")
-        f.write(f"Sample count: {next(iter(decoded_snps.values())).shape[0]}\n")
-        f.write("\nChromosome details:\n")
-        for chr_num, blocks in sorted(chr_blocks.items()):
-            f.write(f"Chromosome {chr_num}: {len(blocks)} blocks\n")
-            for block_num, snps in sorted(blocks.items(), key=lambda x: int(x[0])):
-                f.write(f"  Block {block_num}: {snps.shape[1]} SNPs\n")
-    
-    logger.info(f"Saved decode summary to {summary_file}")
+# Decoding helpers removed: this script only generates and saves latents
 
 def generate(args):
     setup_logging()
@@ -771,47 +631,7 @@ def generate(args):
                 logger.warning(f"Latent histogram visualization failed: {e}")
             first_chunk_hist_done = True
 
-        # Decode this chunk if requested
-        if hasattr(args, 'decode_samples') and args.decode_samples:
-            try:
-                logger.info("Starting sample decoding via decode_vae_latents.py for current chunk...")
-                from ..joint_embed.decode_vae_latents import decode_latents as decode_latents_fn
-                embeddings_dir = os.path.dirname(args.pca_loadings_dir)
-                latents_file_for_decode = latents_file
-                chromosome = getattr(args, 'chromosome', None)
-                if isinstance(getattr(args, 'chromosomes', None), list) and len(args.chromosomes) == 1:
-                    chromosome = args.chromosomes[0]
-                decoded_base = os.path.join(args.decoded_output_dir, f"{args.basename}")
-                if use_chunking:
-                    decoded_gen_file = f"{decoded_base}_batch{chunk_index}_decoded.pt"
-                else:
-                    decoded_gen_file = f"{decoded_base}_decoded.pt"
-                if os.path.exists(decoded_gen_file):
-                    logger.info(f"Decoded file already exists at {decoded_gen_file}; skipping decoding for this chunk.")
-                else:
-                    decode_kwargs = dict(
-                        latents_file=latents_file_for_decode,
-                        model_file=args.vae_model_path,
-                        embeddings_dir=embeddings_dir,
-                        spans_file=args.spans_file,
-                        output_file=decoded_gen_file,
-                        batch_size=256,
-                        chromosome=chromosome
-                    )
-                    # Optional visualization hints if available
-                    if hasattr(args, 'original_latents') and args.original_latents:
-                        decode_kwargs['viz_original_latents'] = args.original_latents
-                    if hasattr(args, 'viz_min_snps'):
-                        decode_kwargs['viz_min_snps'] = int(args.viz_min_snps)
-                    if hasattr(args, 'viz_num_blocks'):
-                        decode_kwargs['viz_num_blocks'] = int(args.viz_num_blocks)
-                    if hasattr(args, 'viz_recoded_dir') and args.viz_recoded_dir:
-                        decode_kwargs['viz_recoded_dir'] = args.viz_recoded_dir
-                    decode_latents_fn(**decode_kwargs)
-                    logger.info("Sample decoding for chunk completed successfully!")
-            except Exception as e:
-                logger.error(f"Error during sample decoding for chunk: {e}")
-                logger.info("Continuing without decoding for this chunk...")
+        # Decoding is disabled in generate_latents: we only save latents
 
         # Reset chunk accumulators
         current_chunk_samples = []
@@ -828,8 +648,7 @@ def generate(args):
         latents = torch.randn(batch_size, 64, 128, 128, device="cuda", dtype=torch.float32)
         
         if DEBUG and batch_index == 0:
-            _tensor_stats("init_noise", noise)
-            _tensor_stats("latents@tT", latents)
+            _tensor_stats("latents(init)", latents)
 
         # Get batch covariates if conditional
         batch_covariates = None
@@ -951,87 +770,7 @@ def generate(args):
         logger.info(f"Covariate profiles saved to {covariate_output_path}")
         logger.info(f"Saved {len(covariate_df)} covariate profiles with {len(covariate_names)} features")
     
-    # Decode samples if decoding arguments are provided (use canonical decoder)
-    # If chunking was used, decoding was already handled per-chunk in finalize_and_save_current_chunk()
-    if hasattr(args, 'decode_samples') and args.decode_samples and not use_chunking:
-        try:
-            logger.info("Starting sample decoding via decode_vae_latents.py...")
-            
-            # Import decoder
-            from ..joint_embed.decode_vae_latents import decode_latents as decode_latents_fn
-            
-            # Determine embeddings_dir (parent of loadings)
-            embeddings_dir = os.path.dirname(args.pca_loadings_dir)
-            
-            # Use already-saved latents file
-            latents_file = args.output_path
-            
-            # Optional chromosome hint
-            chromosome = getattr(args, 'chromosome', None)
-            if isinstance(getattr(args, 'chromosomes', None), list) and len(args.chromosomes) == 1:
-                chromosome = args.chromosomes[0]
-            
-            # Decoded output path (used for both existence check and downstream viz)
-            decoded_gen_file = os.path.join(args.decoded_output_dir, f"{args.basename}_decoded.pt")
-            
-            # Skip decoding if output already exists
-            if os.path.exists(decoded_gen_file):
-                logger.info(f"Decoded file already exists at {decoded_gen_file}; skipping decoding.")
-            else:
-                decode_latents_fn(
-                    latents_file=latents_file,
-                    model_file=args.vae_model_path,
-                    embeddings_dir=embeddings_dir,
-                    spans_file=args.spans_file,
-                    output_file=decoded_gen_file,
-                    batch_size=256,
-                    chromosome=chromosome
-                )
-                logger.info("Sample decoding completed successfully!")
-            
-            # Visualizations 2-4 on decoded data if original decoded provided
-            try:
-                if hasattr(args, 'decoded_original_file') and args.decoded_original_file:
-                    decoded_orig_file = args.decoded_original_file
-                    logger.info("Creating decoded visualizations (LD, AF/variance, AF scatter)...")
-                    # Load decoded blocks
-                    gen_blocks = load_decoded_recon(decoded_gen_file)
-                    orig_blocks = load_decoded_recon(decoded_orig_file)
-                    n_blocks_vis = min(len(gen_blocks), len(orig_blocks))
-                    gen_blocks = gen_blocks[:n_blocks_vis]
-                    orig_blocks = orig_blocks[:n_blocks_vis]
-                    # Select blocks
-                    min_snps = int(getattr(args, 'viz_min_snps', 30))
-                    num_blocks = int(getattr(args, 'viz_num_blocks', 5))
-                    blocks = pick_blocks_with_min_snps(orig_blocks, min_snps=min_snps, max_blocks=num_blocks)
-                    # Plots
-                    plot_ld_heatmaps(
-                        orig_blocks=orig_blocks,
-                        gen_blocks=gen_blocks,
-                        block_indices=blocks,
-                        output_path=os.path.join(args.decoded_output_dir, 'ld_heatmaps.png')
-                    )
-                    plot_af_and_variance(
-                        orig_blocks=orig_blocks,
-                        gen_blocks=gen_blocks,
-                        block_indices=blocks,
-                        output_path=os.path.join(args.decoded_output_dir, 'af_and_variance.png')
-                    )
-                    plot_af_scatter(
-                        orig_blocks=orig_blocks,
-                        gen_blocks=gen_blocks,
-                        block_indices=blocks,
-                        output_path=os.path.join(args.decoded_output_dir, 'af_scatter.png')
-                    )
-                    logger.info("Saved decoded visualizations: ld_heatmaps.png, af_and_variance.png, af_scatter.png")
-                else:
-                    logger.info("decoded_original_file not provided; skipping decoded visualizations.")
-            except Exception as e:
-                logger.warning(f"Decoded visualization failed: {e}")
-        
-        except Exception as e:
-            logger.error(f"Error during sample decoding: {e}")
-            logger.info("Continuing without decoding...")
+    # Decoding stage disabled: this script only generates and saves latents
 
 def main():
     """Main function for diffusion sample generation."""
@@ -1047,23 +786,10 @@ def main():
     parser.add_argument("--covariate-file", type=str, help="Path to covariate CSV file (for conditional models)")
     parser.add_argument("--random-seed", type=int, help="Random seed for reproducible sampling")
     parser.add_argument("--guidance-scale", type=float, default=5, help="CFG scale (how strongly to apply covariates)")
-    
-    # Decoding arguments
-    parser.add_argument("--decode-samples", action="store_true", help="Decode generated samples to SNP space")
-    parser.add_argument("--vae-model-path", type=str, help="Path to trained VAE model")
-    parser.add_argument("--pca-loadings-dir", type=str, help="Directory containing PCA model files")
-    parser.add_argument("--spans-file", type=str, help="Path to spans CSV file")
-    parser.add_argument("--decoded-output-dir", type=str, help="Directory to save decoded SNPs")
-    parser.add_argument("--basename", type=str, help="Dataset basename")
-    parser.add_argument("--chromosome", type=int, help="Chromosome number")
-    
-    # Visualization arguments (optional)
+    # Visualization arguments (optional; latents only)
     parser.add_argument("--original-latents", type=str, help="Path to original/train latents for histogram comparison")
-    parser.add_argument("--decoded-original-file", type=str, help="Path to decoded original SNPs (.pt) for decoded comparisons")
     parser.add_argument("--viz-latent-dims", type=int, nargs='+', default=[0,1,2,3,4,5,6], help="Flattened latent dims to visualize")
     parser.add_argument("--viz-latent-samples", type=int, default=512, help="Number of samples per set for latent histograms")
-    parser.add_argument("--viz-min-snps", type=int, default=30, help="Min SNPs per block to include in decoded visualizations")
-    parser.add_argument("--viz-num-blocks", type=int, default=5, help="Number of blocks to visualize in decoded visualizations")
     
     args = parser.parse_args()
     generate(args)

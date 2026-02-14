@@ -11,14 +11,26 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import h5py
 
-from .vae import (
-    GenotypeAutoencoder,
-    VAEConfig,
-    build_vae,
-    train_vae as train_vae_fn,
-    find_best_ck,
-)
-from ..utils import setup_logging, get_logger
+try:
+    from .ae import (
+        GenotypeAutoencoder,
+        VAEConfig,
+        build_vae,
+        train_vae as train_vae_fn,
+        find_best_ck,
+    )
+    from ..utils import setup_logging, get_logger
+except ImportError:
+    import sys
+    sys.path.append('/n/home03/ahmadazim/WORKING/genGen/DiffuGene/src')
+    from DiffuGene.VAEembed.ae import (
+        GenotypeAutoencoder,
+        VAEConfig,
+        build_vae,
+        train_vae as train_vae_fn,
+        find_best_ck,
+    )
+    from DiffuGene.utils import setup_logging, get_logger
 
 
 logger = get_logger(__name__)
@@ -116,6 +128,14 @@ def main():
     p.add_argument("--ld-lambda", type=float, default=0.0)
     p.add_argument("--maf-lambda", type=float, default=0.0)
     p.add_argument("--ld-window", type=int, default=128)
+    p.add_argument("--beta-kl", type=float, default=0.0, help="Weight on KL term.")
+    p.add_argument("--tv-lambda", type=float, default=0.0, help="Stage-2 latent TV weight.")
+    p.add_argument("--robust-lambda", type=float, default=0.0, help="Stage-2 robust latent weight.")
+    p.add_argument("--stable-lambda", type=float, default=0.0, help="Stage-2 stable latent weight.")
+    p.add_argument("--latent-noise-std", type=float, default=0.05, help="Noise std for robust latent regularizer.")
+    p.add_argument("--embed-noise-std", type=float, default=0.05, help="Noise std for stable latent regularizer.")
+    p.add_argument("--stage2-start-frac", type=float, default=0.75, help="Fraction of training before stage-2 starts.")
+    p.add_argument("--latent-eval-max-batches", type=int, default=2, help="Batches to use when logging latent penalties.")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -156,6 +176,14 @@ def main():
         embed_dim=int(args.embed_dim),
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
+        beta_kl=float(args.beta_kl),
+        tv_lambda=float(args.tv_lambda),
+        robust_lambda=float(args.robust_lambda),
+        stable_lambda=float(args.stable_lambda),
+        latent_noise_std=float(args.latent_noise_std),
+        embed_noise_std=float(args.embed_noise_std),
+        stage2_start_frac=float(args.stage2_start_frac),
+        latent_eval_max_batches=int(args.latent_eval_max_batches),
     )
     model, optim = build_vae(cfg)
 
@@ -194,14 +222,24 @@ def main():
         maf_lambda=float(args.maf_lambda),
         ld_lambda=float(args.ld_lambda),
         ld_window=int(args.ld_window),
+        beta_kl=float(args.beta_kl),
+        tv_lambda=float(args.tv_lambda),
+        robust_lambda=float(args.robust_lambda),
+        stable_lambda=float(args.stable_lambda),
+        latent_noise_std=float(args.latent_noise_std),
+        embed_noise_std=float(args.embed_noise_std),
+        stage2_start_frac=float(args.stage2_start_frac),
+        latent_eval_max_batches=int(args.latent_eval_max_batches),
     )
 
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
 
-    # Save best checkpoint
-    best_path = args.save_path
-    best_payload = {
-        "model_state": res["best_state_dict"],
+    # Save last checkpoint (preferred for downstream usage)
+    last_path = args.save_path
+    last_payload = {
+        # Save under both keys for compatibility
+        "last_state_dict": res["last_state_dict"],
+        "model_state": res["last_state_dict"],
         "config": asdict(cfg),
         "meta": {
             "c": int(getattr(model, "c", -1)),
@@ -221,16 +259,45 @@ def main():
             "weight_decay": float(args.weight_decay),
             "device": args.device,
             "chromosome": int(args.chromosome),
-            "val_mse": float(res["best_meta"].get("val_mse", float("nan"))),
-            "best_epoch": int(res["best_meta"].get("epoch", args.epochs)),
+            "val_mse": float(res["last_meta"].get("val_mse", float("nan"))),
+            "epoch": int(res["last_meta"].get("epoch", args.epochs)),
+            "beta_kl": float(args.beta_kl),
+            "tv_lambda": float(args.tv_lambda),
+            "robust_lambda": float(args.robust_lambda),
+            "stable_lambda": float(args.stable_lambda),
+            "latent_noise_std": float(args.latent_noise_std),
+            "embed_noise_std": float(args.embed_noise_std),
+            "stage2_start_frac": float(args.stage2_start_frac),
+            "latent_eval_max_batches": int(args.latent_eval_max_batches),
         },
-        "best_meta": res["best_meta"],
+        "last_meta": res["last_meta"],
     }
-    torch.save(best_payload, best_path)
-    logger.info(f"Saved best model to {best_path} (val MSE={best_payload['training_args']['val_mse']:.6f})")
+    torch.save(last_payload, last_path)
+    logger.info(f"Saved last model to {last_path} (val MSE={last_payload['training_args']['val_mse']:.6f})")
 
 
 if __name__ == "__main__":
     main()
 
 
+# python -u /n/home03/ahmadazim/WORKING/genGen/DiffuGene/src/DiffuGene/VAEembed/train.py \
+#     --h5-dir /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/genomic_data/vqvae_h5_cache/ \
+#     --chromosome 22 \
+#     --spatial1d 512 \
+#     --spatial2d 16 \
+#     --latent-channels 64 \
+#     --embed-dim 8 \
+#     --ld-lambda 1e-3 \
+#     --maf-lambda 1e-3 \
+#     --ld-window 128 \
+#     --epochs 50 \
+#     --batch-size 256 \
+#     --lr 5e-3 \
+#     --weight-decay 0.1 \
+#     --device cuda \
+#     --grad-clip 5.0 \
+#     --val-h5-dir /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/genomic_data/val_h5_cache/chr22 \
+#     --plateau-min-rel-improve 0.005 \
+#     --plateau-patience 50 \
+#     --plateau-mse-threshold 0.001 \
+#     --save-path /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/models/AEmasked/ae_chr22.pt

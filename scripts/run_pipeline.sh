@@ -114,7 +114,12 @@ setup_cuda_env() {
     # Comprehensive CUDA/TensorFlow warning suppression
     export TF_CPP_MIN_LOG_LEVEL=3  # Suppress all TF messages except errors
     export TF_ENABLE_ONEDNN_OPTS=0  # Disable oneDNN warnings
-    export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"0"}  # Set default GPU
+
+    # Respect CUDA visibility if set; fall back to Slurm assignment when available.
+    if [[ -z "${CUDA_VISIBLE_DEVICES}" && -n "${SLURM_JOB_GPUS}" ]]; then
+        export CUDA_VISIBLE_DEVICES="${SLURM_JOB_GPUS}"
+    fi
+
     export CUDA_LAUNCH_BLOCKING=1  # Reduce CUDA warnings
     export CUDA_CACHE_DISABLE=1    # Disable CUDA cache warnings
     
@@ -199,10 +204,81 @@ check_dependencies() {
 }
 
 # Function to run the pipeline
+# run_pipeline() {
+#     print_status "Starting DiffuGene Pipeline"
+    
+#     # Build command
+#     CMD="python -m DiffuGene.pipeline"
+    
+#     if [[ -n "$CONFIG_FILE" ]]; then
+#         if [[ ! -f "$CONFIG_FILE" ]]; then
+#             print_error "Configuration file not found: $CONFIG_FILE"
+#             exit 1
+#         fi
+#         CMD="$CMD --config $CONFIG_FILE"
+#         print_status "Using config file: $CONFIG_FILE"
+#     fi
+    
+#     if [[ -n "$STEPS" ]]; then
+#         # Convert comma-separated to space-separated
+#         STEPS_ARRAY=(${STEPS//,/ })
+#         CMD="$CMD --steps ${STEPS_ARRAY[@]}"
+#         print_status "Running steps: ${STEPS_ARRAY[@]}"
+#     fi
+    
+#     if [[ "$FORCE_RERUN" == "true" ]]; then
+#         CMD="$CMD --force-rerun"
+#         print_status "Force rerun enabled"
+#     fi
+    
+#     print_status "Executing: $CMD"
+#     echo ""
+    
+#     # Run the pipeline
+#     eval $CMD
+# }
+
+# Function to run the pipeline
 run_pipeline() {
     print_status "Starting DiffuGene Pipeline"
     
-    # Build command
+    # Detect how many GPUs we have on this node.
+    detect_num_gpus() {
+        if [[ -n "${SLURM_GPUS_ON_NODE}" ]]; then
+            if [[ "${SLURM_GPUS_ON_NODE}" =~ ^[0-9]+$ ]]; then
+                echo "${SLURM_GPUS_ON_NODE}"
+            else
+                IFS=',' read -r -a gpu_list <<< "${SLURM_GPUS_ON_NODE}"
+                echo "${#gpu_list[@]}"
+            fi
+            return
+        elif [[ -n "${SLURM_JOB_GPUS}" ]]; then
+            IFS=',' read -r -a gpu_list <<< "${SLURM_JOB_GPUS}"
+            echo "${#gpu_list[@]}"
+            return
+        elif [[ -n "${CUDA_VISIBLE_DEVICES}" ]]; then
+            IFS=',' read -r -a gpu_list <<< "${CUDA_VISIBLE_DEVICES}"
+            echo "${#gpu_list[@]}"
+            return
+        elif command -v nvidia-smi &> /dev/null; then
+            nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l
+            return
+        fi
+        echo 1
+    }
+
+    NUM_GPUS=$(detect_num_gpus)
+    if ! [[ "${NUM_GPUS}" =~ ^[0-9]+$ ]]; then
+        NUM_GPUS=1
+    fi
+    if [[ "${NUM_GPUS}" -le 0 ]]; then
+        NUM_GPUS=1
+    fi
+
+    export DIFFUGENE_NUM_GPUS="${NUM_GPUS}"
+    print_status "GPU slots visible: ${NUM_GPUS} (exported DIFFUGENE_NUM_GPUS)"
+
+    # Build base command (single pipeline process; diffusion step spawns workers)
     CMD="python -m DiffuGene.pipeline"
     
     if [[ -n "$CONFIG_FILE" ]]; then
