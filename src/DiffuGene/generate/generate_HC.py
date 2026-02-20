@@ -90,7 +90,7 @@ def load_model_from_ckpt(model_path: str, device: torch.device) -> Tuple[torch.n
 
     is_conditional = bool(checkpoint.get("conditional", False))
     cond_dim = checkpoint.get("cond_dim", None)
-    model_type = str(checkpoint.get("model_type", "unet")).lower()
+    model_type = str(checkpoint.get("model_type", "usit")).lower()
     latent_shape = tuple(checkpoint.get("latent_shape", (64, 128, 128)))
     logger.info(f"[CKPT] conditional={is_conditional} cond_dim_in_ckpt={cond_dim}")
     logger.info(f"[CKPT] model_type={model_type} latent_shape={latent_shape}")
