@@ -75,10 +75,21 @@ diffusion:
     diffusion_val_latents_path:   ${global.data_root}/AE_embeddings/unified
 
   model:
+    architecture: unet   # unet | sit | usit
+    objective: ddpm_v_prediction   # ddpm_v_prediction (unet) | flow_matching (sit/usit)
     input_channels: 64
     output_channels: 64
     time_steps: 1000
     layers_per_block: 4
+    sit:
+      num_layers: 9
+      num_heads: 8
+      mlp_ratio: 4
+      dropout: 0.0
+      use_udit: false
+    flow_matching:
+      use_latent_normalization: true
+      norm_eps: 1e-6
 
   training:
     batch_size: 32

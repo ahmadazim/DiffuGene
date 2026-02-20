@@ -1401,6 +1401,24 @@ class DiffuGenePipeline:
             'model_output_path': self.config['diffusion']['model_output_path'],
             'train_embed_dataset_path': train_embed_dataset_path
         }
+
+        # Optional architecture settings (default remains UNet)
+        train_args['model_type'] = str(model_config.get('architecture', 'unet')).lower()
+        sit_cfg = model_config.get('sit', {})
+        if isinstance(sit_cfg, dict):
+            train_args.update({
+                'sit_num_layers': int(sit_cfg.get('num_layers', 9)),
+                'sit_num_heads': int(sit_cfg.get('num_heads', 8)),
+                'sit_mlp_ratio': int(sit_cfg.get('mlp_ratio', 4)),
+                'sit_dropout': float(sit_cfg.get('dropout', 0.0)),
+                'sit_use_udit': bool(sit_cfg.get('use_udit', False)),
+            })
+        flow_cfg = model_config.get('flow_matching', {})
+        if isinstance(flow_cfg, dict):
+            train_args.update({
+                'flow_use_latent_normalization': bool(flow_cfg.get('use_latent_normalization', True)),
+                'flow_norm_eps': float(flow_cfg.get('norm_eps', 1e-6)),
+            })
         
         # Add conditional arguments if enabled
         if is_conditional:

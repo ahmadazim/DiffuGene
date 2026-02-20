@@ -28,6 +28,7 @@ from ..utils import setup_logging, get_logger, prepare_covariates_for_training, 
 from .unet import LatentUNET2D as ConditionalUNET
 from .unet_unconditional import LatentUNET2D as UnconditionalUNET
 from .unet import set_seed, v_pred_loss
+from .SiT import SiTFlowModel
 
 logger = get_logger(__name__)
 
@@ -86,7 +87,7 @@ class ConditionalMemmapDataset(Dataset):
         return torch.from_numpy(x), c
 
 
-def compute_channel_stats_from_memmap(
+def compute_feature_stats_from_memmap(
     memmap_array: np.memmap,
     chunk_size: int = 512,
     rank: int = 0,
@@ -94,14 +95,24 @@ def compute_channel_stats_from_memmap(
     device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Compute per-channel mean/std over an entire (N,C,H,W) memmap without loading it fully into RAM.
+    Compute per-feature mean/std over an entire latent memmap without loading it fully into RAM.
+    Supported shapes:
+      - 4D: (N, C, H, W) -> stats over C
+      - 3D: (N, L, D)    -> stats over D
     When running under DDP, each rank processes a disjoint slice of samples and the partial
     statistics are aggregated via all_reduce to avoid long idle waits on non-zero ranks.
     """
-    if memmap_array.ndim != 4:
-        raise ValueError(f"Expected a 4D memmap for channel stats, got shape {memmap_array.shape}")
+    if memmap_array.ndim not in (3, 4):
+        raise ValueError(f"Expected a 3D or 4D memmap for latent stats, got shape {memmap_array.shape}")
 
-    n_samples, n_channels, height, width = memmap_array.shape
+    if memmap_array.ndim == 4:
+        n_samples, n_features, d2, d3 = memmap_array.shape
+        reducer_axes = (0, 2, 3)
+        elements_per_sample = float(d2) * float(d3)
+    else:
+        n_samples, d1, n_features = memmap_array.shape
+        reducer_axes = (0, 1)
+        elements_per_sample = float(d1)
     world_size = max(1, int(world_size))
     rank = max(0, int(rank))
     chunk = max(1, int(chunk_size))
@@ -110,17 +121,17 @@ def compute_channel_stats_from_memmap(
     start_idx = min(n_samples, samples_per_rank * rank)
     end_idx = min(n_samples, start_idx + samples_per_rank)
 
-    sum_c = np.zeros((n_channels,), dtype=np.float64)
-    sumsq_c = np.zeros((n_channels,), dtype=np.float64)
-    local_pixels = float(max(0, end_idx - start_idx)) * float(height) * float(width)
+    sum_c = np.zeros((n_features,), dtype=np.float64)
+    sumsq_c = np.zeros((n_features,), dtype=np.float64)
+    local_pixels = float(max(0, end_idx - start_idx)) * elements_per_sample
 
     for start in range(start_idx, end_idx, chunk):
         end = min(end_idx, start + chunk)
         if start >= end:
             break
-        block = np.asarray(memmap_array[start:end])  # (b,C,H,W)
-        sum_c += block.sum(axis=(0, 2, 3))
-        sumsq_c += np.square(block).sum(axis=(0, 2, 3))
+        block = np.asarray(memmap_array[start:end])
+        sum_c += block.sum(axis=reducer_axes)
+        sumsq_c += np.square(block).sum(axis=reducer_axes)
 
     sum_t = torch.from_numpy(sum_c)
     sumsq_t = torch.from_numpy(sumsq_c)
@@ -128,7 +139,7 @@ def compute_channel_stats_from_memmap(
 
     if world_size > 1 and dist.is_available() and dist.is_initialized():
         if device is None:
-            raise RuntimeError("Distributed channel-stat computation requires a CUDA device reference.")
+            raise RuntimeError("Distributed stat computation requires a CUDA device reference.")
         sum_t = sum_t.to(device)
         sumsq_t = sumsq_t.to(device)
         pixel_t = pixel_t.to(device)
@@ -411,9 +422,20 @@ def train(
     binary_cols: List[str] = None,
     categorical_cols: List[str] = None, 
     cfg_drop_prob: float = 0.1, 
+    model_type: str = "usit",
+    sit_num_layers: int = 9,
+    sit_num_heads: int = 8,
+    sit_mlp_ratio: int = 4,
+    sit_dropout: float = 0.0,
+    sit_use_udit: bool = False,
+    flow_use_latent_normalization: bool = True,
+    flow_norm_eps: float = 1e-6,
 ):
     setup_logging()
     set_seed(random.randint(0, 2**32-1)) if seed == -1 else set_seed(seed)
+    model_type = str(model_type).lower()
+    if model_type not in {"unet", "sit", "usit"}:
+        raise ValueError(f"Unsupported model_type='{model_type}'. Expected one of: unet, sit, usit")
 
     output_folder = os.path.dirname(model_output_path)
     model_name = os.path.splitext(os.path.basename(model_output_path))[0]
@@ -488,13 +510,12 @@ def train(
     # logger.info(f"Estimated sigma from {len(sigma_estimates)} small batches: {sigma_hat:.4f}")
     total_samples = len(train_dataset)
     if conditional:
-        sample_latent_shape = train_dataset[0][0].shape
-        logger.info(f"Training data shape: ({total_samples},) + {sample_latent_shape} latents + covariates")
-        inferred_channels = int(sample_latent_shape[0])
+        sample_shape = train_dataset[0][0].shape
+        logger.info(f"Training data shape: ({total_samples},) + {sample_shape} latents + covariates")
     else:
         sample_shape = train_dataset[0].shape
         logger.info(f"Training data shape: ({total_samples},) + {sample_shape}")
-        inferred_channels = int(sample_shape[0])
+    inferred_channels = int(sample_shape[0])
     # del stats_loader, batch, batch_data
     gc.collect()
     torch.cuda.empty_cache()
@@ -505,44 +526,71 @@ def train(
     # ------------------------------------------------------------------
     # Channel-wise normalization stats over the full latent canvas
     # ------------------------------------------------------------------
+    if flow_norm_eps <= 0.0:
+        raise ValueError(f"flow_norm_eps must be > 0. Got {flow_norm_eps}")
     if not hasattr(train_dataset, "arr"):
-        raise ValueError("Channel normalization requires a memmap-backed dataset with an 'arr' attribute.")
-    stats_chunk = max(int(batch_size), 256)
-    if distributed:
-        if dist.get_rank() == 0:
-            logger.info(f"[NormStats] Computing per-channel mean/std over memmap with chunk={stats_chunk} (distributed)")
-        channel_mean_cpu, channel_std_cpu = compute_channel_stats_from_memmap(
-            train_dataset.arr,
-            chunk_size=stats_chunk,
-            rank=dist.get_rank(),
-            world_size=world_size,
-            device=device,
+        raise ValueError("Latent normalization requires a memmap-backed dataset with an 'arr' attribute.")
+
+    if model_type == "unet" and len(sample_shape) != 4:
+        raise ValueError(
+            f"UNet training expects latent shape (C,H,W); got sample shape {sample_shape}. "
+            "Use model_type=sit/usit for token latents."
         )
-        if dist.get_rank() == 0:
+
+    if (not flow_use_latent_normalization) and model_type in {"sit", "usit"}:
+        logger.info("[NormStats] Flow latent normalization disabled by config.")
+        if len(sample_shape) == 4:
+            channel_mean_cpu = torch.zeros(sample_shape[0], dtype=torch.float32)
+            channel_std_cpu = torch.ones(sample_shape[0], dtype=torch.float32)
+        elif len(sample_shape) == 3:
+            channel_mean_cpu = torch.zeros(sample_shape[-1], dtype=torch.float32)
+            channel_std_cpu = torch.ones(sample_shape[-1], dtype=torch.float32)
+        else:
+            raise ValueError(f"Unsupported latent shape {sample_shape}.")
+    else:
+        stats_chunk = max(int(batch_size), 256)
+        if distributed:
+            if dist.get_rank() == 0:
+                logger.info(f"[NormStats] Computing per-feature mean/std over memmap with chunk={stats_chunk} (distributed)")
+            channel_mean_cpu, channel_std_cpu = compute_feature_stats_from_memmap(
+                train_dataset.arr,
+                chunk_size=stats_chunk,
+                rank=dist.get_rank(),
+                world_size=world_size,
+                device=device,
+            )
+            if dist.get_rank() == 0:
+                logger.info(
+                    "[NormStats] mean(|mean|)=%.4e | mean(std)=%.4e | min(std)=%.4e",
+                    channel_mean_cpu.abs().mean().item(),
+                    channel_std_cpu.mean().item(),
+                    channel_std_cpu.min().item(),
+                )
+        else:
+            logger.info(f"[NormStats] Computing per-feature mean/std over memmap with chunk={stats_chunk}")
+            channel_mean_cpu, channel_std_cpu = compute_feature_stats_from_memmap(
+                train_dataset.arr,
+                chunk_size=stats_chunk,
+            )
             logger.info(
                 "[NormStats] mean(|mean|)=%.4e | mean(std)=%.4e | min(std)=%.4e",
                 channel_mean_cpu.abs().mean().item(),
                 channel_std_cpu.mean().item(),
                 channel_std_cpu.min().item(),
             )
-    else:
-        logger.info(f"[NormStats] Computing per-channel mean/std over memmap with chunk={stats_chunk}")
-        channel_mean_cpu, channel_std_cpu = compute_channel_stats_from_memmap(
-            train_dataset.arr,
-            chunk_size=stats_chunk,
-        )
-        logger.info(
-            "[NormStats] mean(|mean|)=%.4e | mean(std)=%.4e | min(std)=%.4e",
-            channel_mean_cpu.abs().mean().item(),
-            channel_std_cpu.mean().item(),
-            channel_std_cpu.min().item(),
-        )
 
-    channel_std_cpu = torch.clamp(channel_std_cpu, min=1e-6)
-    mu_dev = channel_mean_cpu.view(1, inferred_channels, 1, 1).to(device)
-    sd_dev = channel_std_cpu.view(1, inferred_channels, 1, 1).to(device)
-    mu_dev = mu_dev.contiguous().to(memory_format=torch.channels_last)
-    sd_dev = sd_dev.contiguous().to(memory_format=torch.channels_last)
+    channel_std_cpu = torch.clamp(channel_std_cpu, min=float(flow_norm_eps))
+    if len(sample_shape) == 4:
+        mu_dev = channel_mean_cpu.view(1, inferred_channels, 1, 1).to(device)
+        sd_dev = channel_std_cpu.view(1, inferred_channels, 1, 1).to(device)
+        if model_type == "unet":
+            mu_dev = mu_dev.contiguous().to(memory_format=torch.channels_last)
+            sd_dev = sd_dev.contiguous().to(memory_format=torch.channels_last)
+    elif len(sample_shape) == 3:
+        mu_dev = channel_mean_cpu.view(1, 1, int(sample_shape[-1])).to(device)
+        sd_dev = channel_std_cpu.view(1, 1, int(sample_shape[-1])).to(device)
+    else:
+        raise ValueError(f"Unsupported latent sample shape {sample_shape}; expected 3D or 4D.")
 
     # Create data loader
     if distributed: 
@@ -570,45 +618,74 @@ def train(
     train_loader = DataLoader(train_dataset, **loader_args)
     logger.info(f"Created memmap DataLoader with {loader_args.get('num_workers', 0)} workers")
 
-    # Switch to HF's scheduler for noising/denoising
-    scheduler = DDPMScheduler(
-        num_train_timesteps=num_time_steps,
-        beta_schedule="squaredcos_cap_v2",
-        beta_start=1e-4,
-        beta_end=0.02,
-        clip_sample=True,
-        clip_sample_range=10.0,
-    )
-    scheduler.config.prediction_type = "v_prediction"
-    scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device)
-    scheduler.betas         = scheduler.betas.to(device)
+    scheduler: Optional[DDPMScheduler] = None
+    if model_type == "unet":
+        # Switch to HF's scheduler for noising/denoising
+        scheduler = DDPMScheduler(
+            num_train_timesteps=num_time_steps,
+            beta_schedule="squaredcos_cap_v2",
+            beta_start=1e-4,
+            beta_end=0.02,
+            clip_sample=True,
+            clip_sample_range=10.0,
+        )
+        scheduler.config.prediction_type = "v_prediction"
+        scheduler.alphas_cumprod = scheduler.alphas_cumprod.to(device)
+        scheduler.betas = scheduler.betas.to(device)
 
-    # Create conditional or unconditional model
-    if conditional:
-        model = ConditionalUNET(
-            input_channels=inferred_channels,
-            output_channels=inferred_channels,
-            cond_dim=cond_dim,
-            time_steps=num_time_steps
-        )
-        logger.info(f"Created conditional UNet with {cond_dim} covariate dimensions")
-        logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
-        logger.info(f"Model size: {sum(p.numel() for p in model.parameters()) * 4 / 1024**2:.2f} MB")
+        # Create conditional or unconditional UNet
+        if conditional:
+            model = ConditionalUNET(
+                input_channels=inferred_channels,
+                output_channels=inferred_channels,
+                cond_dim=cond_dim,
+                time_steps=num_time_steps
+            )
+            logger.info(f"Created conditional UNet with {cond_dim} covariate dimensions")
+        else:
+            model = UnconditionalUNET(
+                input_channels=inferred_channels,
+                output_channels=inferred_channels,
+                time_steps=num_time_steps
+            )
+            logger.info("Created unconditional UNet")
+
+        model.unet.enable_gradient_checkpointing()
+        logger.info("Enabled gradient checkpointing for UNet")
     else:
-        model = UnconditionalUNET(
-            input_channels=inferred_channels,
-            output_channels=inferred_channels,
-            time_steps=num_time_steps
+        if len(sample_shape) == 3:
+            latent_length = int(sample_shape[0])
+            token_dim = int(sample_shape[1])
+        elif len(sample_shape) == 4:
+            token_dim = int(sample_shape[0])
+            latent_length = int(sample_shape[1] * sample_shape[2])
+        else:
+            raise ValueError(f"Unsupported latent shape for SiT/USiT: {sample_shape}")
+
+        model = SiTFlowModel(
+            token_dim=token_dim,
+            latent_length=latent_length,
+            cond_dim=(cond_dim if conditional else None),
+            num_layers=sit_num_layers,
+            num_heads=sit_num_heads,
+            mlp_ratio=sit_mlp_ratio,
+            dropout=sit_dropout,
+            use_udit=(sit_use_udit or model_type == "usit"),
         )
-        logger.info("Created unconditional UNet")
-    
-    # Enable gradient checkpointing
-    model.unet.enable_gradient_checkpointing()
-    logger.info("Enabled gradient checkpointing for UNet")
+        logger.info(
+            "Created %s flow model (token_dim=%d latent_length=%d cond=%s)",
+            model_type.upper(),
+            token_dim,
+            latent_length,
+            conditional,
+        )
+
+    logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
+    logger.info(f"Model size: {sum(p.numel() for p in model.parameters()) * 4 / 1024**2:.2f} MB")
 
     model.to(device, non_blocking=True)
-    # model = model.to(memory_format=torch.channels_last, dtype=torch.bfloat16)
-    model = model.to(memory_format=torch.channels_last)
+    if model_type == "unet":
+        model = model.to(memory_format=torch.channels_last)
 
     # Wrap in DDP 
     if distributed:
@@ -708,37 +785,65 @@ def train(
             # Handle conditional vs unconditional data
             if conditional:
                 x, covariates = batch_data
-                x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last).float()
+                x = x.to(device, non_blocking=True).float()
+                if model_type == "unet":
+                    x = x.to(memory_format=torch.channels_last)
                 covariates = covariates.float().to(device, non_blocking=True)
             else:
-                x = batch_data.float().to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                x = batch_data.float().to(device, non_blocking=True)
+                if model_type == "unet":
+                    x = x.to(memory_format=torch.channels_last)
                 covariates = None
             
             clean_latents = (x - mu_dev) / sd_dev
 
-            # Sample random timesteps and noise, then add noise via HF scheduler
-            B = clean_latents.size(0)
-            t = torch.randint(0, num_time_steps, (B,), device=x.device, dtype=torch.long)
-            noise = torch.randn_like(clean_latents)
-            noisy_latents = scheduler.add_noise(clean_latents, noise, t)
-            
             optimizer.zero_grad()
-            
-            if conditional:
-                # Classifier-free guidance training (uses DDP-wrapped model so gradients sync)
-                out_uncond, out_cond = model(
-                    noisy_latents,
-                    t,
-                    covariates,
-                    cfg_drop_prob=p_uncond,
-                    return_pair=True,
-                )
-                loss_un = v_pred_loss(out_uncond, clean_latents, noise, t, scheduler)
-                loss_co = v_pred_loss(out_cond,   clean_latents, noise, t, scheduler)
-                loss = 0.5 * (loss_un + loss_co)
+
+            if model_type == "unet":
+                # Sample random timesteps and noise, then add noise via DDPM scheduler
+                B = clean_latents.size(0)
+                t = torch.randint(0, num_time_steps, (B,), device=x.device, dtype=torch.long)
+                noise = torch.randn_like(clean_latents)
+                noisy_latents = scheduler.add_noise(clean_latents, noise, t)
+
+                if conditional:
+                    out_uncond, out_cond = model(
+                        noisy_latents,
+                        t,
+                        covariates,
+                        cfg_drop_prob=p_uncond,
+                        return_pair=True,
+                    )
+                    loss_un = v_pred_loss(out_uncond, clean_latents, noise, t, scheduler)
+                    loss_co = v_pred_loss(out_cond, clean_latents, noise, t, scheduler)
+                    loss = 0.5 * (loss_un + loss_co)
+                else:
+                    output = model(noisy_latents, t)
+                    loss = v_pred_loss(output, clean_latents, noise, t, scheduler)
             else:
-                output = model(noisy_latents, t)
-                loss = v_pred_loss(output, clean_latents, noise, t, scheduler)
+                # Flow matching objective in latent space.
+                B = clean_latents.size(0)
+                t = torch.rand(B, device=x.device, dtype=clean_latents.dtype)
+                t_view = t.view(B, *([1] * (clean_latents.dim() - 1)))
+                base_latents = torch.randn_like(clean_latents)
+                z_t = (1.0 - t_view) * base_latents + t_view * clean_latents
+                v_target = clean_latents - base_latents
+
+                if conditional:
+                    out_uncond, out_cond = model(
+                        z_t,
+                        t,
+                        covariates,
+                        cfg_drop_prob=p_uncond,
+                        return_pair=True,
+                    )
+                    loss = 0.5 * (
+                        F.mse_loss(out_uncond, v_target) +
+                        F.mse_loss(out_cond, v_target)
+                    )
+                else:
+                    output = model(z_t, t)
+                    loss = F.mse_loss(output, v_target)
             
             total_loss += loss.item()
             total_steps += 1
@@ -755,9 +860,15 @@ def train(
             
             # Clean up
             if conditional:
-                del x, clean_latents, noise, loss, t, covariates, noisy_latents
+                if model_type == "unet":
+                    del x, clean_latents, noise, loss, t, covariates, noisy_latents
+                else:
+                    del x, clean_latents, loss, t, covariates, base_latents, z_t, v_target
             else:
-                del x, clean_latents, noise, output, loss, t, noisy_latents
+                if model_type == "unet":
+                    del x, clean_latents, noise, output, loss, t, noisy_latents
+                else:
+                    del x, clean_latents, output, loss, t, base_latents, z_t, v_target
             
         loss_tensor = torch.tensor(
             [total_loss, float(total_steps)],
@@ -785,10 +896,22 @@ def train(
                     'ema': ema.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'scaler': scaler.state_dict(),
+                    'model_type': model_type,
                     'conditional': conditional,
                     'cond_dim': cond_dim if conditional else None,
                     'channel_mean': channel_mean_cpu.clone(),
                     'channel_std': channel_std_cpu.clone(),
+                    'latent_shape': tuple(sample_shape),
+                    'flow_matching': (model_type in {"sit", "usit"}),
+                    'sit_config': {
+                        'num_layers': int(sit_num_layers),
+                        'num_heads': int(sit_num_heads),
+                        'mlp_ratio': int(sit_mlp_ratio),
+                        'dropout': float(sit_dropout),
+                        'use_udit': bool(sit_use_udit or model_type == "usit"),
+                        'flow_use_latent_normalization': bool(flow_use_latent_normalization),
+                        'flow_norm_eps': float(flow_norm_eps),
+                    },
                 }
                 os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
                 model_output_path_epoch = model_output_path.replace(".pth", f"_epoch{i+1}.pth")
@@ -807,10 +930,22 @@ def train(
             'ema': ema.state_dict(),
             'lr_scheduler': lr_scheduler.state_dict(),
             'scaler': scaler.state_dict(),
+            'model_type': model_type,
             'conditional': conditional,
             'cond_dim': cond_dim if conditional else None,
             'channel_mean': channel_mean_cpu.clone(),
             'channel_std': channel_std_cpu.clone(),
+            'latent_shape': tuple(sample_shape),
+            'flow_matching': (model_type in {"sit", "usit"}),
+            'sit_config': {
+                'num_layers': int(sit_num_layers),
+                'num_heads': int(sit_num_heads),
+                'mlp_ratio': int(sit_mlp_ratio),
+                'dropout': float(sit_dropout),
+                'use_udit': bool(sit_use_udit or model_type == "usit"),
+                'flow_use_latent_normalization': bool(flow_use_latent_normalization),
+                'flow_norm_eps': float(flow_norm_eps),
+            },
         }
         os.makedirs(os.path.dirname(model_output_path), exist_ok=True)
         torch.save(checkpoint, model_output_path)
@@ -843,6 +978,14 @@ def main():
     parser.add_argument("--binary-cols", type=str, nargs='+', help="List of binary variable column names")
     parser.add_argument("--categorical-cols", type=str, nargs='+', help="List of categorical variable column names")
     parser.add_argument("--cfg-drop-prob", type=float, default=0.1, help="Drop probability for classifier-free guidance (unconditional branch)")
+    parser.add_argument("--model-type", type=str, default="usit", choices=["unet", "sit", "usit"], help="Diffusion architecture to train")
+    parser.add_argument("--sit-num-layers", type=int, default=9, help="SiT/USiT transformer layers")
+    parser.add_argument("--sit-num-heads", type=int, default=8, help="SiT/USiT attention heads")
+    parser.add_argument("--sit-mlp-ratio", type=int, default=4, help="SiT/USiT MLP ratio")
+    parser.add_argument("--sit-dropout", type=float, default=0.0, help="SiT/USiT dropout")
+    parser.add_argument("--sit-use-udit", action='store_true', help="Use U-shaped SiT even if model-type=sit")
+    parser.add_argument("--flow-disable-latent-normalization", action='store_true', help="Disable latent normalization in flow matching mode")
+    parser.add_argument("--flow-norm-eps", type=float, default=1e-6, help="Epsilon for latent normalization std clamp")
 
     args = parser.parse_args()
 
@@ -862,7 +1005,15 @@ def main():
         cond_dim=args.cond_dim,
         binary_cols=args.binary_cols,
         categorical_cols=args.categorical_cols, 
-        cfg_drop_prob=args.cfg_drop_prob
+        cfg_drop_prob=args.cfg_drop_prob,
+        model_type=args.model_type,
+        sit_num_layers=args.sit_num_layers,
+        sit_num_heads=args.sit_num_heads,
+        sit_mlp_ratio=args.sit_mlp_ratio,
+        sit_dropout=args.sit_dropout,
+        sit_use_udit=args.sit_use_udit,
+        flow_use_latent_normalization=(not args.flow_disable_latent_normalization),
+        flow_norm_eps=args.flow_norm_eps,
     )
 
 if __name__ == "__main__":
