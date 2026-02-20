@@ -4,8 +4,8 @@
 #SBATCH --mem=20G
 #SBATCH -t 2-00:00:00
 #SBATCH -c 8
-#SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_ae128_chr_%j.out
-#SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_ae128_chr_%j.err
+#SBATCH -o /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_ae_tok_chr_%j.out
+#SBATCH -e /n/holystore01/LABS/xlin/Lab/ahmadazim/log_err/diffugene_ae_tok_chr_%j.err
 
 set -euo pipefail
 
@@ -24,5 +24,5 @@ export MKL_DYNAMIC=TRUE
 export MKL_NUM_THREADS=8
 
 # This wrapper expects to receive python -m DiffuGene.VAEembed.train ... arguments
-python -m DiffuGene.VAEembed.train "$@"
+python -m DiffuGene.VAEembed.train_tok "$@"
 

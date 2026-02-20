@@ -1,6 +1,5 @@
 """
 Deterministic autoencoder for per-SNP genotype sequences.
-
 1D encoder → 2D latent → mirrored decoder. Returns (logits, z).
 """
 
