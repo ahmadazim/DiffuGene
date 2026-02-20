@@ -14,12 +14,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 try:
-    from .aeTok import TokenAEConfig, build_token_ae, reconstruction_loss
+    from .aeTok import TokenAEConfig, build_token_ae
     from ..utils import setup_logging, get_logger
 except Exception:
     import sys
     sys.path.append('/n/home03/ahmadazim/WORKING/genGen/DiffuGene/src')
-    from DiffuGene.VAEembed.aeTok import TokenAEConfig, build_token_ae, reconstruction_loss
+    from DiffuGene.VAEembed.aeTok import TokenAEConfig, build_token_ae
     from DiffuGene.utils import setup_logging, get_logger
 
 
@@ -67,26 +67,63 @@ class H5ChromosomeDataset(Dataset):
 
 
 @torch.no_grad()
-def _eval_val(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+def _eval_val(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    maf_lambda: float = 0.0,
+    ld_lambda: float = 0.0,
+    ld_window: int = 128,
+    beta_kl: float = 0.0,
+) -> Dict[str, float]:
     model.eval()
-    total_ce = 0.0
+    total_recon = 0.0
+    total_maf = 0.0
+    total_ld = 0.0
+    total_kl = 0.0
     total_mse = 0.0
     total_n = 0
     for xb in loader:
         xb = xb.to(device)
         logits, _ = model(xb)
-        ce = reconstruction_loss(logits, xb)
+        loss, metrics = model.loss_function(
+            logits,
+            xb,
+            None,
+            maf_lambda=maf_lambda,
+            ld_lambda=ld_lambda,
+            ld_window=ld_window,
+            beta_kl=beta_kl,
+        )
         probs = torch.softmax(logits, dim=-1)
         x_hat = probs[..., 1] + 2.0 * probs[..., 2]
         mse = torch.mean((x_hat - xb.float()) ** 2)
         bsz = xb.size(0)
-        total_ce += float(ce.item()) * bsz
+        total_recon += float(metrics["recon"].item()) * bsz
+        total_maf += float(metrics["maf"].item()) * bsz
+        total_ld += float(metrics["ld"].item()) * bsz
+        total_kl += float(metrics["kl"].item()) * bsz
         total_mse += float(mse.item()) * bsz
         total_n += bsz
     model.train()
     if total_n == 0:
-        return {"ce": float("nan"), "mse": float("nan")}
-    return {"ce": total_ce / total_n, "mse": total_mse / total_n}
+        return {
+            "recon": float("nan"),
+            "maf": float("nan"),
+            "ld": float("nan"),
+            "kl": float("nan"),
+            "mse": float("nan"),
+            "loss": float("nan"),
+        }
+    return {
+        "recon": total_recon / total_n,
+        "maf": total_maf / total_n,
+        "ld": total_ld / total_n,
+        "kl": total_kl / total_n,
+        "mse": total_mse / total_n,
+        "loss": (total_recon + total_maf + total_ld) / total_n,
+    }
 
 
 def main() -> None:
@@ -104,6 +141,10 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--maf-lambda", type=float, default=0.0)
+    p.add_argument("--ld-lambda", type=float, default=0.0)
+    p.add_argument("--ld-window", type=int, default=128)
+    p.add_argument("--beta-kl", type=float, default=0.0, help="Kept for parity; token AE currently deterministic.")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--save-path", required=True)
     args = p.parse_args()
@@ -136,24 +177,60 @@ def main() -> None:
     best = {"epoch": 0, "val_mse": float("inf"), "state": None}
     for epoch in range(1, int(args.epochs) + 1):
         sum_loss = 0.0
+        sum_recon = 0.0
+        sum_maf = 0.0
+        sum_ld = 0.0
+        sum_kl = 0.0
         n = 0
         for xb in train_loader:
             xb = xb.to(device)
             optimizer.zero_grad(set_to_none=True)
             logits, _ = model(xb)
-            loss = reconstruction_loss(logits, xb)
+            loss, metrics = model.loss_function(
+                logits,
+                xb,
+                None,
+                maf_lambda=float(args.maf_lambda),
+                ld_lambda=float(args.ld_lambda),
+                ld_window=int(args.ld_window),
+                beta_kl=float(args.beta_kl),
+            )
             loss.backward()
             if args.grad_clip and args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
             optimizer.step()
             sum_loss += float(loss.item()) * xb.size(0)
+            sum_recon += float(metrics["recon"].item()) * xb.size(0)
+            sum_maf += float(metrics["maf"].item()) * xb.size(0)
+            sum_ld += float(metrics["ld"].item()) * xb.size(0)
+            sum_kl += float(metrics["kl"].item()) * xb.size(0)
             n += xb.size(0)
         scheduler.step()
 
-        val = _eval_val(model, val_loader, device)
+        val = _eval_val(
+            model,
+            val_loader,
+            device,
+            maf_lambda=float(args.maf_lambda),
+            ld_lambda=float(args.ld_lambda),
+            ld_window=int(args.ld_window),
+            beta_kl=float(args.beta_kl),
+        )
         logger.info(
-            "[TOK-AE] epoch=%d/%d train_ce=%.6f val_ce=%.6f val_mse=%.6f",
-            epoch, int(args.epochs), (sum_loss / max(1, n)), val["ce"], val["mse"]
+            "[TOK-AE] epoch=%d/%d train_loss=%.6f train_recon=%.6f train_maf=%.6f train_ld=%.6f train_kl=%.6f "
+            "val_recon=%.6f val_maf=%.6f val_ld=%.6f val_kl=%.6f val_mse=%.6f",
+            epoch,
+            int(args.epochs),
+            (sum_loss / max(1, n)),
+            (sum_recon / max(1, n)),
+            (sum_maf / max(1, n)),
+            (sum_ld / max(1, n)),
+            (sum_kl / max(1, n)),
+            val["recon"],
+            val["maf"],
+            val["ld"],
+            val["kl"],
+            val["mse"],
         )
         if val["mse"] < best["val_mse"]:
             best["val_mse"] = float(val["mse"])

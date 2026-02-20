@@ -9,6 +9,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def local_ld_penalty(x_data: torch.Tensor, x_hat: torch.Tensor, window: int = 128) -> torch.Tensor:
+    """LD penalty: mean Frobenius norm between local correlation matrices."""
+    bsz, length = x_data.shape
+    total = 0.0
+    num = 0
+    for s in range(0, length - window + 1, window):
+        e = s + window
+        xd = x_data[:, s:e]
+        xr = x_hat[:, s:e]
+        xd = xd - xd.mean(dim=0, keepdim=True)
+        xr = xr - xr.mean(dim=0, keepdim=True)
+        cov_d = (xd.T @ xd) / (bsz - 1 + 1e-6)
+        cov_r = (xr.T @ xr) / (bsz - 1 + 1e-6)
+        std_d = torch.sqrt(torch.diag(cov_d) + 1e-6)
+        std_r = torch.sqrt(torch.diag(cov_r) + 1e-6)
+        corr_d = cov_d / (std_d[:, None] * std_d[None, :] + 1e-6)
+        corr_r = cov_r / (std_r[:, None] * std_r[None, :] + 1e-6)
+        total = total + torch.norm(corr_r - corr_d, p="fro")
+        num += 1
+    return total / max(num, 1)
+
+
 def find_best_ck(x: int, max_c: int = 5, *, min_k: Optional[int] = None) -> Tuple[int, int]:
     """Pick (c,k) so c*2^k is close to x with optional k lower-bound."""
     best_c, best_k = 1, 0
@@ -229,6 +251,63 @@ class TokenAutoencoder1D(nn.Module):
         z = self.encode(x)
         logits = self.decode(z)
         return logits, z
+
+    def loss_function(
+        self,
+        logits: torch.Tensor,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        *,
+        maf_lambda: float = 0.0,
+        ld_lambda: float = 0.0,
+        ld_window: int = 128,
+        beta_kl: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # logits expected shape (B, L, 3)
+        bsz, length, n_classes = logits.shape
+        ce = F.cross_entropy(
+            logits.view(bsz * length, n_classes),
+            x.view(bsz * length).long(),
+            reduction="none",
+        ).view(bsz, length)
+        if mask is not None:
+            if mask.shape != ce.shape:
+                raise ValueError(
+                    f"Mask shape {mask.shape} is not compatible with CE shape {ce.shape}; "
+                    "mask must be in base space (B, L)."
+                )
+            ce = ce * mask
+            recon_loss = ce.sum() / (mask.sum() + 1e-6)
+        else:
+            recon_loss = ce.mean()
+
+        total_loss = recon_loss
+        metrics = {"recon": recon_loss.detach()}
+
+        probs = torch.softmax(logits, dim=-1)  # (B,L,3)
+        class_values = torch.tensor([0.0, 1.0, 2.0], device=logits.device).view(1, 1, 3)
+        x_hat = (probs * class_values).sum(dim=-1)  # (B,L)
+        if maf_lambda and maf_lambda > 0.0:
+            maf_data = x.float().mean(dim=0) / 2.0
+            maf_recon = x_hat.mean(dim=0) / 2.0
+            maf_pen = torch.mean(torch.abs(maf_recon - maf_data))
+            total_loss = total_loss + maf_lambda * maf_pen
+            metrics["maf"] = maf_pen.detach()
+        else:
+            metrics["maf"] = torch.tensor(0.0, device=logits.device)
+
+        if ld_lambda and ld_lambda > 0.0 and x.size(1) >= ld_window:
+            ld_pen = local_ld_penalty(x.float(), x_hat, window=ld_window)
+            total_loss = total_loss + ld_lambda * ld_pen
+            metrics["ld"] = ld_pen.detach()
+        else:
+            metrics["ld"] = torch.tensor(0.0, device=logits.device)
+
+        # Deterministic token AE: no KL term, preserve metric keys for parity.
+        used_beta = float(beta_kl) if beta_kl is not None else 0.0
+        metrics["kl"] = torch.tensor(0.0, device=logits.device)
+        metrics["beta"] = torch.tensor(used_beta, device=logits.device)
+        return total_loss, metrics
 
 
 def reconstruction_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
