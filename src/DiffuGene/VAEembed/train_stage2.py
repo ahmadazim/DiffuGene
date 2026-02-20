@@ -14,9 +14,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 try:
-    from DiffuGene.VAEembed.aeTok import TokenAutoencoder1D, TokenAEConfig
-    from DiffuGene.VAEembed.train_tok import H5ChromosomeDataset
-    from DiffuGene.VAEembed.sharedEmbed_tok import (
+    from DiffuGene.VAEembed.ae import TokenAutoencoder1D, TokenAEConfig
+    from DiffuGene.VAEembed.train import H5ChromosomeDataset
+    from DiffuGene.VAEembed.sharedEmbed import (
         FiLM1D,
         HomogenizedTokenAE,
         Stage2PenaltyConfigTok,
@@ -28,9 +28,9 @@ except Exception:
     src_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
     if src_root not in sys.path:
         sys.path.insert(0, src_root)
-    from DiffuGene.VAEembed.aeTok import TokenAutoencoder1D, TokenAEConfig
-    from DiffuGene.VAEembed.train_tok import H5ChromosomeDataset
-    from DiffuGene.VAEembed.sharedEmbed_tok import (
+    from DiffuGene.VAEembed.ae import TokenAutoencoder1D, TokenAEConfig
+    from DiffuGene.VAEembed.train import H5ChromosomeDataset
+    from DiffuGene.VAEembed.sharedEmbed import (
         FiLM1D,
         HomogenizedTokenAE,
         Stage2PenaltyConfigTok,

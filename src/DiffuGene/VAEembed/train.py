@@ -14,12 +14,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 try:
-    from .aeTok import TokenAEConfig, build_token_ae
+    from .ae import TokenAEConfig, build_token_ae
     from ..utils import setup_logging, get_logger
 except Exception:
     import sys
     sys.path.append('/n/home03/ahmadazim/WORKING/genGen/DiffuGene/src')
-    from DiffuGene.VAEembed.aeTok import TokenAEConfig, build_token_ae
+    from DiffuGene.VAEembed.ae import TokenAEConfig, build_token_ae
     from DiffuGene.utils import setup_logging, get_logger
 
 

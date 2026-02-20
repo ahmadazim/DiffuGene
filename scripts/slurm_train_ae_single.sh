@@ -24,5 +24,5 @@ export MKL_DYNAMIC=TRUE
 export MKL_NUM_THREADS=8
 
 # This wrapper expects to receive python -m DiffuGene.VAEembed.train ... arguments
-python -m DiffuGene.VAEembed.train_tok "$@"
+python -m DiffuGene.VAEembed.train "$@"
 

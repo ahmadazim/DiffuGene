@@ -10,7 +10,7 @@
 
 conda init
 eval "$(conda shell.bash hook)"
-conda activate boltz1
+conda activate diffugene
 module load cuda/12.4.1-fasrc01
 module load cudnn/9.5.1.17_cuda12-fasrc01
 module load R gcc cmake
