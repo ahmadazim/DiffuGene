@@ -31,7 +31,7 @@ import os
 import json
 import argparse
 import hashlib
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Any
 
 import sys
 import torch
@@ -42,6 +42,7 @@ from diffusers import DDIMScheduler
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src'))
 
 from DiffuGene.diffusion.unet import LatentUNET2D as ConditionalUNET
+from DiffuGene.diffusion.SiT import SiTFlowModel
 from DiffuGene.utils import (
     setup_logging, get_logger,
     prepare_covariates_for_training,  # builds normalized covariate tensor aligned to fam
@@ -60,10 +61,28 @@ def ckpt_signature(ckpt) -> Tuple[str, list]:
         return "NA", []
 
 
-def load_model_from_ckpt(model_path: str, device: torch.device) -> Tuple[torch.nn.Module, bool, Optional[int]]:
+def _infer_sit_dims(latent_shape: Any) -> Tuple[int, int]:
+    if latent_shape is None:
+        return 64, 128 * 128
+    if len(latent_shape) == 4:
+        # (N,C,H,W) when stored including batch; keep only latent dims
+        _, c, h, w = latent_shape
+        return int(c), int(h * w)
+    if len(latent_shape) == 3:
+        # (C,H,W)
+        c, h, w = latent_shape
+        return int(c), int(h * w)
+    if len(latent_shape) == 2:
+        # (N,D)
+        n, d = latent_shape
+        return int(d), int(n)
+    raise ValueError(f"Unsupported latent_shape metadata: {latent_shape}")
+
+
+def load_model_from_ckpt(model_path: str, device: torch.device) -> Tuple[torch.nn.Module, bool, Optional[int], str, Tuple[int, ...]]:
     """
     Load ConditionalUNET and EMA weights from checkpoint.
-    Returns (model, is_conditional, cond_dim)
+    Returns (model, is_conditional, cond_dim, model_type, latent_shape)
     """
     checkpoint = torch.load(model_path, map_location="cpu")
     sig, head = ckpt_signature(checkpoint)
@@ -71,13 +90,32 @@ def load_model_from_ckpt(model_path: str, device: torch.device) -> Tuple[torch.n
 
     is_conditional = bool(checkpoint.get("conditional", False))
     cond_dim = checkpoint.get("cond_dim", None)
+    model_type = str(checkpoint.get("model_type", "usit")).lower()
+    latent_shape = tuple(checkpoint.get("latent_shape", (64, 128, 128)))
     logger.info(f"[CKPT] conditional={is_conditional} cond_dim_in_ckpt={cond_dim}")
+    logger.info(f"[CKPT] model_type={model_type} latent_shape={latent_shape}")
 
     if "ema" not in checkpoint:
         raise KeyError("EMA weights not found in checkpoint. Training saves EMA; generation expects it.")
 
     # Build model
-    model = ConditionalUNET(input_channels=64, output_channels=64, cond_dim=(cond_dim or 0))
+    if model_type == "unet":
+        model = ConditionalUNET(input_channels=64, output_channels=64, cond_dim=(cond_dim or 0))
+    elif model_type in {"sit", "usit"}:
+        sit_cfg = checkpoint.get("sit_config", {}) or {}
+        token_dim, latent_length = _infer_sit_dims(latent_shape)
+        model = SiTFlowModel(
+            token_dim=token_dim,
+            latent_length=latent_length,
+            cond_dim=(cond_dim if is_conditional else None),
+            num_layers=int(sit_cfg.get("num_layers", 9)),
+            num_heads=int(sit_cfg.get("num_heads", 8)),
+            mlp_ratio=int(sit_cfg.get("mlp_ratio", 4)),
+            dropout=float(sit_cfg.get("dropout", 0.0)),
+            use_udit=bool(sit_cfg.get("use_udit", model_type == "usit")),
+        )
+    else:
+        raise ValueError(f"Unsupported model_type in checkpoint: {model_type}")
     ema = ModelEmaV3(model, decay=0.9)
     ema.load_state_dict(checkpoint["ema"])
     model.load_state_dict(ema.module.state_dict())
@@ -92,7 +130,7 @@ def load_model_from_ckpt(model_path: str, device: torch.device) -> Tuple[torch.n
 
     # cleanup
     del checkpoint, ema
-    return model, is_conditional, cond_dim
+    return model, is_conditional, cond_dim, model_type, latent_shape
 
 
 def build_covariates_if_needed(
@@ -126,6 +164,8 @@ def build_covariates_if_needed(
 @torch.no_grad()
 def ddim_generate(
     model: torch.nn.Module,
+    model_type: str,
+    latent_shape: Tuple[int, ...],
     num_samples: int,
     batch_size: int,
     num_steps: int,
@@ -144,19 +184,28 @@ def ddim_generate(
     """
     assert prediction_type in ("epsilon", "v_prediction"), "prediction_type must be epsilon or v_prediction"
 
-    # Setup DDIM scheduler consistent with training (betas schedule must match!)
-    # You trained with linear betas in your training code.
-    ddim = DDIMScheduler(
-        num_train_timesteps=1000,
-        beta_schedule="linear",
-        beta_start=1e-4,
-        beta_end=0.02,
-        clip_sample=False,
-        prediction_type=prediction_type,
-    )
-    ddim.set_timesteps(num_inference_steps=num_steps, device=device)  # descending
+    model_type = str(model_type).lower()
+    if len(latent_shape) == 3:
+        C, H, W = int(latent_shape[0]), int(latent_shape[1]), int(latent_shape[2])
+        token_shape = (C, H, W)
+    elif len(latent_shape) == 2:
+        N, D = int(latent_shape[0]), int(latent_shape[1])
+        token_shape = (N, D)
+    else:
+        raise ValueError(f"Unsupported latent shape {latent_shape}.")
 
-    C, H, W = 64, 128, 128
+    ddim = None
+    if model_type == "unet":
+        # Setup DDIM scheduler consistent with training
+        ddim = DDIMScheduler(
+            num_train_timesteps=1000,
+            beta_schedule="linear",
+            beta_start=1e-4,
+            beta_end=0.02,
+            clip_sample=False,
+            prediction_type=prediction_type,
+        )
+        ddim.set_timesteps(num_inference_steps=num_steps, device=device)  # descending
     out = []
     cov_out = []
 
@@ -190,34 +239,55 @@ def ddim_generate(
             cov_batch = None
 
         # x_T ~ N(0,I)
-        x = torch.randn(bs, C, H, W, device=device, dtype=next(model.parameters()).dtype).to(memory_format=torch.channels_last)
-
-        # run DDIM
-        for t in ddim.timesteps:
-            t_vec = t.expand(bs).to(device)
-            if use_cfg:
-                # compute shared input projection once
-                h = model.input_proj(x)
-
-                # Unconditional branch uses learned null embedding already in cross-attn space
-                null_emb = getattr(model, "null_cond_emb").expand(bs, -1).unsqueeze(1)  # (B,1,hidden)
-                u_uncond = model.unet(h, t_vec, encoder_hidden_states=null_emb).sample
-                y_uncond = model.output_proj(u_uncond)
-
-                # Conditional branch uses embedded covariates
-                if cov_batch is None:
-                    raise ValueError("CFG requested but covariates are missing.")
-                e = model.cond_emb(cov_batch).unsqueeze(1)  # (B,1,hidden)
-                u_cond = model.unet(h, t_vec, encoder_hidden_states=e).sample
-                y_cond = model.output_proj(u_cond)
-
-                # Guidance: y = u + s (c - u)
-                model_out = y_uncond + guidance_scale * (y_cond - y_uncond)
+        if model_type == "unet":
+            x = torch.randn(bs, C, H, W, device=device, dtype=next(model.parameters()).dtype).to(memory_format=torch.channels_last)
+            # run DDIM
+            for t in ddim.timesteps:
+                t_vec = t.expand(bs).to(device)
+                if use_cfg:
+                    h = model.input_proj(x)
+                    null_emb = getattr(model, "null_cond_emb").expand(bs, -1).unsqueeze(1)
+                    u_uncond = model.unet(h, t_vec, encoder_hidden_states=null_emb).sample
+                    y_uncond = model.output_proj(u_uncond)
+                    if cov_batch is None:
+                        raise ValueError("CFG requested but covariates are missing.")
+                    e = model.cond_emb(cov_batch).unsqueeze(1)
+                    u_cond = model.unet(h, t_vec, encoder_hidden_states=e).sample
+                    y_cond = model.output_proj(u_cond)
+                    model_out = y_uncond + guidance_scale * (y_cond - y_uncond)
+                else:
+                    model_out = unet_once(x, t_vec, cov_batch)
+                step = ddim.step(model_output=model_out, timestep=t, sample=x, eta=eta)
+                x = step.prev_sample
+        else:
+            # Flow ODE sampling (Euler) from base Gaussian at t=0 to t=1.
+            if len(token_shape) == 3:
+                x = torch.randn(bs, token_shape[0], token_shape[1], token_shape[2], device=device, dtype=next(model.parameters()).dtype)
             else:
-                model_out = unet_once(x, t_vec, cov_batch)
-
-            step = ddim.step(model_output=model_out, timestep=t, sample=x, eta=eta)
-            x = step.prev_sample
+                x = torch.randn(bs, token_shape[0], token_shape[1], device=device, dtype=next(model.parameters()).dtype)
+            t_grid = torch.linspace(0.0, 1.0, steps=int(num_steps) + 1, device=device, dtype=x.dtype)
+            for i in range(int(num_steps)):
+                t_now = t_grid[i].expand(bs)
+                dt = t_grid[i + 1] - t_grid[i]
+                if use_cfg:
+                    if cov_batch is None:
+                        raise ValueError("CFG requested but covariates are missing.")
+                    v_uncond, v_cond = model(
+                        x,
+                        t_now,
+                        cov_batch,
+                        cfg_drop_prob=1.0,
+                        return_pair=True,
+                    )
+                    v = v_uncond + guidance_scale * (v_cond - v_uncond)
+                else:
+                    if getattr(model, "conditional", False) and cov_batch is None:
+                        in_dim = int(model.cond_embed.net[0].in_features)  # type: ignore[union-attr]
+                        cov_fallback = torch.zeros(bs, in_dim, device=device, dtype=x.dtype)
+                        v = model(x, t_now, cov_fallback)
+                    else:
+                        v = model(x, t_now, cov_batch if hasattr(model, "cond_embed") else None)
+                x = x + dt * v
 
         out.append(x.to("cpu"))
         if cov_batch is not None:
@@ -270,7 +340,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load model (+ EMA)
-    model, is_conditional, cond_dim = load_model_from_ckpt(args.model_path, device=device)
+    model, is_conditional, cond_dim, model_type, latent_shape = load_model_from_ckpt(args.model_path, device=device)
 
     if args.cond and not is_conditional:
         raise ValueError("You requested --cond but the loaded checkpoint is UNCONDITIONAL.")
@@ -307,6 +377,8 @@ def main():
     # Generate
     latents, cov_used = ddim_generate(
         model=model,
+        model_type=model_type,
+        latent_shape=latent_shape,
         num_samples=args.num_samples,
         batch_size=args.batch_size,
         num_steps=args.num_steps,
@@ -319,8 +391,10 @@ def main():
 
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     payload = {
-        "latents": latents,          # (N,64,128,128), CPU
+        "latents": latents,          # CPU latent tensor
         "cond": bool(args.cond),
+        "model_type": model_type,
+        "latent_shape": tuple(latent_shape),
         "guidance_scale": float(args.guidance_scale),
         "prediction_type": args.prediction_type,
         "num_steps": int(args.num_steps),

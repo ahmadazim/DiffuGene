@@ -1,409 +1,447 @@
 #!/usr/bin/env python
 """
-Generate samples by starting from *observed training latents* that are noised to t=T
-and then denoised with the same DDIM loop used in generate_HC.py.
+Synthetic-observed generation for chained SiT/USiT flow models.
 
-- Loads EMA weights from your training checkpoint.
-- Supports conditional generation with optional classifier-free guidance (CFG).
-- Works with epsilon- or v_prediction training.
-- Starts from x_T = add_noise(clean_latents, noise, t=T-1) for training latents.
-- Saves a single .pt file with the generated latents and (optionally) the covariates used.
-
-This is identical to generate_HC.py except for the initialization: it uses
-noised *observed* training data rather than fresh Gaussian noise.
+This script starts from observed training latents instead of fresh Gaussian noise:
+1. Load observed training latents.
+2. Normalize into the main-model training space.
+3. Flow backward through the main model.
+4. Convert into the inverse-model training space.
+5. Flow backward through the inverse model to obtain inverse-inverse-noise.
+6. Flow forward through the inverse model and then the main model.
+7. Save generated latents and optionally decode them per chromosome.
 """
 
-import os
-import json
+from __future__ import annotations
+
 import argparse
-import hashlib
-from typing import Optional, List, Tuple
-
+import os
+import random
 import sys
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 import torch
-from timm.utils import ModelEmaV3
-from diffusers import DDIMScheduler
+from tqdm import tqdm
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src'))
+try:
+    from ..utils import setup_logging, get_logger
+    from ..diffusion.SiT import SiTFlowModel
+    from ..diffusion.train import MultiChromosomeMemmapDataset, read_prepare_data
+    from .generate import (
+        SOLVER_MAP,
+        autocast_ctx,
+        decode_per_chromosome,
+        get_norm_tensors,
+        is_identity_norm,
+        load_ae_for_chr,
+        load_flow_model,
+        make_token_offsets,
+        resolve_amp_dtype,
+        save_outputs,
+        validate_compatible_checkpoints,
+    )
+except ImportError:
+    this_dir = os.path.dirname(__file__)
+    src_root = os.path.abspath(os.path.join(this_dir, "..", "..", ".."))
+    if src_root not in sys.path:
+        sys.path.insert(0, src_root)
+    from DiffuGene.utils import setup_logging, get_logger
+    from DiffuGene.diffusion.SiT import SiTFlowModel
+    from DiffuGene.diffusion.train import MultiChromosomeMemmapDataset, read_prepare_data
+    from DiffuGene.generate.generate import (
+        SOLVER_MAP,
+        autocast_ctx,
+        decode_per_chromosome,
+        get_norm_tensors,
+        is_identity_norm,
+        load_ae_for_chr,
+        load_flow_model,
+        make_token_offsets,
+        resolve_amp_dtype,
+        save_outputs,
+        validate_compatible_checkpoints,
+    )
 
-from DiffuGene.diffusion.unet import LatentUNET2D as ConditionalUNET
-from DiffuGene.diffusion.train import read_prepare_data, compute_channel_stats_from_memmap
-from DiffuGene.utils import (
-    setup_logging, get_logger,
-    prepare_covariates_for_training,  # builds normalized covariate tensor aligned to fam
-)
 
 logger = get_logger(__name__)
 
-
-def ckpt_signature(ckpt) -> Tuple[str, list]:
-    try:
-        keys = sorted(list(ckpt.keys()))
-        sig = hashlib.md5(json.dumps(keys).encode()).hexdigest()
-        return sig, keys[:12]
-    except Exception:
-        return "NA", []
+torch.backends.cuda.matmul.allow_tf32 = True
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 
-def load_model_from_ckpt(
-    model_path: str, device: torch.device
-) -> Tuple[torch.nn.Module, bool, Optional[int], Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """
-    Load ConditionalUNET and EMA weights from checkpoint.
-    Returns (model, is_conditional, cond_dim, channel_mean, channel_std)
-    """
-    checkpoint = torch.load(model_path, map_location="cpu")
-    sig, head = ckpt_signature(checkpoint)
-    logger.info(f"[CKPT] path={model_path} keyset_md5={sig} sample_keys={head}")
-
-    is_conditional = bool(checkpoint.get("conditional", False))
-    cond_dim = checkpoint.get("cond_dim", None)
-    logger.info(f"[CKPT] conditional={is_conditional} cond_dim_in_ckpt={cond_dim}")
-
-    if "ema" not in checkpoint:
-        raise KeyError("EMA weights not found in checkpoint. Training saves EMA; generation expects it.")
-
-    channel_mean = checkpoint.get("channel_mean", None)
-    channel_std = checkpoint.get("channel_std", None)
-
-    # Build model
-    model = ConditionalUNET(input_channels=64, output_channels=64, cond_dim=(cond_dim or 0))
-    ema = ModelEmaV3(model, decay=0.9)
-    ema.load_state_dict(checkpoint["ema"])
-    model.load_state_dict(ema.module.state_dict())
-
-    # Move to device
-    model = model.to(device)
-    model.eval()
-
-    nparams = sum(p.numel() for p in model.parameters())
-    logger.info(f"[MODEL] {model.__class__.__name__} params={nparams:,}")
-    logger.info(f"[MODEL] has cond_emb={hasattr(model,'cond_emb')} null_cond_emb={hasattr(model,'null_cond_emb')}")
-
-    # cleanup
-    del checkpoint, ema
-    return model, is_conditional, cond_dim, channel_mean, channel_std
+def reverse_euler(model: SiTFlowModel, z: torch.Tensor, steps: int) -> torch.Tensor:
+    if int(steps) < 1:
+        return z
+    dt = 1.0 / float(steps)
+    for k in range(int(steps)):
+        t_cur = 1.0 - float(k) * dt
+        t_batch = torch.full((z.shape[0],), t_cur, device=z.device, dtype=z.dtype)
+        z = z - dt * model(z, t_batch)
+    return z
 
 
-def build_covariates_if_needed(
-    cond: bool,
-    covariate_file: Optional[str],
-    fam_file: Optional[str],
-    binary_cols: Optional[List[str]],
-    categorical_cols: Optional[List[str]],
-) -> Optional[torch.Tensor]:
-    """
-    Prepares a normalized covariate matrix aligned to fam.
-    Returns a CPU tensor (we'll slice per batch and send to device).
-    """
-    if not cond:
-        return None
+def reverse_rk2(model: SiTFlowModel, z: torch.Tensor, steps: int) -> torch.Tensor:
+    if int(steps) < 1:
+        return z
+    batch = z.shape[0]
+    dt = 1.0 / float(steps)
+    for k in range(int(steps)):
+        t1 = 1.0 - dt * k
+        t0 = 1.0 - dt * (k + 1)
+        t1_batch = torch.full((batch,), float(t1), device=z.device, dtype=z.dtype)
+        t0_batch = torch.full((batch,), float(t0), device=z.device, dtype=z.dtype)
+        v1 = model(z, t1_batch)
+        z_euler = z - dt * v1
+        v0 = model(z_euler, t0_batch)
+        z = z - 0.5 * dt * (v1 + v0)
+    return z
 
-    if covariate_file and fam_file:
-        cov_t, cov_names, _ = prepare_covariates_for_training(
-            covariate_path=covariate_file,
-            fam_path=fam_file,
-            binary_cols=binary_cols or [],
-            categorical_cols=categorical_cols or [],
+
+def reverse_dpm(model: SiTFlowModel, z: torch.Tensor, steps: int) -> torch.Tensor:
+    if int(steps) < 1:
+        return z
+    dt = 1.0 / float(steps)
+    t_steps = torch.linspace(0.0, 1.0, int(steps) + 1, device=z.device, dtype=z.dtype)
+    v_prev = None
+    for i in range(int(steps)):
+        t = t_steps[i]
+        t_batch = torch.full((z.shape[0],), t, device=z.device, dtype=z.dtype)
+        v = model(z, 1.0 - t_batch)
+        if i == 0:
+            z = z - dt * v
+        else:
+            z = z - dt * (1.5 * v - 0.5 * v_prev)
+        v_prev = v
+    return z
+
+
+REVERSE_SOLVER_MAP = {
+    "euler": reverse_euler,
+    "rk2": reverse_rk2,
+    "dpm": reverse_dpm,
+}
+
+
+def get_layout_from_dataset(dataset: MultiChromosomeMemmapDataset) -> Tuple[List[int], Dict[int, int], int, int]:
+    chroms = list(dataset.chromosomes)
+    chr_tokens = {int(chrom): int(dataset.tokens_per_chr[chrom]) for chrom in chroms}
+    total_tokens = int(dataset.total_tokens)
+    token_dim = int(dataset.latent_dim)
+    return chroms, chr_tokens, total_tokens, token_dim
+
+
+def load_observed_slice(dataset: MultiChromosomeMemmapDataset, start: int, end: int) -> torch.Tensor:
+    parts = [torch.from_numpy(np.asarray(dataset.arrays[chrom][start:end])) for chrom in dataset.chromosomes]
+    return torch.cat(parts, dim=1).contiguous().float()
+
+
+def prepare_observed_dataset(args: argparse.Namespace) -> MultiChromosomeMemmapDataset:
+    cache_dir = args.memmap_cache_dir or args.output_dir
+    os.makedirs(cache_dir, exist_ok=True)
+    train_latent_path = os.path.abspath(os.path.expanduser(str(args.train_latent_path)))
+    if not os.path.exists(train_latent_path):
+        raise FileNotFoundError(
+            f"Observed training latent path does not exist: {train_latent_path}. "
+            "Expected a directory containing chr*/batch*_latents.pt, an existing memmap, "
+            "or another path format accepted by diffusion.train.read_prepare_data()."
         )
-        logger.info(f"[COV] Prepared covariates: shape={tuple(cov_t.shape)} features={len(cov_names)}")
-        return cov_t  # CPU tensor
-    else:
-        raise ValueError("--cond was set but no --covariate-file/--fam-file provided.")
-
-
-def get_channel_stats(
-    train_dataset,
-    ckpt_channel_mean: Optional[torch.Tensor],
-    ckpt_channel_std: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Load channel mean/std from checkpoint if available; otherwise compute from memmap.
-    Returns CPU tensors.
-    """
-    if ckpt_channel_mean is not None and ckpt_channel_std is not None:
-        logger.info("[NormStats] Using channel_mean/channel_std from checkpoint")
-        mean_cpu = ckpt_channel_mean.detach().cpu().to(dtype=torch.float32)
-        std_cpu = ckpt_channel_std.detach().cpu().to(dtype=torch.float32)
-        return mean_cpu, std_cpu
-
-    if not hasattr(train_dataset, "arr"):
-        raise ValueError("Channel normalization requires a memmap-backed dataset with an 'arr' attribute.")
-
-    logger.info("[NormStats] Computing per-channel mean/std over memmap")
-    mean_cpu, std_cpu = compute_channel_stats_from_memmap(train_dataset.arr, chunk_size=512)
-    return mean_cpu, std_cpu
-
-
-@torch.no_grad()
-def ddim_generate_from_observed(
-    model: torch.nn.Module,
-    train_dataset,
-    num_samples: int,
-    batch_size: int,
-    num_steps: int,
-    prediction_type: str,
-    eta: float,
-    guidance_scale: float,
-    covariates_ordered: Optional[torch.Tensor],
-    mu_dev: torch.Tensor,
-    sd_dev: torch.Tensor,
-    num_train_timesteps: int,
-    start_index_0: int,
-    device: torch.device,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """
-    Generate latents from noised observed training latents using DDIM.
-
-    Returns:
-      latents_all: (N, C, H, W)
-      cov_used:    (N, D) or None
-    """
-    assert prediction_type in ("epsilon", "v_prediction"), "prediction_type must be epsilon or v_prediction"
-
-    # Setup DDIM scheduler consistent with generate_HC.py
-    ddim = DDIMScheduler(
-        num_train_timesteps=num_train_timesteps,
-        beta_schedule="linear",
-        beta_start=1e-4,
-        beta_end=0.02,
-        clip_sample=False,
-        prediction_type=prediction_type,
+    dataset = read_prepare_data(
+        path=train_latent_path,
+        output_folder=cache_dir,
+        model_output_path=args.main_checkpoint_path,
     )
-    ddim.set_timesteps(num_inference_steps=num_steps, device=device)  # descending
-
-    if not hasattr(train_dataset, "arr"):
-        raise ValueError("Expected a memmap-backed dataset with an 'arr' attribute.")
-
-    _, C, H, W = train_dataset.arr.shape
-    out = []
-    cov_out = []
-
-    # helper to run unet once
-    def unet_once(x_t: torch.Tensor, t: torch.Tensor, cond_vec: Optional[torch.Tensor]):
-        h = model.input_proj(x_t)
-        if cond_vec is not None and hasattr(model, "cond_emb"):
-            e = model.cond_emb(cond_vec).unsqueeze(1)  # (B,1,hidden)
-            u = model.unet(h, t, encoder_hidden_states=e).sample
-        else:
-            u = model.unet(h, t).sample
-        return model.output_proj(u)
-
-    # optional CFG at inference (only if model is conditional AND user requests >1.0 scale)
-    use_cfg = (guidance_scale is not None and guidance_scale > 1.0 and hasattr(model, "cond_emb") and hasattr(model, "null_cond_emb"))
-
-    remaining = int(num_samples)
-    cursor = int(start_index_0)  # position within training dataset and covariates
-    while remaining > 0:
-        bs = min(batch_size, remaining)
-        remaining -= bs
-
-        # slice training latents in-order to preserve alignment with covariates
-        latent_np = train_dataset.arr[cursor:cursor + bs]  # (B,C,H,W) numpy
-        if latent_np.shape[0] != bs:
-            raise ValueError(f"Insufficient latent rows for batch size {bs} at cursor {cursor}.")
-        x = torch.from_numpy(latent_np).to(device=device, dtype=next(model.parameters()).dtype)
-        x = x.to(memory_format=torch.channels_last)
-
-        # pick covariate rows sequentially to preserve order (no replacement)
-        if covariates_ordered is not None:
-            cov_batch_cpu = covariates_ordered[cursor - start_index_0:cursor - start_index_0 + bs]
-            if cov_batch_cpu.shape[0] != bs:
-                raise ValueError(f"Insufficient covariate rows for batch size {bs} at cursor {cursor}.")
-            cov_batch = cov_batch_cpu.to(device=device, dtype=next(model.parameters()).dtype)
-        else:
-            cov_batch = None
-
-        # normalize to training space
-        clean_latents = (x - mu_dev) / sd_dev
-
-        # x_T = add_noise(clean_latents, noise, t=T-1)
-        noise = torch.randn_like(clean_latents)
-        t_max = torch.full((bs,), int(num_train_timesteps - 1), device=device, dtype=torch.long)
-        # t_max = torch.full((bs,), 500, device=device, dtype=torch.long)
-        x = ddim.add_noise(clean_latents, noise, t_max).to(memory_format=torch.channels_last)
-
-        # run DDIM
-        for t in ddim.timesteps:
-            t_vec = t.expand(bs).to(device)
-            if use_cfg:
-                # compute shared input projection once
-                h = model.input_proj(x)
-
-                # Unconditional branch uses learned null embedding already in cross-attn space
-                null_emb = getattr(model, "null_cond_emb").expand(bs, -1).unsqueeze(1)  # (B,1,hidden)
-                u_uncond = model.unet(h, t_vec, encoder_hidden_states=null_emb).sample
-                y_uncond = model.output_proj(u_uncond)
-
-                # Conditional branch uses embedded covariates
-                if cov_batch is None:
-                    raise ValueError("CFG requested but covariates are missing.")
-                e = model.cond_emb(cov_batch).unsqueeze(1)  # (B,1,hidden)
-                u_cond = model.unet(h, t_vec, encoder_hidden_states=e).sample
-                y_cond = model.output_proj(u_cond)
-
-                # Guidance: y = u + s (c - u)
-                model_out = y_uncond + guidance_scale * (y_cond - y_uncond)
-            else:
-                model_out = unet_once(x, t_vec, cov_batch)
-
-            step = ddim.step(model_output=model_out, timestep=t, sample=x, eta=eta)
-            x = step.prev_sample
-
-        out.append(x.to("cpu"))
-        if cov_batch is not None:
-            cov_out.append(cov_batch.to("cpu"))
-
-        cursor += bs
-        del x, clean_latents, noise, latent_np
-        torch.cuda.empty_cache()
-        print(f"Generated {cursor - start_index_0} samples")
-
-    latents_all = torch.cat(out, dim=0)
-    cov_used = torch.cat(cov_out, dim=0) if cov_out else None
-    return latents_all, cov_used
+    if not isinstance(dataset, MultiChromosomeMemmapDataset):
+        raise ValueError(
+            "Observed synthetic generation expects multi-chromosome token latents. "
+            f"Got dataset type: {type(dataset).__name__}"
+        )
+    return dataset
 
 
-"""
-python /n/home03/ahmadazim/WORKING/genGen/DiffuGene/src/DiffuGene/generate/generate_synObs.py \
-  --model-path /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/models/diffusion/DDPM_unrelWhite_allchr_AE128z_epoch22.pth \
-  --train-embed-dataset-path /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/genomic_data/AE_embeddings/unified/ukb_allchr_unrel_britishWhite_unrelWhite_allchr_AE128z_memmap.npy \
-  --prediction-type v_prediction \
-  --num-steps 50 \
-  --num-samples 512 \
-  --batch-size 32 \
-  --eta 0.0 \
-  --guidance-scale 7.0 \
-  --save-path /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/genomic_data/generated_samples/synObs_latents_unrelWhite_allchr_AE128z_512_genBatch1.pt \
-  --cond \
-  --covariate-file /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/covariates/all_covariates.csv \
-  --fam-file /n/home03/ahmadazim/WORKING/genGen/UKBVQVAE/genomic_data/geneticBinary/ukb_allchr_unrel_britishWhite_conditional_diffusion_train.fam \
-  --binary-cols SEX_MALE CAD HYPERTENSION T2D T1D STROKE CKD HYPERLIPIDEMIA LUNG_CANCER BREAST_CANCER PROSTATE_CANCER COLORECTAL_CANCER PANCREATIC_CANCER BIPOLAR MAJOR_DEPRESSION RA IBD AD_DIMENTIA PARKINSONS ATRIAL_FIBRILLATION CHOL_LOW_MEDS ASSESSMENT_CENTER_10003 ASSESSMENT_CENTER_11001 ASSESSMENT_CENTER_11002 ASSESSMENT_CENTER_11003 ASSESSMENT_CENTER_11004 ASSESSMENT_CENTER_11005 ASSESSMENT_CENTER_11006 ASSESSMENT_CENTER_11007 ASSESSMENT_CENTER_11008 ASSESSMENT_CENTER_11009 ASSESSMENT_CENTER_11010 ASSESSMENT_CENTER_11011 ASSESSMENT_CENTER_11012 ASSESSMENT_CENTER_11013 ASSESSMENT_CENTER_11014 ASSESSMENT_CENTER_11016 ASSESSMENT_CENTER_11017 ASSESSMENT_CENTER_11018 ASSESSMENT_CENTER_11020 ASSESSMENT_CENTER_11021 ASSESSMENT_CENTER_11022 ASSESSMENT_CENTER_11023 \
-  --categorical-cols SMOKING_STATUS ALCOHOL_INTAKE \
-  --data-start-index 1
-"""
-
-
-def main():
+def generate(args: argparse.Namespace) -> None:
     setup_logging()
-    p = argparse.ArgumentParser(description="Generate samples by denoising noised observed training latents (DDIM).")
 
-    # Model / checkpoint
-    p.add_argument("--model-path", type=str, required=True)
+    if args.seed is not None:
+        random.seed(int(args.seed))
+        np.random.seed(int(args.seed))
+        torch.manual_seed(int(args.seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(args.seed))
 
-    # Training data (observed latents)
-    p.add_argument("--train-embed-dataset-path", type=str, required=True)
-    p.add_argument(
+    device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
+    amp_dtype = resolve_amp_dtype(args.amp_dtype)
+    use_amp = (not args.disable_amp) and device.type == "cuda"
+
+    inverse_forward_solver = SOLVER_MAP[args.inverse_solver]
+    main_forward_solver = SOLVER_MAP[args.main_solver]
+    inverse_backward_solver = REVERSE_SOLVER_MAP[args.inverse_backward_solver or args.inverse_solver]
+    main_backward_solver = REVERSE_SOLVER_MAP[args.main_backward_solver or args.main_solver]
+
+    logger.info("Using device=%s | amp=%s dtype=%s", device, use_amp, amp_dtype)
+
+    observed_dataset = prepare_observed_dataset(args)
+    chroms, chr_tokens, total_tokens, token_dim = get_layout_from_dataset(observed_dataset)
+    offsets = make_token_offsets(chr_tokens)
+    logger.info(
+        "Observed training layout: %s",
+        ", ".join(f"chr{chrom}:{chr_tokens[chrom]}" for chrom in chroms),
+    )
+
+    total_available = len(observed_dataset)
+    if args.data_start_index < 1:
+        raise ValueError("--data-start-index must be >= 1 (1-indexed).")
+    start_idx0 = int(args.data_start_index) - 1
+    end_idx = start_idx0 + int(args.num_samples)
+    if end_idx > total_available:
+        raise ValueError(
+            f"Requested {args.num_samples} samples starting at row {args.data_start_index} "
+            f"requires rows up to {end_idx}, but only {total_available} rows are available."
+        )
+
+    main_model, main_payload = load_flow_model(
+        checkpoint_path=args.main_checkpoint_path,
+        device=device,
+        use_ema=(not args.use_main_model_weights),
+        hidden_dim_override=args.main_hidden_dim,
+    )
+    inverse_model, inverse_payload = load_flow_model(
+        checkpoint_path=args.inverse_checkpoint_path,
+        device=device,
+        use_ema=(not args.use_inverse_model_weights),
+        hidden_dim_override=args.inverse_hidden_dim,
+    )
+    validate_compatible_checkpoints(main_payload, inverse_payload)
+
+    latent_shape = tuple(main_payload.get("latent_shape", ()))
+    if latent_shape != (total_tokens, token_dim):
+        raise ValueError(
+            f"Observed dataset token layout {(total_tokens, token_dim)} does not match checkpoint latent_shape {latent_shape}"
+        )
+
+    mu_inverse, sd_inverse = get_norm_tensors(inverse_payload, device=device)
+    mu_main, sd_main = get_norm_tensors(main_payload, device=device)
+    inverse_has_norm = not is_identity_norm(mu_inverse, sd_inverse)
+    main_has_norm = not is_identity_norm(mu_main, sd_main)
+
+    if inverse_has_norm:
+        logger.info("Inverse checkpoint normalization detected.")
+    else:
+        logger.info("No norm detected in inverse checkpoint; skipping inverse normalization transforms.")
+
+    if main_has_norm:
+        logger.info("Main checkpoint normalization detected.")
+    else:
+        logger.info("No norm detected in main checkpoint; skipping main normalization transforms.")
+
+    ae_models: Optional[Dict[int, torch.nn.Module]] = None
+    if args.ae_models_dir:
+        ae_models = {chrom: load_ae_for_chr(args.ae_models_dir, chrom, device) for chrom in chroms}
+        logger.info("Loaded AE models for chromosomes: %s", chroms)
+
+    latents_by_chr: Dict[int, List[torch.Tensor]] = {chrom: [] for chrom in chroms}
+    calls_by_chr: Optional[Dict[int, List[np.ndarray]]] = (
+        {chrom: [] for chrom in chroms} if ae_models is not None else None
+    )
+
+    for start in tqdm(range(start_idx0, end_idx, int(args.batch_size)), desc="Generating synthetic observed"):
+        stop = min(end_idx, start + int(args.batch_size))
+        x_obs_cpu = load_observed_slice(observed_dataset, start, stop)
+        z = x_obs_cpu.to(device=device, dtype=torch.float32, non_blocking=(device.type == "cuda"))
+
+        # Raw observed latents -> main normalized training space.
+        if main_has_norm:
+            z = (z - mu_main) / sd_main
+
+        # Backward through main model: observed data -> inverse-noise shared space.
+        with autocast_ctx(device=device, enabled=use_amp, dtype=amp_dtype):
+            z = main_backward_solver(main_model, z, int(args.main_steps))
+
+        z = z.float()
+
+        # Shared space -> inverse-model normalized training space.
+        if inverse_has_norm:
+            z = (z - mu_inverse) / sd_inverse
+
+        # Backward through inverse model: inverse noise -> inverse-inverse noise (~Gaussian).
+        with autocast_ctx(device=device, enabled=use_amp, dtype=amp_dtype):
+            z = inverse_backward_solver(inverse_model, z, int(args.inverse_steps))
+
+        z = z.float()
+
+        # Forward again as in generate.py.
+        with autocast_ctx(device=device, enabled=use_amp, dtype=amp_dtype):
+            z = inverse_forward_solver(inverse_model, z, int(args.inverse_steps))
+
+        z = z.float()
+        if inverse_has_norm:
+            z = z * sd_inverse + mu_inverse
+        if main_has_norm:
+            z = (z - mu_main) / sd_main
+
+        with autocast_ctx(device=device, enabled=use_amp, dtype=amp_dtype):
+            z = main_forward_solver(main_model, z, int(args.main_steps))
+
+        z = z.float()
+        if main_has_norm:
+            z = z * sd_main + mu_main
+        z_cpu = z.detach().cpu()
+
+        offset = 0
+        for chrom in chroms:
+            next_offset = offset + chr_tokens[chrom]
+            latents_by_chr[chrom].append(z_cpu[:, offset:next_offset, :].contiguous())
+            offset = next_offset
+
+        if ae_models is not None and calls_by_chr is not None:
+            decoded_calls = decode_per_chromosome(
+                latents_cpu=z_cpu,
+                chroms=chroms,
+                offsets=offsets,
+                ae_models=ae_models,
+                device=device,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+            )
+            for chrom in chroms:
+                calls_by_chr[chrom].append(decoded_calls[chrom])
+
+        del x_obs_cpu, z, z_cpu
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    metadata = {
+        "mode": "synthetic_observed",
+        "main_checkpoint_path": args.main_checkpoint_path,
+        "inverse_checkpoint_path": args.inverse_checkpoint_path,
+        "train_latent_path": args.train_latent_path,
+        "memmap_cache_dir": args.memmap_cache_dir,
+        "data_start_index": int(args.data_start_index),
+        "num_samples": int(args.num_samples),
+        "batch_size": int(args.batch_size),
+        "inverse_steps": int(args.inverse_steps),
+        "main_steps": int(args.main_steps),
+        "inverse_solver": args.inverse_solver,
+        "main_solver": args.main_solver,
+        "inverse_backward_solver": args.inverse_backward_solver or args.inverse_solver,
+        "main_backward_solver": args.main_backward_solver or args.main_solver,
+        "chromosomes": chroms,
+        "tokens_per_chr": chr_tokens,
+        "token_dim": token_dim,
+        "device": str(device),
+        "amp_enabled": bool(use_amp),
+        "amp_dtype": args.amp_dtype,
+        "seed": args.seed,
+    }
+
+    save_outputs(
+        output_dir=args.output_dir,
+        output_prefix=args.output_prefix,
+        latents_by_chr=latents_by_chr,
+        calls_by_chr=calls_by_chr,
+        metadata=metadata,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate synthetic observed samples by cycling training latents backward and forward through chained flows."
+    )
+    parser.add_argument("--main-checkpoint-path", type=str, required=True, help="Main flow checkpoint")
+    parser.add_argument("--inverse-checkpoint-path", type=str, required=True, help="Noise-correction flow checkpoint")
+    parser.add_argument(
+        "--train-latent-path",
+        type=str,
+        required=True,
+        help="Observed training latents: per-chromosome batch directory or existing memmap-backed source supported by diffusion.train.read_prepare_data().",
+    )
+    parser.add_argument(
+        "--memmap-cache-dir",
+        type=str,
+        default=None,
+        help="Optional directory for memmaps created from batch latents. Defaults to output-dir.",
+    )
+    parser.add_argument("--output-dir", type=str, required=True, help="Directory for generated outputs")
+    parser.add_argument("--output-prefix", type=str, default="synthetic_observed", help="Prefix for saved files")
+    parser.add_argument("--num-samples", type=int, default=1000, help="Number of observed rows to process")
+    parser.add_argument(
         "--data-start-index",
         type=int,
         default=1,
-        help="1-indexed start row in the training dataset to begin sampling from (inclusive).",
+        help="1-indexed start row within the observed training latents.",
     )
-
-    # Sampling
-    p.add_argument("--prediction-type", type=str, default="epsilon", choices=["epsilon", "v_prediction"])
-    p.add_argument("--num-steps", type=int, default=50, help="DDIM steps")
-    p.add_argument("--eta", type=float, default=0.0, help="DDIM stochasticity (0.0 = deterministic)")
-    p.add_argument("--num-samples", type=int, default=512)
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--num-train-timesteps", type=int, default=1000, help="Total training diffusion steps (T)")
-
-    # Conditional settings
-    p.add_argument("--cond", action="store_true", help="Enable conditional generation")
-    p.add_argument("--guidance-scale", type=float, default=1.0, help="CFG scale; >1 enables CFG at inference")
-    p.add_argument("--covariate-file", type=str, default=None)
-    p.add_argument("--fam-file", type=str, default=None)
-    p.add_argument("--binary-cols", nargs="*", default=None)
-    p.add_argument("--categorical-cols", nargs="*", default=None)
-
-    # Output
-    p.add_argument("--save-path", type=str, required=True)
-
-    args = p.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Load model (+ EMA)
-    model, is_conditional, cond_dim, ckpt_mean, ckpt_std = load_model_from_ckpt(args.model_path, device=device)
-
-    if args.cond and not is_conditional:
-        raise ValueError("You requested --cond but the loaded checkpoint is UNCONDITIONAL.")
-    if (not args.cond) and is_conditional:
-        logger.warning("Checkpoint is conditional but --cond not set; generation will ignore covariates.")
-
-    # Load training dataset
-    output_folder = os.path.dirname(args.model_path)
-    train_dataset = read_prepare_data(args.train_embed_dataset_path, output_folder, args.model_path)
-
-    total_rows = int(len(train_dataset))
-    if args.data_start_index < 1:
-        raise ValueError("--data-start-index must be >= 1 (1-indexed).")
-    start_idx_0 = args.data_start_index - 1
-    end_idx = start_idx_0 + int(args.num_samples)
-    if end_idx > total_rows:
-        raise ValueError(
-            f"Requested {args.num_samples} samples starting at row {args.data_start_index} "
-            f"requires rows up to {end_idx} but only {total_rows} training rows are available."
-        )
-
-    # Prepare covariates (CPU tensor), if needed
-    covariates_full = build_covariates_if_needed(
-        cond=args.cond,
-        covariate_file=args.covariate_file,
-        fam_file=args.fam_file,
-        binary_cols=args.binary_cols,
-        categorical_cols=args.categorical_cols,
+    parser.add_argument("--batch-size", type=int, default=128, help="Number of observed samples processed at once")
+    parser.add_argument("--inverse-steps", type=int, default=50, help="ODE steps for the inverse model")
+    parser.add_argument("--main-steps", type=int, default=50, help="ODE steps for the main model")
+    parser.add_argument(
+        "--inverse-solver",
+        type=str,
+        default="dpm",
+        choices=sorted(SOLVER_MAP.keys()),
+        help="Forward solver for the inverse model.",
     )
-    if args.cond:
-        covariates_ordered = covariates_full[start_idx_0:end_idx]
-        logger.info(f"[COV] Using covariate rows [{args.data_start_index}..{end_idx}] (1-indexed start, exclusive end).")
-    else:
-        covariates_ordered = None
-
-    # Channel-wise normalization (same as training)
-    channel_mean_cpu, channel_std_cpu = get_channel_stats(train_dataset, ckpt_mean, ckpt_std)
-    channel_std_cpu = torch.clamp(channel_std_cpu, min=1e-6)
-    inferred_channels = int(channel_mean_cpu.numel())
-    mu_dev = channel_mean_cpu.view(1, inferred_channels, 1, 1).to(device)
-    sd_dev = channel_std_cpu.view(1, inferred_channels, 1, 1).to(device)
-    mu_dev = mu_dev.contiguous().to(memory_format=torch.channels_last)
-    sd_dev = sd_dev.contiguous().to(memory_format=torch.channels_last)
-
-    # Generate
-    latents, cov_used = ddim_generate_from_observed(
-        model=model,
-        train_dataset=train_dataset,
-        num_samples=args.num_samples,
-        batch_size=args.batch_size,
-        num_steps=args.num_steps,
-        prediction_type=args.prediction_type,
-        eta=args.eta,
-        guidance_scale=args.guidance_scale,
-        covariates_ordered=covariates_ordered,
-        mu_dev=mu_dev,
-        sd_dev=sd_dev,
-        num_train_timesteps=args.num_train_timesteps,
-        start_index_0=start_idx_0,
-        device=device,
+    parser.add_argument(
+        "--main-solver",
+        type=str,
+        default="dpm",
+        choices=sorted(SOLVER_MAP.keys()),
+        help="Forward solver for the main model.",
     )
+    parser.add_argument(
+        "--inverse-backward-solver",
+        type=str,
+        default=None,
+        choices=sorted(REVERSE_SOLVER_MAP.keys()),
+        help="Optional backward solver for the inverse model. Defaults to --inverse-solver.",
+    )
+    parser.add_argument(
+        "--main-backward-solver",
+        type=str,
+        default=None,
+        choices=sorted(REVERSE_SOLVER_MAP.keys()),
+        help="Optional backward solver for the main model. Defaults to --main-solver.",
+    )
+    parser.add_argument(
+        "--ae-models-dir",
+        type=str,
+        default=None,
+        help="Optional AE directory. If provided, decoded genotype calls are also saved per chromosome.",
+    )
+    parser.add_argument("--device", type=str, default="cuda", help="Device, e.g. cuda or cpu")
+    parser.add_argument("--amp-dtype", type=str, default="bf16", help="Autocast dtype: bf16, fp16, fp32")
+    parser.add_argument("--disable-amp", action="store_true", help="Disable autocast during flow/decoding")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--use-main-model-weights",
+        action="store_true",
+        help="Use raw main model weights instead of EMA weights.",
+    )
+    parser.add_argument(
+        "--use-inverse-model-weights",
+        action="store_true",
+        help="Use raw inverse model weights instead of EMA weights.",
+    )
+    parser.add_argument(
+        "--main-hidden-dim",
+        type=int,
+        default=None,
+        help="Optional hidden_dim override for older main checkpoints that did not save it.",
+    )
+    parser.add_argument(
+        "--inverse-hidden-dim",
+        type=int,
+        default=None,
+        help="Optional hidden_dim override for older inverse checkpoints that did not save it.",
+    )
+    return parser
 
-    os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-    payload = {
-        "latents": latents,          # (N,C,H,W), CPU
-        "cond": bool(args.cond),
-        "guidance_scale": float(args.guidance_scale),
-        "prediction_type": args.prediction_type,
-        "num_steps": int(args.num_steps),
-        "eta": float(args.eta),
-        "num_train_timesteps": int(args.num_train_timesteps),
-        "data_start_index": int(args.data_start_index),
-        "train_embed_dataset_path": args.train_embed_dataset_path,
-    }
-    if cov_used is not None:
-        payload["covariates"] = cov_used  # (N, D)
 
-    torch.save(payload, args.save_path)
-    logger.info(f"[DONE] Saved samples to {args.save_path}  |  latents={tuple(latents.shape)}")
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    generate(args)
 
 
 if __name__ == "__main__":

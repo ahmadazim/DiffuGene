@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 Apply saved PCA Procrustes alignment to generated genotype calls (per chromosome).
+
+Supports current DiffuGene generated outputs where a directory may contain either:
+  - one generation run worth of `*chr{c}_calls.npy` files, or
+  - multiple runs/batches, disambiguated with `--generated-batch-number`.
 """
 
 from __future__ import annotations
@@ -78,22 +82,51 @@ def apply_alignment(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Apply PCA-Procrustes alignment to generated calls.")
-    p.add_argument("--generated-dir", required=True, help="Directory containing generated calls.")
+    p.add_argument(
+        "--generated-dir",
+        required=True,
+        help="Directory containing generated call files (e.g. *chr{c}_calls.npy).",
+    )
+    p.add_argument(
+        "--generated-batch-number",
+        type=int,
+        default=None,
+        help="Optional batch number used to select one generated run when the directory contains multiple batches.",
+    )
     p.add_argument("--chromosomes", nargs="*", default=["all"], help="Chromosomes to process, or 'all'.")
     p.add_argument("--alignment-dir", required=True, help="Directory containing PCA Procrustes alignment artifacts.")
     p.add_argument("--output-dir", required=True, help="Directory to write aligned outputs.")
+    p.add_argument(
+        "--output-prefix",
+        default="",
+        help="Optional prefix for output filenames. Example: run1_ -> run1_chr22_aligned_calls.pt",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if not os.path.isdir(args.generated_dir):
+        raise FileNotFoundError(f"--generated-dir does not exist or is not a directory: {args.generated_dir}")
+    if not os.path.isdir(args.alignment_dir):
+        raise FileNotFoundError(f"--alignment-dir does not exist or is not a directory: {args.alignment_dir}")
     os.makedirs(args.output_dir, exist_ok=True)
 
     chrs = _resolve_chromosomes(args.chromosomes)
 
+    print(f"[INFO] generated_dir={args.generated_dir}")
+    print(f"[INFO] generated_batch_number={args.generated_batch_number}")
+    print(f"[INFO] alignment_dir={args.alignment_dir}")
+    print(f"[INFO] output_dir={args.output_dir}")
+    print(f"[INFO] output_prefix={args.output_prefix}")
+
     for chr_no in chrs:
         print(f"[chr{chr_no}] loading generated calls")
-        X_g = load_generated_calls(args.generated_dir, chr_no)  # [N,L] int8
+        X_g = load_generated_calls(
+            args.generated_dir,
+            chr_no,
+            batch_number=args.generated_batch_number,
+        )  # [N,L] int8
 
         print(f"[chr{chr_no}] loading alignment artifacts")
         meta = _load_meta(args.alignment_dir, chr_no)
@@ -119,8 +152,9 @@ def main() -> None:
             R=R,
         )
 
-        out_float = os.path.join(args.output_dir, f"chr{chr_no}_aligned_float.pt")
-        out_calls = os.path.join(args.output_dir, f"chr{chr_no}_aligned_calls.pt")
+        prefix = str(args.output_prefix)
+        out_float = os.path.join(args.output_dir, f"{prefix}chr{chr_no}_aligned_float.pt")
+        out_calls = os.path.join(args.output_dir, f"{prefix}chr{chr_no}_aligned_calls.pt")
         torch.save(torch.from_numpy(X_float), out_float)
         torch.save(torch.from_numpy(X_calls), out_calls)
         print(f"[chr{chr_no}] saved: {out_float}")
