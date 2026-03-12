@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Write a single PLINK1 binary dataset (bed/bim/fam) from per-chromosome .pt call tensors.
+Write a single PLINK1 binary dataset (bed/bim/fam) from per-chromosome call files.
 
 Inputs:
-  --pt-dir      directory containing chr{1..22}_calls.pt (ignores chr*_logits.pt)
+  --pt-dir      directory containing chr{1..22}_calls.pt/.npy or aligned variants
+  --file-prefix-pattern
+                optional basename prefix/glob to select one run when the directory
+                contains multiple matching chr files
   --bim-all     BIM for ALL variants across all chromosomes, in the SAME order as concatenation of chr calls
   --fam         FAM for individuals (N rows), in the SAME order as tensors
   --out-prefix  output prefix for .bed/.bim/.fam
 
 Assumptions (STRICT):
-  - Each chr{c}_calls.pt or chr{c}_aligned_calls.pt is a tensor or dict with key "calls", shape [N, p_c], genotypes in {0,1,2}
+  - Each chr{c}_calls(.pt/.npy) or chr{c}_aligned_calls(.pt/.npy) contains shape [N, p_c], genotypes in {0,1,2}
   - All chromosomes have identical N and the intended variant order matches the provided --bim-all.
   - Concatenating chr1..chr22 along variants gives total variants == number of lines in --bim-all.
 
 This script:
-  - loads chr*_calls.pt
+  - loads chr*_calls.pt/.npy
   - concatenates into one [N, P] matrix
   - writes PLINK bed using pandas_plink.write_plink1_bin
   - then FORCE-copies the provided BIM/FAM into place (writer may overwrite placeholders)
@@ -23,6 +26,8 @@ This script:
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import glob
 import os
 import subprocess
 from typing import Dict, List, Tuple, Union
@@ -36,8 +41,16 @@ from pandas_plink import write_plink1_bin
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Convert per-chr .pt calls to a single PLINK bed/bim/fam.")
-    p.add_argument("--pt-dir", required=True, help="Directory with chr*_calls.pt files.")
+    p = argparse.ArgumentParser(description="Convert per-chr .pt/.npy calls to a single PLINK bed/bim/fam.")
+    p.add_argument("--pt-dir", required=True, help="Directory with chr*_calls.pt/.npy files.")
+    p.add_argument(
+        "--file-prefix-pattern",
+        default=None,
+        help=(
+            "Optional basename prefix or glob-style pattern used to select matching chr files in the input "
+            "directory, e.g. 'synObs_batch1_' or 'synObs_batch1_*'."
+        ),
+    )
     p.add_argument("--bim", required=True, help="BIM for ALL variants (all chromosomes) in correct order, to be copied as is.")
     p.add_argument("--out-prefix", required=True, help="Output prefix for PLINK files.")
     p.add_argument("--chromosomes", default="all", help="Chromosomes to include, e.g. 'all', '1-22', '1,2,3,22'.")
@@ -96,6 +109,76 @@ def _load_calls_pt(path: str) -> np.ndarray:
         raise ValueError(f"{path}: calls have unexpected values {u[:10]}")
     return X
 
+
+def _load_calls_npy(path: str) -> np.ndarray:
+    X = np.load(path)
+    if X.ndim != 2:
+        raise ValueError(f"{path}: expected 2D [N,p] calls array, got {X.shape}")
+    if not np.issubdtype(X.dtype, np.integer):
+        X = np.rint(X)
+    X = np.clip(X, 0, 2).astype(np.float32, copy=False)
+    u = np.unique(X)
+    if u.size > 3 or np.any((u < 0) | (u > 2)) or not np.all(np.isin(u, [0.0, 1.0, 2.0])):
+        raise ValueError(f"{path}: calls have unexpected values {u[:10]}")
+    return X
+
+
+def _load_calls_file(path: str) -> np.ndarray:
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix == ".pt":
+        return _load_calls_pt(path)
+    if suffix == ".npy":
+        return _load_calls_npy(path)
+    raise ValueError(f"Unsupported calls file extension for {path}; expected .pt or .npy")
+
+
+def _matches_prefix_pattern(name: str, pattern: str) -> bool:
+    if any(ch in pattern for ch in "*?[]"):
+        return fnmatch.fnmatch(name, pattern)
+    return name.startswith(pattern)
+
+
+def _discover_calls_file(pt_dir: str, chr_no: int, file_prefix_pattern: str | None) -> str:
+    candidates: List[str] = []
+    suffixes = ("pt", "npy")
+    stems = (f"chr{chr_no}_calls", f"chr{chr_no}_aligned_calls")
+    for stem in stems:
+        for suffix in suffixes:
+            direct = os.path.join(pt_dir, f"{stem}.{suffix}")
+            if os.path.exists(direct):
+                candidates.append(direct)
+            candidates.extend(sorted(glob.glob(os.path.join(pt_dir, f"*{stem}.{suffix}"))))
+
+    # deduplicate while preserving order
+    seen = set()
+    deduped: List[str] = []
+    for path in candidates:
+        if path not in seen:
+            deduped.append(path)
+            seen.add(path)
+    candidates = deduped
+
+    if file_prefix_pattern:
+        candidates = [
+            path for path in candidates
+            if _matches_prefix_pattern(os.path.basename(path), file_prefix_pattern)
+        ]
+
+    if not candidates:
+        pattern_msg = f" with prefix pattern '{file_prefix_pattern}'" if file_prefix_pattern else ""
+        raise FileNotFoundError(
+            f"No chr{chr_no} calls files found in {pt_dir}{pattern_msg}. "
+            "Expected files like chr{chr}_calls.pt/.npy, chr{chr}_aligned_calls.pt/.npy, "
+            "or prefixed variants ending with those names."
+        )
+    if len(candidates) > 1:
+        raise ValueError(
+            f"Multiple chr{chr_no} calls files matched in {pt_dir}: "
+            f"{[os.path.basename(p) for p in candidates[:10]]}. "
+            "Use --file-prefix-pattern to disambiguate."
+        )
+    return candidates[0]
+
 def _infer_prefix_digit(name: str) -> int:
     """
     FID/IID first digit convention:
@@ -122,7 +205,7 @@ def _infer_genbatch(name: str) -> int:
     """
     Parse genBatch{n} from directory/prefix name. Defaults to 1 if absent.
     """
-    m = re.search(r"genBatch(\d+)", name)
+    m = re.search(r"batch(\d+)", name)
     return int(m.group(1)) if m else 1
 
 def _to_plink_sex(v) -> int:
@@ -234,16 +317,8 @@ def main() -> None:
     total_p = 0
 
     for c in chrs:
-        pth = os.path.join(pt_dir, f"chr{c}_calls.pt")
-        if not os.path.exists(pth):
-            pth = os.path.join(pt_dir, f"chr{c}_aligned_calls.pt")
-            if not os.path.exists(pth):
-                msg = f"Missing {pth}"
-                raise FileNotFoundError(msg)
-                # print(f"[warn] {msg}; skipping chr{c}")
-                # continue
-
-        Xc = _load_calls_pt(pth)  # float32 [N,p_c] in {0,1,2}
+        pth = _discover_calls_file(pt_dir, c, args.file_prefix_pattern)
+        Xc = _load_calls_file(pth)  # float32 [N,p_c] in {0,1,2}
         if N_ref < 0:
             N_ref = int(Xc.shape[0])
         if int(Xc.shape[0]) != N_ref:
@@ -251,10 +326,10 @@ def main() -> None:
 
         X_parts.append(Xc)
         total_p += int(Xc.shape[1])
-        print(f"[chr{c}] loaded calls: N={Xc.shape[0]}, p={Xc.shape[1]}")
+        print(f"[chr{c}] loaded calls from {os.path.basename(pth)}: N={Xc.shape[0]}, p={Xc.shape[1]}")
 
     if not X_parts:
-        raise FileNotFoundError(f"No chr*_calls.pt loaded from {pt_dir} with spec {args.chromosomes}")
+        raise FileNotFoundError(f"No chr calls files loaded from {pt_dir} with spec {args.chromosomes}")
 
     X = np.concatenate(X_parts, axis=1).astype(np.float32, copy=False)  # [N, P]
     N, P = int(X.shape[0]), int(X.shape[1])

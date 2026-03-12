@@ -8,7 +8,6 @@ import os
 import subprocess
 import sys
 from typing import Dict, List, Tuple
-import numpy as np
 
 try:
     from DiffuGene.utils import setup_logging, get_logger, ensure_dir_exists
@@ -25,118 +24,6 @@ except Exception:
 
 
 logger = get_logger(__name__)
-
-
-def _pow2_options(min_tokens: int, max_tokens: int) -> List[int]:
-    out: List[int] = []
-    k = 0
-    while (1 << k) <= int(max_tokens):
-        v = 1 << k
-        if v >= int(min_tokens):
-            out.append(int(v))
-        k += 1
-    if len(out) == 0:
-        raise ValueError("No power-of-two options in requested [min_tokens, max_tokens] range.")
-    return out
-
-
-def solve_token_allocation_dp(
-    w: List[float],
-    total_tokens: int,
-    min_tokens: int,
-    max_tokens: int | None,
-) -> Dict:
-    """
-    Exact dynamic-programming allocation without external MILP solvers.
-    Minimizes sum_i |alloc_i - target_i| with power-of-two alloc_i and exact token budget.
-    """
-    w_arr = np.asarray(w, dtype=float)
-    if w_arr.ndim != 1 or len(w_arr) == 0:
-        raise ValueError("w must be a non-empty 1D list.")
-    if np.any(w_arr < 0) or float(w_arr.sum()) <= 0.0:
-        raise ValueError("weights must be nonnegative and sum to > 0.")
-
-    n = int(len(w_arr))
-    T = int(total_tokens)
-    if T <= 0:
-        raise ValueError("total_tokens must be > 0.")
-    lo = max(1, int(min_tokens))
-    hi = int(max_tokens) if max_tokens is not None else int(total_tokens)
-    options = _pow2_options(lo, hi)
-    if n * min(options) > T or n * max(options) < T:
-        raise ValueError("No feasible allocation satisfies bounds and exact token budget.")
-
-    targets = (w_arr / float(w_arr.sum())) * float(T)
-    inf = float("inf")
-    dp = np.full((n + 1, T + 1), inf, dtype=np.float64)
-    prev_s = np.full((n + 1, T + 1), -1, dtype=np.int32)
-    prev_o = np.full((n + 1, T + 1), -1, dtype=np.int32)
-    dp[0, 0] = 0.0
-
-    for i in range(1, n + 1):
-        tgt = float(targets[i - 1])
-        for s in range(0, T + 1):
-            best = inf
-            best_prev = -1
-            best_opt = -1
-            for opt in options:
-                p = s - int(opt)
-                if p < 0:
-                    continue
-                base = float(dp[i - 1, p])
-                if not np.isfinite(base):
-                    continue
-                cand = base + abs(float(opt) - tgt)
-                if cand < best:
-                    best = cand
-                    best_prev = p
-                    best_opt = int(opt)
-            dp[i, s] = best
-            prev_s[i, s] = best_prev
-            prev_o[i, s] = best_opt
-
-    if not np.isfinite(dp[n, T]):
-        raise RuntimeError("DP failed to find a feasible exact allocation.")
-
-    allocations = np.zeros((n,), dtype=int)
-    s = T
-    for i in range(n, 0, -1):
-        opt = int(prev_o[i, s])
-        if opt <= 0:
-            raise RuntimeError("DP backtracking failed.")
-        allocations[i - 1] = opt
-        s = int(prev_s[i, s])
-    if s != 0:
-        raise RuntimeError("DP backtracking ended with non-zero remainder.")
-
-    assignments = []
-    offsets = []
-    cursor = 0
-    for i in range(n):
-        tok = int(allocations[i])
-        assignments.append(
-            {
-                "i": int(i),
-                "tokens": tok,
-                "target": float(targets[i]),
-                "abs_error": float(abs(float(tok) - float(targets[i]))),
-            }
-        )
-        offsets.append({"i": int(i), "token_start": int(cursor), "token_end": int(cursor + tok)})
-        cursor += tok
-
-    return {
-        "status": "Optimal",
-        "objective": float(dp[n, T]),
-        "total_tokens": int(T),
-        "allocations": allocations,
-        "targets": targets,
-        "abs_errors": np.abs(allocations.astype(float) - targets),
-        "assignments": assignments,
-        "offsets": offsets,
-        "options": options,
-        "sum_allocations": int(allocations.sum()),
-    }
 
 
 def get_chromosome_list(chrom_spec: List[str]) -> List[int]:
@@ -191,7 +78,7 @@ def build_training_command(
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Orchestrate per-chromosome token-AE training with MILP token allocation.")
+    p = argparse.ArgumentParser(description="Orchestrate per-chromosome token-AE training with token allocation.")
     p.add_argument("--h5-dir", required=True, help="H5 cache directory root with chr*/batch*.h5")
     p.add_argument("--val-h5-dir", required=True, help="Validation H5 root with chr*/batch*.h5")
     p.add_argument("--bim", required=True, help="BIM file used to infer per-chromosome variant counts")
@@ -216,13 +103,6 @@ def main() -> None:
     p.add_argument("--use-slurm", action="store_true", help="Submit sbatch jobs instead of local execution")
     p.add_argument("--slurm-script", type=str, default=None, help="Path to SLURM wrapper script")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument(
-        "--token-solver",
-        type=str,
-        default="AUTO",
-        choices=["AUTO", "DP", "CBC", "GUROBI", "GLPK", "SCIP"],
-        help="Solver for token allocation MILP; AUTO falls back to pure-Python DP if CBC is unavailable.",
-    )
     args = p.parse_args()
 
     setup_logging()
@@ -236,41 +116,12 @@ def main() -> None:
     layout_csv = os.path.join(args.output_dir, "tok_milp_layout.csv")
 
     weights = [counts[c] for c in chromosomes]
-    token_solver = str(args.token_solver).upper()
-    if token_solver == "DP":
-        result = solve_token_allocation_dp(
-            w=weights,
-            total_tokens=int(args.total_tokens),
-            min_tokens=int(args.min_tokens),
-            max_tokens=(None if args.max_tokens is None else int(args.max_tokens)),
-        )
-    elif token_solver == "AUTO":
-        try:
-            result = solve_token_allocation_milp(
-                w=weights,
-                total_tokens=int(args.total_tokens),
-                min_tokens=int(args.min_tokens),
-                max_tokens=(None if args.max_tokens is None else int(args.max_tokens)),
-                solver_name="CBC",
-                verbose=False,
-            )
-        except Exception as ex:
-            logger.warning(f"CBC unavailable ({ex}); falling back to pure-Python DP allocation.")
-            result = solve_token_allocation_dp(
-                w=weights,
-                total_tokens=int(args.total_tokens),
-                min_tokens=int(args.min_tokens),
-                max_tokens=(None if args.max_tokens is None else int(args.max_tokens)),
-            )
-    else:
-        result = solve_token_allocation_milp(
-            w=weights,
-            total_tokens=int(args.total_tokens),
-            min_tokens=int(args.min_tokens),
-            max_tokens=(None if args.max_tokens is None else int(args.max_tokens)),
-            solver_name=token_solver,
-            verbose=False,
-        )
+    result = solve_token_allocation_milp(
+        w=weights,
+        total_tokens=int(args.total_tokens),
+        min_tokens=int(args.min_tokens),
+        max_tokens=(None if args.max_tokens is None else int(args.max_tokens)),
+    )
     alloc_map = organize_token_solution(result)
 
     layout_records = []

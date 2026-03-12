@@ -1,38 +1,36 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
+import math
 
-import numpy as np
 
-
-def _pow2_options(total_tokens: int, min_tokens: int = 1, max_tokens: Optional[int] = None) -> List[int]:
-    if total_tokens <= 0:
+def _pow2_options(
+    total_tokens: int,
+    min_tokens: int = 1,
+    max_tokens: Optional[int] = None,
+) -> List[int]:
+    """
+    Power-of-two token options within [min_tokens, max_tokens], capped by total_tokens.
+    Deterministic ordering: increasing.
+    """
+    T = int(total_tokens)
+    if T <= 0:
         raise ValueError("total_tokens must be > 0")
     lo = max(1, int(min_tokens))
-    hi = int(max_tokens) if max_tokens is not None else int(total_tokens)
+    hi = int(max_tokens) if max_tokens is not None else T
     if hi < lo:
         raise ValueError("max_tokens must be >= min_tokens")
+    hi = min(hi, T)
     out: List[int] = []
     k = 0
     while (1 << k) <= hi:
         v = 1 << k
         if v >= lo:
-            out.append(v)
+            out.append(int(v))
         k += 1
     if not out:
         raise ValueError("No valid power-of-two options available.")
     return out
-
-
-def _nearest_option_index(target: float, options: List[int]) -> int:
-    best_idx = 0
-    best_dist = float("inf")
-    for idx, opt in enumerate(options):
-        dist = abs(float(opt) - float(target))
-        if dist < best_dist:
-            best_dist = dist
-            best_idx = idx
-    return best_idx
 
 
 def solve_token_allocation_milp(
@@ -40,104 +38,117 @@ def solve_token_allocation_milp(
     total_tokens: int = 4096,
     min_tokens: int = 1,
     max_tokens: Optional[int] = None,
+    solver_name: Optional[str] = None,
+    verbose: bool = False,
+    **_: Any,
 ) -> Dict:
     """
-    Simple pure-Python allocator:
-      1) assign each chromosome to nearest power-of-two token count
-      2) greedily adjust up/down to match exact total token budget
-    """
-    w_arr = np.asarray(w, dtype=float)
-    if w_arr.ndim != 1 or len(w_arr) == 0:
-        raise ValueError("w must be a non-empty 1D list/array.")
-    if np.any(w_arr < 0) or float(w_arr.sum()) <= 0:
-        raise ValueError("w must be nonnegative and sum(w) must be > 0.")
+    Pure-Python, deterministic, exact allocator.
 
-    n = int(len(w_arr))
-    total_tokens = int(total_tokens)
-    if total_tokens <= 0:
+    Problem:
+      minimize   sum_i |a_i - t_i|
+      subject to a_i in {powers of 2 within [min_tokens, max_tokens]}
+                 sum_i a_i = total_tokens
+
+    where t_i = total_tokens * w_i / sum_j w_j.
+
+    Notes:
+      - `solver_name`, `verbose` are accepted for API compatibility but ignored.
+    """
+    if not isinstance(w, list) or len(w) == 0:
+        raise ValueError("w must be a non-empty list of weights.")
+    weights = [float(x) for x in w]
+    if any(x < 0.0 for x in weights):
+        raise ValueError("weights must be nonnegative.")
+    sum_w = float(sum(weights))
+    if not (sum_w > 0.0):
+        raise ValueError("sum(w) must be > 0.")
+
+    n = int(len(weights))
+    T = int(total_tokens)
+    if T <= 0:
         raise ValueError("total_tokens must be > 0.")
 
-    options = _pow2_options(total_tokens=total_tokens, min_tokens=min_tokens, max_tokens=max_tokens)
-    if n * min(options) > total_tokens:
-        raise ValueError("Infeasible: minimum per-chromosome tokens exceed total_tokens.")
-    if n * max(options) < total_tokens:
-        raise ValueError("Infeasible: maximum per-chromosome tokens cannot reach total_tokens.")
+    options = _pow2_options(total_tokens=T, min_tokens=min_tokens, max_tokens=max_tokens)
+    min_opt = min(options)
+    max_opt = max(options)
+    if n * min_opt > T or n * max_opt < T:
+        raise ValueError("Infeasible: bounds/options cannot satisfy exact total_tokens.")
 
-    targets = total_tokens * (w_arr / float(w_arr.sum()))
-    option_index = np.asarray([_nearest_option_index(float(t), options) for t in targets], dtype=int)
+    targets: List[float] = [T * (wi / sum_w) for wi in weights]
 
-    allocations = np.asarray([int(options[idx]) for idx in option_index], dtype=int)
+    # DP over (i, s): best objective using first i items summing to s.
+    inf = math.inf
+    dp_prev = [inf] * (T + 1)
+    dp_prev[0] = 0.0
+    # backpointers: for each i and s, store (prev_s, chosen_opt).
+    prev_s: List[List[int]] = [[-1] * (T + 1) for _ in range(n + 1)]
+    prev_o: List[List[int]] = [[-1] * (T + 1) for _ in range(n + 1)]
 
-    # Greedily repair to exact budget while minimally increasing L1 error each step.
-    delta = int(total_tokens - int(allocations.sum()))
-    while delta != 0:
-        if delta > 0:
-            best_i = -1
-            best_gain = float("inf")
-            for i in range(n):
-                idx = int(option_index[i])
-                if idx >= len(options) - 1:
+    for i in range(1, n + 1):
+        tgt = float(targets[i - 1])
+        dp_cur = [inf] * (T + 1)
+        for s in range(0, T + 1):
+            best_val = inf
+            best_ps = -1
+            best_opt = -1
+            for opt in options:
+                p = s - int(opt)
+                if p < 0:
                     continue
-                old = float(allocations[i])
-                new = float(options[idx + 1])
-                gain = abs(new - float(targets[i])) - abs(old - float(targets[i]))
-                if gain < best_gain:
-                    best_gain = gain
-                    best_i = i
-            if best_i < 0:
-                raise RuntimeError("Could not increase allocations to reach total_tokens.")
-            old_val = int(allocations[best_i])
-            option_index[best_i] += 1
-            allocations[best_i] = int(options[int(option_index[best_i])])
-            delta -= int(allocations[best_i] - old_val)
-        else:
-            best_i = -1
-            best_gain = float("inf")
-            for i in range(n):
-                idx = int(option_index[i])
-                if idx <= 0:
+                base = dp_prev[p]
+                if base == inf:
                     continue
-                old = float(allocations[i])
-                new = float(options[idx - 1])
-                gain = abs(new - float(targets[i])) - abs(old - float(targets[i]))
-                if gain < best_gain:
-                    best_gain = gain
-                    best_i = i
-            if best_i < 0:
-                raise RuntimeError("Could not decrease allocations to reach total_tokens.")
-            old_val = int(allocations[best_i])
-            option_index[best_i] -= 1
-            allocations[best_i] = int(options[int(option_index[best_i])])
-            delta += int(old_val - allocations[best_i])
+                cand = base + abs(float(opt) - tgt)
+                # Deterministic tie-break: smaller objective, then smaller opt, then smaller prev sum.
+                if (cand < best_val) or (
+                    cand == best_val and (best_opt < 0 or int(opt) < best_opt)
+                ) or (
+                    cand == best_val and int(opt) == best_opt and (best_ps < 0 or p < best_ps)
+                ):
+                    best_val = cand
+                    best_ps = p
+                    best_opt = int(opt)
+            dp_cur[s] = best_val
+            prev_s[i][s] = best_ps
+            prev_o[i][s] = best_opt
+        dp_prev = dp_cur
+    if dp_prev[T] == inf:
+        raise RuntimeError("DP failed to find a feasible exact allocation.")
+    allocations: List[int] = [0] * n
+    s = T
+    for i in range(n, 0, -1):
+        opt = int(prev_o[i][s])
+        ps = int(prev_s[i][s])
+        if opt <= 0 or ps < 0:
+            raise RuntimeError("DP backtracking failed.")
+        allocations[i - 1] = opt
+        s = ps
+    if s != 0:
+        raise RuntimeError("DP backtracking ended with non-zero remainder.")
 
-    assignments = []
-    offsets = []
+    assignments: List[Dict[str, Any]] = []
+    offsets: List[Dict[str, int]] = []
     cursor = 0
-    for i in range(n):
-        tok = int(allocations[i])
-        assignments.append(
-            {
-                "i": int(i),
-                "tokens": tok,
-                "target": float(targets[i]),
-                "abs_error": float(abs(float(tok) - float(targets[i]))),
-            }
-        )
+    abs_errors: List[float] = []
+    for i, tok in enumerate(allocations):
+        tgt = float(targets[i])
+        ae = float(abs(float(tok) - tgt))
+        abs_errors.append(ae)
+        assignments.append({"i": int(i), "tokens": int(tok), "target": tgt, "abs_error": ae})
         offsets.append({"i": int(i), "token_start": int(cursor), "token_end": int(cursor + tok)})
-        cursor += tok
-
-    abs_errors = np.abs(allocations.astype(float) - targets)
+        cursor += int(tok)
     return {
         "status": "Optimal",
-        "objective": float(abs_errors.sum()),
-        "total_tokens": int(total_tokens),
+        "objective": float(dp_prev[T]),
+        "total_tokens": int(T),
         "allocations": allocations,
         "targets": targets,
         "abs_errors": abs_errors,
         "assignments": assignments,
         "offsets": offsets,
         "options": options,
-        "sum_allocations": int(allocations.sum()),
+        "sum_allocations": int(sum(allocations)),
     }
 
 

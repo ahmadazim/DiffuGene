@@ -13,7 +13,7 @@ home=/n/home03/ahmadazim/WORKING/genGen/
 database=${home}UKBVQVAE/genomic_data/
 modelbase=${home}UKBVQVAE/models/
 
-python -u ${home}DiffuGene/src/DiffuGene/VAEembed/train_orchestrator_tok.py \
+python -u ${home}DiffuGene/src/DiffuGene/VAEembed/train_orchestrator.py \
     --h5-dir ${database}vqvae_h5_cache/ \
     --val-h5-dir ${database}val_h5_cache/ \
     --bim ${database}geneticBinary/ukb_allchr_unrel_britishWhite.bim \

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import subprocess
 import sys
@@ -20,6 +21,7 @@ if src_root not in sys.path:
     sys.path.insert(0, src_root)
 
 from DiffuGene.VAEembed.ae import TokenAutoencoder1D, TokenAEConfig
+from DiffuGene.VAEembed.sharedEmbed import FiLM1D
 from DiffuGene.utils import ensure_dir_exists
 from DiffuGene.utils.file_utils import read_bim_file
 
@@ -168,22 +170,24 @@ def create_batched_h5(
     return per_chr
 
 
-class ChromosomeEncoderTok:
-    """Load a per-chromosome ae_tok_chr*.pt checkpoint and encode batches."""
+def _extract_prefixed_state(state_dict: Dict[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
+    plen = len(prefix)
+    return {k[plen:]: v for k, v in state_dict.items() if k.startswith(prefix)}
 
+
+class HomogenizedChromosomeEncoderTok:
     def __init__(self, chrom_no: int, model_path: str, device: torch.device, use_amp: bool = True) -> None:
         self.chrom_no = int(chrom_no)
+        self.chrom_embed_idx = max(0, self.chrom_no - 1)
         self.device = device
         payload = torch.load(model_path, map_location="cpu")
         state = payload.get("model_state")
         if state is None:
             raise KeyError(f"{model_path} missing model_state")
-        cfg_dict = payload.get("config")
+        meta = payload.get("meta", {})
+        cfg_dict = meta.get("config", payload.get("config"))
         if cfg_dict is None:
-            meta = payload.get("meta", {})
-            cfg_dict = meta.get("config")
-        if cfg_dict is None:
-            raise KeyError(f"{model_path} missing config")
+            raise KeyError(f"{model_path} missing config metadata")
         cfg = TokenAEConfig(**cfg_dict)
 
         self.ae = TokenAutoencoder1D(
@@ -194,9 +198,17 @@ class ChromosomeEncoderTok:
             max_c=cfg.max_c,
             dropout=cfg.dropout,
         ).to(device)
-        self.ae.load_state_dict(state, strict=True)
+        ae_state = _extract_prefixed_state(state, "aes.0.")
+        self.ae.load_state_dict(ae_state, strict=True)
         self.ae.eval()
         for p in self.ae.parameters():
+            p.requires_grad = False
+
+        self.encode_head = FiLM1D(self.ae.latent_dim).to(device)
+        eh_state = _extract_prefixed_state(state, "encode_head.")
+        self.encode_head.load_state_dict(eh_state, strict=True)
+        self.encode_head.eval()
+        for p in self.encode_head.parameters():
             p.requires_grad = False
 
         self.amp_enabled = bool(use_amp and device.type == "cuda" and cuda_autocast is not None)
@@ -212,8 +224,10 @@ class ChromosomeEncoderTok:
         with torch.no_grad():
             with amp_ctx:
                 z = self.ae.encode(x_dev)
-        out = z.detach().to("cpu").float()
-        del x_dev, z
+                chrom_vec = torch.full((z.size(0),), int(self.chrom_embed_idx), dtype=torch.long, device=z.device)
+                z_hom = self.encode_head(z, chrom_vec)
+        out = z_hom.detach().to("cpu").float()
+        del x_dev, z, z_hom
         return out
 
 
@@ -232,10 +246,10 @@ def encode_per_chr_batches(
     for c in chromosomes:
         model_path = os.path.join(models_dir, model_pattern.format(chr=c))
         if not os.path.exists(model_path):
-            print(f"[ENC-TOK] Missing model for chr{c}: {model_path}; skipping")
+            print(f"[ENC-TOK] Missing homogenized model for chr{c}: {model_path}; skipping")
             continue
         try:
-            enc = ChromosomeEncoderTok(c, model_path, device, use_amp=amp)
+            enc = HomogenizedChromosomeEncoderTok(c, model_path, device, use_amp=amp)
         except Exception as exc:
             print(f"[ENC-TOK] Failed to init encoder for chr{c}: {exc}")
             continue
@@ -273,22 +287,93 @@ def encode_per_chr_batches(
     return per_chr_batches
 
 
+def unify_batches(
+    layout_json: str,
+    latents_root: str,
+    out_unified_root: str,
+    chromosomes: List[int],
+    embed_dtype: str = "float32",
+) -> None:
+    ensure_dir_exists(out_unified_root)
+    with open(layout_json, "r") as f:
+        layout = json.load(f)
+    total_tokens = int(layout["total_tokens"])
+    latent_dim = int(layout["latent_dim"])
+    map_by_chr = {int(r["chromosome"]): r for r in layout["layout"]}
+
+    available_chr = [c for c in chromosomes if os.path.isdir(os.path.join(latents_root, f"chr{c}"))]
+    if not available_chr:
+        raise RuntimeError(f"No per-chr latent dirs in {latents_root}")
+    ref = None
+    num_batches = None
+    for c in available_chr:
+        pts = sorted(glob.glob(os.path.join(latents_root, f"chr{c}", "batch*_latents.pt")))
+        if pts:
+            ref = c
+            num_batches = len(pts)
+            break
+    if ref is None or num_batches is None:
+        raise RuntimeError("No encoded batch files found.")
+
+    for bi in range(1, num_batches + 1):
+        ref_pt = os.path.join(latents_root, f"chr{ref}", f"batch{bi:05d}_latents.pt")
+        if not os.path.exists(ref_pt):
+            raise FileNotFoundError(ref_pt)
+        ref_tensor = torch.load(ref_pt, map_location="cpu")
+        n = int(ref_tensor.shape[0])
+        unified = torch.zeros((n, total_tokens, latent_dim), dtype=getattr(torch, embed_dtype))
+        for c in chromosomes:
+            rec = map_by_chr.get(int(c))
+            if rec is None:
+                continue
+            pt = os.path.join(latents_root, f"chr{c}", f"batch{bi:05d}_latents.pt")
+            if not os.path.exists(pt):
+                continue
+            z = torch.load(pt, map_location="cpu")  # (N, T_chr, D)
+            t_start = int(rec["token_start"])
+            t_end = int(rec["token_end"])
+            if z.shape[1] != (t_end - t_start):
+                raise ValueError(
+                    f"chr{c} token mismatch: encoded {z.shape[1]} vs layout span {t_end - t_start}"
+                )
+            if z.shape[2] != latent_dim:
+                raise ValueError(f"chr{c} latent_dim mismatch: encoded {z.shape[2]} vs {latent_dim}")
+            unified[:, t_start:t_end, :] = z.to(unified.dtype)
+        out_pt = os.path.join(out_unified_root, f"batch{bi:05d}_unified.pt")
+        torch.save(unified, out_pt)
+        del unified, ref_tensor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    map_out = os.path.join(out_unified_root, "token_ranges.json")
+    with open(map_out, "w") as f:
+        json.dump(
+            {
+                "total_tokens": total_tokens,
+                "latent_dim": latent_dim,
+                "layout": layout["layout"],
+            },
+            f,
+            indent=2,
+        )
+    print(f"[ENC-TOK] Saved token-range metadata: {map_out}")
+
+
 def main() -> None:
-    p = argparse.ArgumentParser(
-        description="Encode per-chromosome token-AE latents. "
-        "Output: <latents-out-root>/chr{c}/batch{XXXXX}_latents.pt  (N, T_chr, D)"
-    )
+    p = argparse.ArgumentParser(description="Encode batched homogenized token-AE latents and unify to (B,T,D).")
     p.add_argument("--bfile", required=True)
     p.add_argument("--bim", required=True)
     p.add_argument("--fam", required=True)
     p.add_argument("--chromosomes", nargs="+", default=["all"])
-    p.add_argument("--batch-size", type=int, default=12000, help="Number of individuals per H5/latent batch file")
-    p.add_argument("--h5-out-root", required=True, help="Root dir for intermediate H5 caches (<root>/chr{c}/batch*.h5)")
-    p.add_argument("--models-dir", required=True, help="Dir containing per-chromosome AE checkpoints")
-    p.add_argument("--model-pattern", default="ae_chr{chr}.pt", help="Filename pattern with {chr} placeholder (default: ae_chr{chr}.pt)")
-    p.add_argument("--latents-out-root", required=True, help="Root dir for encoded latents (<root>/chr{c}/batch*_latents.pt)")
+    p.add_argument("--batch-size", type=int, default=12000)
+    p.add_argument("--h5-out-root", required=True)
+    p.add_argument("--models-dir", required=True)
+    p.add_argument("--model-pattern", default="ae_tok_chr{chr}_homog.pt")
+    p.add_argument("--latents-out-root", required=True)
+    p.add_argument("--layout-json", required=True)
+    p.add_argument("--unified-out-root", required=True)
     p.add_argument("--device", default="cuda")
-    p.add_argument("--encode-batch-size", type=int, default=128, help="Sub-batch size for GPU encoding within each H5 file")
+    p.add_argument("--encode-batch-size", type=int, default=128)
     p.add_argument("--no-amp", dest="amp", action="store_false")
     p.set_defaults(amp=True)
     args = p.parse_args()
@@ -296,6 +381,7 @@ def main() -> None:
     chromosomes = get_chromosomes(args.chromosomes)
     ensure_dir_exists(args.h5_out_root)
     ensure_dir_exists(args.latents_out_root)
+    ensure_dir_exists(args.unified_out_root)
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
 
     per_chr_batches = create_batched_h5(
@@ -320,18 +406,13 @@ def main() -> None:
     )
     print(f"[ENC-TOK] Encoded batches per chromosome: {per_chr_batches}")
 
-    total_tokens = 0
-    for c in sorted(per_chr_batches.keys()):
-        chr_dir = os.path.join(args.latents_out_root, f"chr{c}")
-        sample_files = sorted(glob.glob(os.path.join(chr_dir, "batch*_latents.pt")))
-        if sample_files:
-            z = torch.load(sample_files[0], map_location="cpu")
-            t_chr, d = z.shape[1], z.shape[2]
-            total_tokens += t_chr
-            print(f"[ENC-TOK] chr{c}: {len(sample_files)} batches, T={t_chr}, D={d}")
-            del z
-    print(f"[ENC-TOK] Total tokens across all chromosomes: {total_tokens}")
-    print("[ENC-TOK] Encoding complete. Latents ready for diffusion training.")
+    unify_batches(
+        layout_json=args.layout_json,
+        latents_root=args.latents_out_root,
+        out_unified_root=args.unified_out_root,
+        chromosomes=chromosomes,
+    )
+    print("[ENC-TOK] Unification complete.")
 
 
 if __name__ == "__main__":

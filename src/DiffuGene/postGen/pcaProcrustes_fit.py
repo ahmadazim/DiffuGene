@@ -18,13 +18,15 @@ Procedure (matches smoothAE_eval.ipynb 1-53):
 
 Inputs:
   - Original data: cached H5 batches: <orig_h5_root>/chr{c}/batch*.h5 (dataset "X")
-  - Generated data: decoded calls from DiffuGene.generate.decode:
-      directory with chr{c}_calls.pt OR a .pt payload with calls_by_chr/hard_calls_by_chr.
+  - Generated data: decoded calls from current DiffuGene generators:
+      directory with *chr{c}_calls.npy / chr{c}_calls.pt,
+      OR a .pt payload with calls_by_chr/hard_calls_by_chr.
 """
 
 import argparse
 import glob
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 
 import h5py
@@ -51,25 +53,128 @@ def _list_chr_h5_batches(orig_h5_root: str, chr_no: int) -> List[str]:
     return sorted(glob.glob(os.path.join(chr_dir, "batch*.h5")))
 
 
-def _load_one_h5_batch_calls(orig_h5_root: str, chr_no: int) -> np.ndarray:
-    files = _list_chr_h5_batches(orig_h5_root, chr_no)
-    if not files:
-        raise FileNotFoundError(f"No H5 batch files found for chr{chr_no} under {orig_h5_root}")
-    h5_path = files[0]
+def _read_h5_calls(h5_path: str) -> np.ndarray:
     with h5py.File(h5_path, "r") as f:
+        if "X" not in f:
+            raise KeyError(f"Dataset 'X' not found in {h5_path}")
         X = f["X"][:]  # (N,L)
     return np.asarray(X, dtype=np.int8)
 
 
-def load_generated_calls(generated_path: str, chr_no: int) -> np.ndarray:
+def _load_h5_calls_slice(orig_h5_root: str, chr_no: int, start_index_0: int, n_rows: int) -> np.ndarray:
+    files = _list_chr_h5_batches(orig_h5_root, chr_no)
+    if not files:
+        raise FileNotFoundError(f"No H5 batch files found for chr{chr_no} under {orig_h5_root}")
+
+    if start_index_0 < 0:
+        raise ValueError(f"start_index_0 must be >= 0, got {start_index_0}")
+    if n_rows <= 0:
+        raise ValueError(f"n_rows must be > 0, got {n_rows}")
+
+    remaining = int(n_rows)
+    cursor = int(start_index_0)
+    out_parts: List[np.ndarray] = []
+
+    for h5_path in files:
+        X = _read_h5_calls(h5_path)
+        batch_n = int(X.shape[0])
+        if cursor >= batch_n:
+            cursor -= batch_n
+            continue
+
+        take_end = min(batch_n, cursor + remaining)
+        out_parts.append(X[cursor:take_end])
+        remaining -= (take_end - cursor)
+        cursor = 0
+        if remaining == 0:
+            break
+
+    if remaining > 0:
+        loaded = int(n_rows) - remaining
+        raise ValueError(
+            f"Requested {n_rows} original rows for chr{chr_no} starting at index {start_index_0 + 1}, "
+            f"but only {loaded} rows were available under {orig_h5_root}"
+        )
+
+    return np.concatenate(out_parts, axis=0)
+
+
+def _path_matches_batch_number(path: str, chr_no: int, batch_number: int) -> bool:
+    name = os.path.basename(path)
+    bn = int(batch_number)
+    patterns = [
+        rf"(?:^|[_-]){bn}_chr{chr_no}(?:[_-]|$)",
+        rf"(?:^|[_-])batch0*{bn}(?:[_-]|$)",
+        rf"(?:^|[_-])batch0*{bn}_chr{chr_no}(?:[_-]|$)",
+    ]
+    return any(re.search(pattern, name) is not None for pattern in patterns)
+
+
+def _resolve_generated_dir_file(
+    generated_dir: str,
+    chr_no: int,
+    suffix: str,
+    batch_number: Optional[int] = None,
+) -> Optional[str]:
+    candidates = sorted(set(glob.glob(os.path.join(generated_dir, f"*chr{chr_no}_{suffix}"))))
+    direct = os.path.join(generated_dir, f"chr{chr_no}_{suffix}")
+    if os.path.exists(direct):
+        candidates = sorted(set(candidates + [direct]))
+
+    if not candidates:
+        return None
+
+    if batch_number is not None:
+        filtered = [path for path in candidates if _path_matches_batch_number(path, chr_no, int(batch_number))]
+        if len(filtered) == 1:
+            return filtered[0]
+        if len(filtered) > 1:
+            raise ValueError(
+                f"Multiple generated call files matched chr{chr_no} and batch {batch_number} under {generated_dir}: "
+                f"{filtered[:5]}"
+            )
+        raise FileNotFoundError(
+            f"No generated call file matched chr{chr_no} and batch {batch_number} under {generated_dir}. "
+            f"Available candidates: {[os.path.basename(path) for path in candidates[:10]]}"
+        )
+
+    if len(candidates) == 1:
+        return candidates[0]
+    raise ValueError(
+        f"Multiple generated call files matched chr{chr_no} under {generated_dir}: {candidates[:5]}. "
+        "Pass --generated-batch-number or point --generated at a directory containing one generation run."
+    )
+
+
+def load_generated_calls(generated_path: str, chr_no: int, batch_number: Optional[int] = None) -> np.ndarray:
     if os.path.isdir(generated_path):
-        pth = os.path.join(generated_path, f"chr{chr_no}_calls.pt")
-        t = torch.load(pth, map_location="cpu")
-        if torch.is_tensor(t):
-            return t.cpu().numpy().astype(np.int8, copy=False)
-        if isinstance(t, dict) and "calls" in t and torch.is_tensor(t["calls"]):
-            return t["calls"].cpu().numpy().astype(np.int8, copy=False)
-        raise ValueError(f"Unexpected tensor payload in {pth}")
+        npy_path = _resolve_generated_dir_file(
+            generated_path,
+            chr_no,
+            "calls.npy",
+            batch_number=batch_number,
+        )
+        if npy_path is not None:
+            return np.load(npy_path).astype(np.int8, copy=False)
+
+        pth = _resolve_generated_dir_file(
+            generated_path,
+            chr_no,
+            "calls.pt",
+            batch_number=batch_number,
+        )
+        if pth is not None:
+            t = torch.load(pth, map_location="cpu")
+            if torch.is_tensor(t):
+                return t.cpu().numpy().astype(np.int8, copy=False)
+            if isinstance(t, dict) and "calls" in t and torch.is_tensor(t["calls"]):
+                return t["calls"].cpu().numpy().astype(np.int8, copy=False)
+            raise ValueError(f"Unexpected tensor payload in {pth}")
+
+        raise FileNotFoundError(
+            f"Could not find generated chr{chr_no} calls under {generated_path}. "
+            "Expected *chr{chr_no}_calls.npy or *chr{chr_no}_calls.pt."
+        )
 
     payload = torch.load(generated_path, map_location="cpu")
     if not isinstance(payload, dict):
@@ -80,7 +185,11 @@ def load_generated_calls(generated_path: str, chr_no: int) -> np.ndarray:
             if not torch.is_tensor(t):
                 raise ValueError(f"{key}[{chr_no}] is not a tensor")
             return t.cpu().numpy().astype(np.int8, copy=False)
-    raise KeyError(f"Could not find chr{chr_no} calls inside {generated_path}")
+    raise KeyError(
+        f"Could not find chr{chr_no} calls inside {generated_path}. "
+        "If this is a current generate.py output, point --generated at the decoded output directory "
+        "containing *chr{chr_no}_calls.npy files."
+    )
 
 
 def _fit_alignment(
@@ -146,10 +255,26 @@ def _apply_alignment_full(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Post-generation PCA alignment (Procrustes).")
     p.add_argument("--orig-h5-root", required=True, help="Root of per-chromosome H5 cache directories.")
-    p.add_argument("--generated", required=True, help="Generated decoded calls: dir with chr{c}_calls.pt or .pt payload.")
+    p.add_argument(
+        "--generated",
+        required=True,
+        help="Generated decoded calls: directory with *chr{c}_calls.npy / chr{c}_calls.pt, or a .pt payload.",
+    )
+    p.add_argument(
+        "--generated-batch-number",
+        type=int,
+        default=None,
+        help="Optional batch number used to disambiguate generated files when a directory contains multiple runs.",
+    )
     p.add_argument("--chromosomes", nargs="*", default=["all"], help="Chromosomes to process, or 'all'.")
-    p.add_argument("--n-fit", type=int, default=10000, help="N samples used to fit PCA + Procrustes rotation.")
-    p.add_argument("--k-pcs", type=int, default=3000, help="Number of PCs (K) to retain.")
+    p.add_argument(
+        "--orig-start-index",
+        type=int,
+        default=1,
+        help="1-indexed start row for original H5 data. Supports contiguous slicing across batch*.h5 files.",
+    )
+    p.add_argument("--n-fit", type=int, default=16384, help="N samples used to fit PCA + Procrustes rotation.")
+    p.add_argument("--k-pcs", type=int, default=5000, help="Number of PCs (K) to retain.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--models-dir", required=True, help="Directory to save rotation matrices (and metadata).")
     p.add_argument("--out-dir", required=True, help="Directory to save aligned generated outputs.")
@@ -162,17 +287,28 @@ def main() -> None:
     os.makedirs(args.out_dir, exist_ok=True)
 
     chromosomes = _resolve_chromosomes(args.chromosomes)
+    if int(args.orig_start_index) < 1:
+        raise ValueError("--orig-start-index must be >= 1 (1-indexed).")
+    orig_start_index_0 = int(args.orig_start_index) - 1
 
     for chr_no in chromosomes:
         print(f"Processing chromosome {chr_no}")
-        calls_gen = load_generated_calls(args.generated, chr_no)
-        calls_orig_full = _load_one_h5_batch_calls(args.orig_h5_root, chr_no)
+        calls_gen = load_generated_calls(
+            args.generated,
+            chr_no,
+            batch_number=args.generated_batch_number,
+        )
+        calls_orig = _load_h5_calls_slice(
+            args.orig_h5_root,
+            chr_no,
+            start_index_0=orig_start_index_0,
+            n_rows=int(calls_gen.shape[0]),
+        )
 
-        print(f"Loaded {calls_gen.shape[0]} generated calls and {calls_orig_full.shape[0]} original calls")
-
-        n_gen = int(calls_gen.shape[0])
-        calls_orig = calls_orig_full[:n_gen, :]
-        calls_gen = calls_gen[: calls_orig.shape[0], :]
+        print(
+            f"Loaded {calls_gen.shape[0]} generated calls and {calls_orig.shape[0]} original calls "
+            f"(orig start index={args.orig_start_index})"
+        )
 
         n_fit = min(int(args.n_fit), calls_orig.shape[0], calls_gen.shape[0])
         print(f"Using first {n_fit} samples for PCA fitting")

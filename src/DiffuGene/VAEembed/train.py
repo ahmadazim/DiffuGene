@@ -14,12 +14,18 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 try:
-    from .ae import TokenAEConfig, build_token_ae
+    from .ae import (
+        TokenAEConfig, build_token_ae, train_token_ae,
+        eval_latent_penalties_tokenae,
+    )
     from ..utils import setup_logging, get_logger
 except Exception:
     import sys
     sys.path.append('/n/home03/ahmadazim/WORKING/genGen/DiffuGene/src')
-    from DiffuGene.VAEembed.ae import TokenAEConfig, build_token_ae
+    from DiffuGene.VAEembed.ae import (
+        TokenAEConfig, build_token_ae, train_token_ae,
+        eval_latent_penalties_tokenae,
+    )
     from DiffuGene.utils import setup_logging, get_logger
 
 
@@ -137,14 +143,26 @@ def main() -> None:
     p.add_argument("--max-c", type=int, default=5)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--grad-clip", type=float, default=1.0)
-    p.add_argument("--maf-lambda", type=float, default=0.0)
-    p.add_argument("--ld-lambda", type=float, default=0.0)
+    p.add_argument("--weight-decay", type=float, default=0.1)
+    p.add_argument("--grad-clip", type=float, default=5.0)
+    p.add_argument("--maf-lambda", type=float, default=1e-3)
+    p.add_argument("--ld-lambda", type=float, default=1e-3)
     p.add_argument("--ld-window", type=int, default=128)
     p.add_argument("--beta-kl", type=float, default=0.0, help="Kept for parity; token AE currently deterministic.")
+    # Stage-2 latent regularization
+    p.add_argument("--tv-lambda", type=float, default=2e-2)
+    p.add_argument("--robust-lambda", type=float, default=100.0)
+    p.add_argument("--stable-lambda", type=float, default=3e-1)
+    p.add_argument("--latent-noise-std", type=float, default=0.05)
+    p.add_argument("--embed-noise-std", type=float, default=0.03)
+    p.add_argument("--stage2-start-frac", type=float, default=0.7)
+    p.add_argument("--latent-eval-max-batches", type=int, default=5)
+    # Early stopping / stagnation
+    p.add_argument("--plateau-min-rel-improve", type=float, default=0.005)
+    p.add_argument("--plateau-patience", type=int, default=10)
+    p.add_argument("--plateau-mse-threshold", type=float, default=0.001)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--save-path", required=True)
     args = p.parse_args()
@@ -165,6 +183,16 @@ def main() -> None:
         lr=float(args.lr),
         weight_decay=float(args.weight_decay),
         grad_clip=float(args.grad_clip),
+        maf_lambda=float(args.maf_lambda),
+        ld_lambda=float(args.ld_lambda),
+        ld_window=int(args.ld_window),
+        tv_lambda=float(args.tv_lambda),
+        robust_lambda=float(args.robust_lambda),
+        stable_lambda=float(args.stable_lambda),
+        latent_noise_std=float(args.latent_noise_std),
+        embed_noise_std=float(args.embed_noise_std),
+        stage2_start_frac=float(args.stage2_start_frac),
+        latent_eval_max_batches=int(args.latent_eval_max_batches),
     )
     model, optimizer = build_token_ae(cfg)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -172,81 +200,62 @@ def main() -> None:
     )
 
     device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
-    model.to(device).train()
 
-    best = {"epoch": 0, "val_mse": float("inf"), "state": None}
-    for epoch in range(1, int(args.epochs) + 1):
-        sum_loss = 0.0
-        sum_recon = 0.0
-        sum_maf = 0.0
-        sum_ld = 0.0
-        sum_kl = 0.0
-        n = 0
-        for xb in train_loader:
-            xb = xb.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            logits, _ = model(xb)
-            loss, metrics = model.loss_function(
-                logits,
-                xb,
-                None,
-                maf_lambda=float(args.maf_lambda),
-                ld_lambda=float(args.ld_lambda),
-                ld_window=int(args.ld_window),
-                beta_kl=float(args.beta_kl),
-            )
-            loss.backward()
-            if args.grad_clip and args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
-            optimizer.step()
-            sum_loss += float(loss.item()) * xb.size(0)
-            sum_recon += float(metrics["recon"].item()) * xb.size(0)
-            sum_maf += float(metrics["maf"].item()) * xb.size(0)
-            sum_ld += float(metrics["ld"].item()) * xb.size(0)
-            sum_kl += float(metrics["kl"].item()) * xb.size(0)
-            n += xb.size(0)
-        scheduler.step()
+    result = train_token_ae(
+        model,
+        train_loader,
+        optimizer,
+        device=device,
+        num_epochs=int(args.epochs),
+        grad_clip=float(args.grad_clip),
+        scheduler=scheduler,
+        val_dataloader=val_loader,
+        plateau_min_rel_improve=float(args.plateau_min_rel_improve),
+        plateau_patience=int(args.plateau_patience),
+        plateau_mse_threshold=float(args.plateau_mse_threshold),
+        maf_lambda=float(args.maf_lambda),
+        ld_lambda=float(args.ld_lambda),
+        ld_window=int(args.ld_window),
+        tv_lambda=float(args.tv_lambda),
+        robust_lambda=float(args.robust_lambda),
+        stable_lambda=float(args.stable_lambda),
+        latent_noise_std=float(args.latent_noise_std),
+        embed_noise_std=float(args.embed_noise_std),
+        stage2_start_frac=float(args.stage2_start_frac),
+        latent_eval_max_batches=int(args.latent_eval_max_batches),
+    )
 
-        val = _eval_val(
-            model,
-            val_loader,
-            device,
-            maf_lambda=float(args.maf_lambda),
-            ld_lambda=float(args.ld_lambda),
-            ld_window=int(args.ld_window),
-            beta_kl=float(args.beta_kl),
-        )
-        logger.info(
-            "[TOK-AE] epoch=%d/%d train_loss=%.6f train_recon=%.6f train_maf=%.6f train_ld=%.6f train_kl=%.6f "
-            "val_recon=%.6f val_maf=%.6f val_ld=%.6f val_kl=%.6f val_mse=%.6f",
-            epoch,
-            int(args.epochs),
-            (sum_loss / max(1, n)),
-            (sum_recon / max(1, n)),
-            (sum_maf / max(1, n)),
-            (sum_ld / max(1, n)),
-            (sum_kl / max(1, n)),
-            val["recon"],
-            val["maf"],
-            val["ld"],
-            val["kl"],
-            val["mse"],
-        )
-        if val["mse"] < best["val_mse"]:
-            best["val_mse"] = float(val["mse"])
-            best["epoch"] = int(epoch)
-            best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    best_meta = result["best_meta"]
+    best_state = result["best_state_dict"]
+
+    # Final detailed evaluation with the best model
+    model.load_state_dict(best_state)
+    model.to(device)
+    val_detail = _eval_val(
+        model, val_loader, device,
+        maf_lambda=float(args.maf_lambda),
+        ld_lambda=float(args.ld_lambda),
+        ld_window=int(args.ld_window),
+        beta_kl=float(args.beta_kl),
+    )
+    logger.info(
+        "[TOK-AE] best_epoch=%d best_val_mse=%.6f | "
+        "val_recon=%.6f val_maf=%.6f val_ld=%.6f val_mse=%.6f",
+        best_meta.get("epoch", 0), best_meta.get("val_mse", float("inf")),
+        val_detail["recon"], val_detail["maf"], val_detail["ld"], val_detail["mse"],
+    )
 
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     payload = {
-        "model_state": best["state"] if best["state"] is not None else model.state_dict(),
+        "model_state": best_state,
         "config": asdict(cfg),
         "meta": {
             "chromosome": int(args.chromosome),
-            "best_epoch": int(best["epoch"]),
-            "best_val_mse": float(best["val_mse"]),
+            "best_epoch": int(best_meta.get("epoch", 0)),
+            "best_val_mse": float(best_meta.get("val_mse", float("inf"))),
             "latent_length": int(args.latent_length),
             "latent_dim": int(args.latent_dim),
+            "val_detail": val_detail,
         },
     }
     torch.save(payload, args.save_path)
